@@ -405,15 +405,15 @@ describe('HistoryReplayer', () => {
       });
     });
 
-    it('should fail dangling calls before rethrowing replay errors', async () => {
-      const danglingRecord: ChatRecord = {
+    it('should not fail pending calls when replay aborts before matching results', async () => {
+      const assistantRecord: ChatRecord = {
         ...createAssistantRecord(''),
         message: {
           role: 'model',
           parts: [
             {
               functionCall: {
-                id: 'call-missing',
+                id: 'call-123',
                 name: 'run_shell_command',
                 args: { command: 'sleep 10' },
               },
@@ -422,6 +422,7 @@ describe('HistoryReplayer', () => {
         },
       };
       const failingRecord = createUserRecord('this send fails');
+      const resultRecord = createToolResultRecord('run_shell_command', 'done');
       sendUpdateSpy.mockImplementation(
         async (update: Record<string, unknown>) => {
           if (update['sessionUpdate'] === 'user_message_chunk') {
@@ -431,19 +432,15 @@ describe('HistoryReplayer', () => {
       );
 
       await expect(
-        replayer.replay([danglingRecord, failingRecord]),
+        replayer.replay([assistantRecord, failingRecord, resultRecord]),
       ).rejects.toThrow('replay failed');
 
       const updates = sentUpdates();
       expect(updates.map((update) => update['sessionUpdate'])).toEqual([
         'tool_call',
         'user_message_chunk',
-        'tool_call_update',
       ]);
-      expect(updates[2]).toMatchObject({
-        toolCallId: 'call-missing',
-        status: 'failed',
-      });
+      expect(setActiveRecordIdSpy).toHaveBeenLastCalledWith(null, undefined);
     });
 
     it('should throw dangling errors and continue failing later dangling calls', async () => {
@@ -499,52 +496,6 @@ describe('HistoryReplayer', () => {
         toolCallId: 'call-b',
         status: 'failed',
       });
-    });
-
-    it('should aggregate replay and dangling cleanup errors', async () => {
-      const danglingRecord: ChatRecord = {
-        ...createAssistantRecord(''),
-        message: {
-          role: 'model',
-          parts: [
-            {
-              functionCall: {
-                id: 'call-missing',
-                name: 'run_shell_command',
-                args: { command: 'sleep 10' },
-              },
-            },
-          ],
-        },
-      };
-      const failingRecord = createUserRecord('this send fails');
-      sendUpdateSpy.mockImplementation(
-        async (update: Record<string, unknown>) => {
-          if (update['sessionUpdate'] === 'user_message_chunk') {
-            throw new Error('replay failed');
-          }
-          if (update['sessionUpdate'] === 'tool_call_update') {
-            throw new Error('dangling cleanup failed');
-          }
-        },
-      );
-
-      let caughtError: unknown;
-      try {
-        await replayer.replay([danglingRecord, failingRecord]);
-      } catch (error) {
-        caughtError = error;
-      }
-
-      expect(caughtError).toBeInstanceOf(AggregateError);
-      expect((caughtError as AggregateError).message).toBe(
-        'Replay and dangling-cleanup both failed',
-      );
-      expect(
-        (caughtError as AggregateError).errors.map((error) =>
-          error instanceof Error ? error.message : String(error),
-        ),
-      ).toEqual(['replay failed', 'dangling cleanup failed']);
     });
 
     it('should not fail function calls that have matching tool results', async () => {

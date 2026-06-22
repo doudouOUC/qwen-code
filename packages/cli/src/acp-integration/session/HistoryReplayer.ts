@@ -59,34 +59,10 @@ export class HistoryReplayer {
   async replay(records: ChatRecord[]): Promise<void> {
     this.pendingReplayToolCalls.clear();
     try {
-      let replayError: unknown;
-      try {
-        for (const record of records) {
-          await this.replayRecord(record);
-        }
-      } catch (error) {
-        replayError = error;
+      for (const record of records) {
+        await this.replayRecord(record);
       }
-
-      let danglingError: unknown;
-      try {
-        await this.failDanglingToolCalls();
-      } catch (error) {
-        danglingError = error;
-      }
-
-      if (replayError && danglingError) {
-        throw new AggregateError(
-          [replayError, danglingError],
-          'Replay and dangling-cleanup both failed',
-        );
-      }
-      if (replayError) {
-        throw replayError;
-      }
-      if (danglingError) {
-        throw danglingError;
-      }
+      await this.failDanglingToolCalls();
     } finally {
       this.pendingReplayToolCalls.clear();
       this.setActiveRecordId(null);
