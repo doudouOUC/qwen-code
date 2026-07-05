@@ -7065,6 +7065,16 @@ describe('createServeApp', () => {
       expect(unknownGroupAssignment.status).toBe(404);
       expect(unknownGroupAssignment.body.code).toBe('group_not_found');
 
+      const unknownGroupDelete = await host(
+        request(app).delete(
+          `/workspace/${encodeURIComponent(
+            WS_BOUND,
+          )}/session-groups/missing-group`,
+        ),
+      );
+      expect(unknownGroupDelete.status).toBe(404);
+      expect(unknownGroupDelete.body.code).toBe('group_not_found');
+
       const missingSession = await host(
         request(app).patch(
           '/session/550e8400-e29b-41d4-a716-446655440099/organization',

@@ -6360,6 +6360,23 @@ describe('ACP Streamable HTTP transport (over the wire)', () => {
 
         await post(connId, {
           jsonrpc: '2.0',
+          id: 731,
+          method: '_qwen/workspace/session_groups/delete',
+          params: { workspaceCwd: '/ws', groupId: group.id },
+        });
+        expect(await reader.next()).toMatchObject({
+          error: {
+            code: -32602,
+            data: {
+              errorKind: 'group_not_found',
+              field: 'groupId',
+            },
+          },
+          id: 731,
+        });
+
+        await post(connId, {
+          jsonrpc: '2.0',
           id: 74,
           method: 'session/list',
           params: {

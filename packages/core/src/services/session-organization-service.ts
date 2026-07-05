@@ -319,7 +319,11 @@ export class SessionOrganizationService {
       const before = store.groups.length;
       store.groups = store.groups.filter((group) => group.id !== groupId);
       if (store.groups.length === before) {
-        return false;
+        throw new SessionOrganizationError(
+          `Group not found: ${groupId}`,
+          'group_not_found',
+          'groupId',
+        );
       }
       const now = new Date().toISOString();
       for (const session of Object.values(store.sessions)) {
@@ -552,23 +556,41 @@ export class SessionOrganizationService {
       this.warnMalformedGroupEntry(value);
       return undefined;
     }
+    const name = this.normalizeStoredGroupName(value);
+    if (name === undefined) {
+      return undefined;
+    }
     const color = isSupportedGroupColor(value['color'])
       ? value['color']
       : FALLBACK_GROUP_COLOR;
     if (color !== value['color']) {
       this.warnOnce(
-        `unknown-group-color:${value['id']}\0${value['color']}`,
-        `Session group "${value['name']}" (id: ${value['id']}) uses unsupported color "${value['color']}"; using "${FALLBACK_GROUP_COLOR}"`,
+        `unknown-group-color:${value['id']}`,
+        `Session group (id: ${value['id']}) uses unsupported color; using "${FALLBACK_GROUP_COLOR}"`,
       );
     }
     return {
       id: value['id'],
-      name: value['name'],
+      name,
       color,
       order: value['order'],
       createdAt: value['createdAt'],
       updatedAt: value['updatedAt'],
     };
+  }
+
+  private normalizeStoredGroupName(
+    value: Record<string, unknown>,
+  ): string | undefined {
+    try {
+      return normalizeGroupName(value['name']);
+    } catch {
+      this.warnOnce(
+        `invalid-group-name:${value['id']}`,
+        `Session group (id: ${value['id']}) has invalid name on disk; skipping`,
+      );
+      return undefined;
+    }
   }
 
   private dedupeGroups(groups: SessionGroup[]): SessionGroup[] {

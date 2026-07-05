@@ -1369,7 +1369,7 @@ Update a custom session group. Strict mutation gate. Pre-flight `caps.features.i
 
 ### `DELETE /workspace/:id/session-groups/:groupId`
 
-Delete a custom session group. Strict mutation gate. Pre-flight `caps.features.includes('session_organization')`. Sessions referencing the group are cleared to `groupId: null`; pinned state is preserved. Response is `{ "deleted": true }` when a group was removed and `{ "deleted": false }` when the id did not exist.
+Delete a custom session group. Strict mutation gate. Pre-flight `caps.features.includes('session_organization')`. Sessions referencing the group are cleared to `groupId: null`; pinned state is preserved. Response is `{ "deleted": true }` when a group was removed. Unknown group ids return `404 { code: "group_not_found" }`.
 
 ### `POST /sessions/delete`
 

@@ -217,7 +217,69 @@ describe('SessionOrganizationService', () => {
     }).listGroups();
 
     expect(warnings).toEqual([
-      'Session group "Future" (id: group-future) uses unsupported color "teal"; using "blue"',
+      'Session group (id: group-future) uses unsupported color; using "blue"',
+    ]);
+  });
+
+  it('drops stored groups with invalid names', async () => {
+    await fs.mkdir(path.dirname(service.getStorePath()), { recursive: true });
+    await fs.writeFile(
+      service.getStorePath(),
+      JSON.stringify({
+        schemaVersion: 1,
+        groups: [
+          {
+            id: 'group-valid',
+            name: ' Valid ',
+            color: 'red',
+            order: 0,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+          {
+            id: 'group-empty',
+            name: '   ',
+            color: 'blue',
+            order: 1,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+          {
+            id: 'group-control',
+            name: 'Bad\u001bName',
+            color: 'green',
+            order: 2,
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ],
+        sessions: {
+          [sessionIdA]: {
+            groupId: 'group-control',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        },
+      }),
+      'utf8',
+    );
+
+    await expect(service.listGroups()).resolves.toEqual({
+      groups: [
+        expect.objectContaining({
+          id: 'group-valid',
+          name: 'Valid',
+        }),
+      ],
+      colorOptions: GROUP_COLOR_OPTIONS,
+    });
+    const snapshot = await service.readSnapshot();
+    expect(snapshot.sessions.get(sessionIdA)).toEqual(
+      expect.objectContaining({ groupId: null }),
+    );
+    expect(warnings).toEqual([
+      'Session group (id: group-empty) has invalid name on disk; skipping',
+      'Session group (id: group-control) has invalid name on disk; skipping',
+      'Dropped orphaned session group reference: session 550e8400-e29b-41d4-a716-446655440000 references missing group group-control',
     ]);
   });
 
@@ -328,6 +390,11 @@ describe('SessionOrganizationService', () => {
     await expect(
       service.updateGroup('missing-group', { name: 'Missing' }),
     ).rejects.toMatchObject({ code: 'group_not_found', field: 'groupId' });
+
+    await expect(service.deleteGroup('missing-group')).rejects.toMatchObject({
+      code: 'group_not_found',
+      field: 'groupId',
+    });
 
     await expect(
       service.updateSessionOrganization(sessionIdA, {
