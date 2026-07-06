@@ -49,7 +49,8 @@
 - Primary workspace：daemon 启动时的第一个 workspace。所有 legacy route 默认使用它。
 - Workspace runtime：一个 workspace 对应的一组服务对象，包括 bridge、workspace service、filesystem factory、MCP sender registry、memory task lane、status provider 等。
 - Workspace registry：daemon 进程内的 runtime 注册表，负责 workspace 解析、session 到 workspace 的索引、聚合关闭和聚合状态。
-- Workspace key：canonicalized absolute cwd。首版直接作为内部 key；HTTP path 中继续使用 `encodeURIComponent(cwd)`。
+- Workspace key：canonicalized absolute cwd。首版作为内部主 key，避免同一个目录被不同字符串重复注册。
+- Workspace id：对 canonical cwd 计算出的稳定 opaque id，复用现有 per-workspace storage/identity hash。Phase 2a 起在 `workspaces[].id` 暴露；Phase 2b plural route resolver 同时接受 id 和 encoded cwd，给反向代理不可靠透传 `%2F` 的部署提供逃生口。
 - Workspace root：文件系统 root。一个 workspace runtime 可以包含多个 filesystem roots，但它们仍属于同一个 workspace runtime。
 
 ## 方案选项
@@ -81,7 +82,7 @@
 - 复用现有单 workspace bridge，不把最复杂的 ACP 会话状态改成多维 map。
 - settings、MCP、permissions、memory、status、filesystem trust 可以按 workspace 隔离。
 - 旧 route 保持 primary 默认，兼容性好。
-- 可以分阶段落地：先单 runtime registry 无行为变化，再启用多 workspace。
+- 可以分阶段落地：先做单 runtime registry 和 gated prep，再启用多 workspace。
 
 缺点：
 
@@ -165,6 +166,7 @@ Express app
 
 ```ts
 interface WorkspaceRuntime {
+  readonly id: string;
   readonly key: string;
   readonly isPrimary: boolean;
   readonly bridge: AcpSessionBridge;
@@ -179,6 +181,7 @@ interface WorkspaceRegistry {
   list(): readonly WorkspaceRuntime[];
   resolveWorkspace(input: string | undefined): WorkspaceRuntime;
   resolveRequiredWorkspace(input: string): WorkspaceRuntime;
+  resolveWorkspaceSelector(selector: string): WorkspaceRuntime;
   noteSession(sessionId: string, workspaceKey: string): void;
   forgetSession(sessionId: string): void;
   resolveSession(sessionId: string): WorkspaceRuntime | undefined;
@@ -189,6 +192,8 @@ interface WorkspaceRegistry {
 `resolveWorkspace(undefined)` 返回 primary，兼容 legacy behavior。传入 string 时必须是已注册 workspace 的 canonical path 或可 canonicalize 到已注册 workspace；未知 string 抛出 `workspace_mismatch`。如果实现需要不抛错的探测接口，应另设 `tryResolveWorkspace(input): WorkspaceRuntime | undefined`，不要让一个签名同时表达“legacy fallback”和“未知 workspace 可忽略”两种语义。
 
 `resolveRequiredWorkspace(input)` 用在 `/workspaces/:workspace/...` 这类显式 workspace route。解析失败返回 `workspace_mismatch`。
+
+`resolveWorkspaceSelector(selector)` 用在 Phase 2b 之后的 plural route path 参数。它先 URL-decode selector；decoded 值如果以 `/` 开头，则按 canonical cwd 精确匹配；否则按 `workspaces[].id` 查找。这样兼容现有 encoded cwd 调试习惯，同时为代理环境提供不含 `%2F` 的稳定 id 路径。
 
 `resolveSession(sessionId)` 通过 session ownership resolver 找 runtime。Phase 2a 可以扫描 runtime live session summary；后续引入 session index 后先查 index，找不到时再扫描，扫描仍找不到时按现有 `session_not_found` 行为返回。
 
@@ -240,6 +245,7 @@ workspace-scoped 对象放进 runtime：
 6. `POST /workspaces/:workspace/reload` 只重算目标 runtime 的 overlay 和 settings cache；如果该 runtime 的 ACP child 已经存活，响应里返回 `requiresChannelRestart: true`，说明新 env 只会应用到重启后的 child。
 7. `GET /workspaces/:workspace/env` 返回目标 runtime 的 redacted effective env 视图，而不是“父进程 env + overlay”的原始合并。该视图不得包含其他 workspace overlay 贡献的 key/value；尤其 non-primary 不能看到 primary `.env` secret。
 8. daemon 父进程内执行的 workspace-scoped 操作也必须读取目标 runtime 的 effective env，例如 providers status、voice transcription、auth provider install/model resolution、workspace preflight 等。实现应把 `effectiveEnv` 显式传给这些 helpers，或让 runtime 提供 env-aware settings/provider facade；不要在 async handler 内临时改写全局 `process.env`，那会重新引入跨 workspace race。
+9. Phase 2a 验收必须加入 lint/grep 守卫：serve 层和 `@qwen-code/acp-bridge` 包内禁止 workspace-scoped 代码直接读取 `process.env`，base env 初始化、进程级 flag 读取和测试 fixture 通过明确白名单放行。推荐用 ESLint `no-restricted-properties` / `no-restricted-syntax` 规则挡住回归。
 
 这是多 runtime 架构下的必修项；否则 workspace reload 会跨 workspace 污染，或者 non-primary child 会继承 primary workspace 的 `.env` secret。
 
@@ -263,7 +269,7 @@ workspace-scoped 对象放进 runtime：
 首版使用静态 workspace 列表：
 
 - 第一个 workspace 是 primary。
-- 支持重复传 `--workspace <dir>` 或新增等价配置项来声明 additional workspaces。
+- 支持重复传 `--workspace <dir>` 来声明 additional workspaces；v1 不新增 `--primary-workspace`，first wins 规则和 `workspaces[].primary` 已足够可观察，未来如有需要再添加显式 primary flag。
 - 如果只传一个 workspace，行为和现在一致。
 - `--workspace` 当前是单值参数；实现 repeatable 语义前必须先显式处理 yargs 可能给出的 array 形态。Phase 2a feature gate 未摘除前，只要解析到多个 explicit workspaces 就 boot error，而不是把 array 误当 string 继续启动。
 - 不从请求体里的任意 cwd 动态创建 runtime。
@@ -274,11 +280,13 @@ workspace-scoped 对象放进 runtime：
 1. 所有 workspace 都必须是 absolute path 并 canonicalize 成真实目录。
 2. duplicate workspace 只保留一个。
 3. 首版拒绝 nested workspace 列表，避免同一个 path 同时命中父子 runtime。
-4. additional workspace 必须加载自己的 trust/settings 状态。
+4. 每个 explicit workspace 都复用现有 workspace trust/settings 存储判定，不发明新的默认 trust 策略；从未被 trust 过的 registered workspace 就是 `trusted: false`。
 5. explicit workspace 即使 untrusted 也可以注册，但 runtime 标记为 `trusted: false`，写文件、runtime MCP mutation、memory write 等 mutating route 返回 403；implicit IDE secondary roots 仍按现有逻辑过滤 untrusted root，不自动升级成 workspace runtime。
+6. 多 workspace boot 日志必须列出每个 registered workspace 的 cwd/id/primary/trusted 状态，便于自动化解释后续 403。
 
 untrusted workspace 语义：
 
+- 下面的严格 gate 只在多个 explicit workspace 的 daemon 中生效。单 workspace 模式保持当前行为：untrusted bound workspace 仍可启动 session，文件写按既有 trust boundary 拒绝，并保留现有 boot warning。
 - `POST /session { cwd }`、load/resume/fork/branch 这类会创建或恢复执行上下文的操作，以及 ACP dispatcher 的 `session/new`、load、resume，都按 mutation-like 操作处理。目标 workspace 不 trusted 时返回 403 `untrusted_workspace`，不得 spawn ACP child。
 - untrusted workspace 可以出现在 `/capabilities.workspaces[]`、daemon status 和 read-only list/status route 中，entry 必须带 `trusted: false`，让客户端提前禁用写操作入口。
 - legacy `/workspace/trust/request` 继续作用 primary；workspace-qualified trust route 落地后必须更新目标 runtime 的 trusted state、settings/fs boundary、capabilities/status cache 和 event。
@@ -289,6 +297,7 @@ untrusted workspace 语义：
 
 - 保留现有 `maxSessions` 语义为每个 workspace runtime 的 session 上限。
 - 增加 `maxTotalSessions` 作为进程级上限。若 `maxSessions` 是有限正数，默认值建议为 `maxSessions * workspaceCount`，这样单 workspace 和“原本多个 daemon”迁移过来的容量预期不变；若 `maxSessions` 为空/无限，则 `maxTotalSessions` 默认也为空/无限。用户可以显式设更低的全局上限。注意默认 `maxSessions * workspaceCount` 不会比 per-workspace cap 更早触发，因此它是兼容默认，不是额外 RSS 保护；容量规划应按 workspace 数量乘以单 session/child 成本估算。
+- 多 workspace 模式下 boot 日志必须打印 resolved `maxSessionsPerWorkspace` 和 `maxTotalSessions`，避免运维误以为旧的进程级 `--max-sessions` 仍是唯一上限。
 - `/capabilities` 和 daemon status 必须显式区分 `maxSessionsPerWorkspace` 与 `maxTotalSessions`。旧文档里 `--max-sessions` 是进程级并发 session 上限；如果多 workspace 模式把它解释成 per-workspace 上限，就要在用户文档、兼容性说明和 changelog 中明确这是多 workspace 模式下的语义扩展。
 - `maxTotalSessions` 必须在 serve/registry 层执行，而不是交给单个 runtime bridge。registry 汇总各 bridge 的 live `sessionCount`，并维护进程级 in-flight reservation。
 - total cap admission 必须在“即将新建 session”边界原子占位，spawn/load/resume/branch 等 fresh session 创建失败后回滚，session close/delete 后释放。两个 workspace 并发创建 session 时不能同时越过总上限。
@@ -327,8 +336,8 @@ untrusted workspace 语义：
 {
   "workspaceCwd": "/repo/a",
   "workspaces": [
-    { "cwd": "/repo/a", "primary": true, "trusted": true },
-    { "cwd": "/repo/b", "primary": false, "trusted": false }
+    { "id": "ws_a_hash", "cwd": "/repo/a", "primary": true, "trusted": true },
+    { "id": "ws_b_hash", "cwd": "/repo/b", "primary": false, "trusted": false }
   ],
   "limits": {
     "maxSessionsPerWorkspace": 20,
@@ -343,7 +352,7 @@ untrusted workspace 语义：
 兼容约束：
 
 - `workspaceCwd` 继续表示 primary workspace，不改成“当前请求 workspace”或“任意 workspace”。
-- `workspaces[]` 是新客户端判断一个 daemon 是否能服务某 workspace 的唯一列表。每个 entry 增加 `trusted`，让 workspace picker 和 SDK 可以在发起 mutation 前禁用写操作入口；不 trusted 的 workspace 仍可展示 read-only 状态。
+- `workspaces[]` 是新客户端判断一个 daemon 是否能服务某 workspace 的唯一列表。每个 entry 增加稳定 `id` 和 `trusted`；`id` 复用现有 per-workspace storage/identity hash，`trusted` 让 workspace picker 和 SDK 可以在发起 mutation 前禁用写操作入口。不 trusted 的 workspace 仍可展示 read-only 状态。
 - channel worker 这类现有消费者不能只读 `workspaceCwd` 做严格相等；多 workspace 模式下必须改为检查 requested workspace 是否存在于 `workspaces[]`。
 - `/daemon/status` 同样保留旧的 `daemon.workspaceCwd` / 顶层 `workspaceCwd` primary 语义，同时新增聚合 `workspaces[]`。`runtime.sessions.active` 建议表示进程总 active sessions；如果 UI 需要按 workspace 展示，必须读 `workspaces[].sessions`，不要从旧字段反推。
 - workspace-less legacy routes 继续 primary-only。已经带 workspace path 参数的 read-only legacy routes 可以放宽到 registered workspace，例如 `GET /workspace/:id/sessions`、`GET /workspace/:id/session-groups`；mutation 类 singular legacy routes 仍保持 primary-only，或要求使用 plural namespace。
@@ -394,16 +403,22 @@ POST /session
 /workspaces/:workspace/...
 ```
 
-`:workspace` 首版使用 `encodeURIComponent(canonicalCwd)`。这和现有 SDK 的 `/workspace/:id/sessions` 风格一致，避免额外引入 opaque id。
+Phase 2a 不新增 plural URL surface，只放宽既有 `GET /workspace/:id/sessions` 这类 read-only legacy route。它今天的 `:id` 仍沿用 encoded cwd，因此没有增加新的 reverse proxy 风险面。
+
+Phase 2b 第一条 plural route 落地前，`:workspace` selector 必须同时支持两种形态：
+
+- stable workspace id：来自 capabilities/status 的 `workspaces[].id`，推荐新客户端和代理部署优先使用；
+- encoded cwd：`encodeURIComponent(canonicalCwd)`，保留调试便利和现有 SDK 风格。
 
 解析规则必须集中在一个 helper 内：
 
-- Express 解码后的值必须是 absolute path，且长度不能超过现有 workspace path 上限。
-- canonicalize 后必须精确命中 registry；未知 workspace 返回 `workspace_mismatch`。
+- URL decode 后如果值以 `/` 开头，按 absolute path canonicalize，并要求精确命中 registry；未知 workspace 返回 `workspace_mismatch`。
+- URL decode 后如果值不以 `/` 开头，按 `workspaces[].id` 查 registry；未知 id 返回 `workspace_mismatch`。
+- id 与 absolute path 无歧义；v1 只支持 absolute workspace path。
 - 不允许 prefix / startsWith 判断 workspace 归属，nested workspace 首版已在启动时拒绝。
 - plural namespace 的具体 routes 必须在 catch-all routes 之前注册；SDK 的 ACP route table 也要同步增加 `/workspaces/:workspace/...` pattern，避免新客户端经 HTTP fallback 时仍走 singular legacy path。
 - rate-limit tier 解析要显式识别 plural namespace，并继承同语义 singular route 的档位。实现上可以先解析 `/workspaces/:workspace` 前缀，再对剩余 path 复用现有 tier 规则：写文件、settings、tools、lifecycle 等 mutation 仍是 `mutation`，sessions/status/list/file read 仍是 `read`，未来如果出现 workspace-qualified prompt 类 route 必须归入 `prompt`。不要让新 plural route 只依赖 fallback 行为而和旧 route 档位分裂。
-- 部署文档需要提示 reverse proxy 兼容性：encoded absolute cwd 必然包含 `%2F`，nginx/LB 可能解码、normalize 或拒绝这类 path。现有 `/workspace/:id/sessions` 已有同类风险，但 `/workspaces/:workspace/acp` 是 WebSocket 主通道，代理部署更常见；如果该风险成为 blocker，opaque workspace id 应提前进入后续阶段。
+- 部署文档仍需提示 reverse proxy 兼容性：encoded absolute cwd 必然包含 `%2F`，nginx/LB 可能解码、normalize 或拒绝这类 path。支持 `workspaces[].id` 后，代理部署可直接使用 id route，尤其是后续 `/workspaces/:workspace/acp` 和 `/workspaces/:workspace/voice/stream` 这类 WebSocket 主通道。
 
 推荐新增或镜像的 route：
 
@@ -437,10 +452,12 @@ workspace-less legacy routes 继续保留，并绑定 primary：
 处理细节：
 
 1. Phase 2a 可以先扫描 registered runtimes 的 live session summaries 来解析 session owner。这个版本只承诺 live session prompt/events/cancel/permission 闭环；扫描是同步内存操作，不应触发 lazy child spawn。
-2. 在 workspace-qualified ACP/Web Shell、broader session-scoped REST、telemetry attribution 或 persisted-session 管理进入前，推荐由 registry 订阅或注入 bridge 的 session lifecycle callback，集中维护 `noteSession` / `forgetSession`。bridge 每次注册或移除 live session 时上报 owning workspace，REST route 和 ACP dispatcher 都不需要手工填索引。
-3. 如果实现阶段暂时无法改 bridge callback，索引填充点也必须覆盖所有 session 创建路径，不只 REST route；至少包括 `POST /session`、load、resume、fork、branch，以及各 runtime-bound ACP dispatcher 内部的 `session/new`、load、resume 处理。
-4. session close、delete、bridge 返回 not found 后调用 `forgetSession`。child crash 后的 stale index 可以惰性清理：下次按索引命中 runtime 但 bridge 返回 not found 时再 forget。
-5. 如果多个 runtime 同时报告相同 session id，返回 server error 并记录高优先级日志；session id 理论上应全局唯一。
+2. Phase 2a scan miss 必须返回 404 `session_not_found`，绝不 fallback 到 primary runtime。
+3. Phase 2a 不把 load/resume 纳入 non-primary session-scoped 集合。legacy resume 保持只看 primary storage；非 primary persisted session 在 Phase 2a 尝试 resume 应自然 404。不要在 Phase 2a 顺手扫描所有 workspace 的 persisted storage，否则可能在 primary runtime 中恢复出 cwd 错误的 session。
+4. 在 workspace-qualified ACP/Web Shell、broader session-scoped REST、telemetry attribution 或 persisted-session 管理进入前，推荐由 registry 订阅或注入 bridge 的 session lifecycle callback，集中维护 `noteSession` / `forgetSession`。bridge 每次注册或移除 live session 时上报 owning workspace，REST route 和 ACP dispatcher 都不需要手工填索引。
+5. 如果实现阶段暂时无法改 bridge callback，索引填充点也必须覆盖所有 session 创建路径，不只 REST route；至少包括 `POST /session`、load、resume、fork、branch，以及各 runtime-bound ACP dispatcher 内部的 `session/new`、load、resume 处理。
+6. session close、delete、bridge 返回 not found 后调用 `forgetSession`。child crash 后的 stale index 可以惰性清理：下次按索引命中 runtime 但 bridge 返回 not found 时再 forget。
+7. 如果多个 runtime 同时报告相同 session id，返回 server error 并记录高优先级日志；session id 理论上应全局唯一。
 
 Phase 2a 必须纳入 session-scoped 分发的最小接口：
 
@@ -501,7 +518,7 @@ SSE、auth device-flow、voice WebSocket 是多 workspace 容易漏掉的旁路�
 
 首版不要求一次性重写所有 route。推荐按以下顺序落地：
 
-1. 引入单 runtime `WorkspaceRegistry`，保持所有测试通过，无行为变化。
+1. 引入单 runtime `WorkspaceRegistry`，保持所有测试通过，不改变 route/session 行为；daemon log/telemetry identity 的可观察变化按 Phase 1 兼容说明处理。
 2. Phase 2a 只做 multi-workspace sessions only：`POST /session` 支持 `cwd` 路由到 registered workspace，并同批完成 prompt、events、cancel、session-scoped permission 的 runtime dispatch。`GET /workspace/:id/sessions` 接受 registered workspace，便于验证 non-primary session 可列出。
 3. Phase 2a 同批交付 capabilities/status registry 视图、`multi_workspace_sessions` tag、`maxTotalSessions` admission、trust gate 和 per-runtime env overlay。非 sessions-only 闭环所需的 workspace API 首版继续 primary-only，或返回明确 unsupported / `workspace_mismatch`，不要半支持。
 4. Phase 2b 再补 session ownership hardening 和基础 reads：bridge lifecycle session index、`GET /workspaces/:workspace/sessions`、参数化 read-only legacy session groups，以及 model/mode、metadata/status/tasks、A2UI 等不触达 persisted sidecar 的 session-adjacent route。
@@ -606,13 +623,17 @@ Runtime MCP 与 client-provided MCP 都按 workspace runtime 隔离。
   "workspaces": [
     {
       "cwd": "/repo/a",
+      "id": "ws_a_hash",
       "primary": true,
+      "trusted": true,
       "bridge": { "state": "connected" },
       "sessions": { "live": 2 }
     },
     {
       "cwd": "/repo/b",
+      "id": "ws_b_hash",
       "primary": false,
+      "trusted": false,
       "bridge": { "state": "idle" },
       "sessions": { "live": 0 }
     }
@@ -636,7 +657,7 @@ status 聚合规则：
 - v1 rate limiter 仍是 daemon 进程级。一个 workspace 的高流量客户端可能耗尽全局配额，影响其他 workspace；这不是 workspace 隔离配额。需要 per-workspace 公平性时后续再引入 workspace-aware rate limiter。
 - `maxTotalSessions` 是进程级硬上限，`maxSessionsPerWorkspace` 是单 workspace 上限。默认 `maxSessionsPerWorkspace * workspaceCount` 只是兼容默认，不提供额外保护；部署方做容量规划时应同时看两个值，并按 active workspace 数量估算 child/session RSS。
 - 每个 runtime 有自己的 event bus。只监控当前 workspace 的 Web Shell picker 可以连接一个 workspace；聚合 dashboard 若要同时观察全部 workspace，v1 需要 N 条 SSE/WS 连接或后续新增 daemon-level event aggregation。
-- `/workspaces/:workspace/...` 使用 encoded cwd 时会在 URL path 中出现 `%2F`。反向代理可能提前解码或 normalize 该 path，尤其影响 workspace-qualified ACP/voice WebSocket；代理部署需要显式验证，后续 opaque workspace id 是降低该风险的主要动机。
+- `/workspaces/:workspace/...` 如果使用 encoded cwd，会在 URL path 中出现 `%2F`。反向代理可能提前解码或 normalize 该 path，尤其影响 workspace-qualified ACP/voice WebSocket；代理部署需要显式验证，且应优先使用 `workspaces[].id`。Phase 2b 起 plural routes 同时接受 stable workspace id 和 encoded cwd，encoded cwd 主要保留给调试和既有兼容。
 - v1 不支持 dynamic workspace add/remove，因此 workspace 数量由启动配置决定。
 
 ## Failure Paths
@@ -695,11 +716,11 @@ Phase 2 摘除 multi-workspace feature gate 的 PR 必须同批更新公开文�
 至少覆盖：
 
 - `docs/users/qwen-serve.md`：CLI flags 表中说明 `--workspace` 可重复；`--max-sessions` 在 multi-workspace 模式下是 per-workspace 上限，并区分 `maxSessionsPerWorkspace` / `maxTotalSessions`；改写 “Multi-session & multi-workspace deployment” 小节，说明单 daemon 多 workspace runtime、primary workspace、legacy route primary-only 和容量规划。
-- `docs/developers/qwen-serve-protocol.md`：更新 `/capabilities` schema，包含 `workspaces[]`、`workspaces[].trusted`、`limits`、`multi_workspace_sessions` feature tag；更新 `workspace_mismatch` 错误体与 `boundWorkspaces` / registered workspace 语义；补 plural `/workspaces/:workspace/...` route 参考。
+- `docs/developers/qwen-serve-protocol.md`：更新 `/capabilities` schema，包含 `workspaces[]`、`workspaces[].id`、`workspaces[].trusted`、`limits`、`multi_workspace_sessions` feature tag；更新 `workspace_mismatch` 错误体与 `boundWorkspaces` / registered workspace 语义；补 plural `/workspaces/:workspace/...` route 参考，并说明 `:workspace` 同时支持 stable id 和 encoded cwd。
 - `docs/developers/examples/daemon-client-quickstart.md`：把“multi-workspace deployments run one daemon per workspace”改成优先使用 multi-workspace daemon 的 session workspace picker；`WorkspaceDaemonClient` 作为后续 workspace-qualified REST facade 介绍，保留多 daemon 作为 fallback。
 - `docs/users/qwen-serve-deploy-local.md`：更新 “Cross-host federation / multi-daemon coordination on one host” 限制说明，把 multi-daemon 降级为 fallback / federation 形态，而不是唯一 multi-workspace 部署方式。
 - 全仓公开文档里其他“one daemon = one workspace”承诺也要一起扫掉或降级为 legacy/fallback 描述，例如 `docs/developers/daemon/*` 和 channel adapter 文档中的 daemon workspace 定义。
-- changelog / 兼容性小节：显式记录 `--max-sessions` 语义扩展、`maxTotalSessions`、workspace-qualified routes、feature gate 摘除条件、单 daemon 故障半径、无 per-workspace ACL、global rate-limit 公平性限制，以及 encoded cwd path 对 reverse proxy 的要求。
+- changelog / 兼容性小节：显式记录 `--max-sessions` 语义扩展、`maxTotalSessions`、daemon log/telemetry identity 从 workspace-scoped 改为 daemon-scoped、workspace-qualified routes、feature gate 摘除条件、单 daemon 故障半径、无 per-workspace ACL、global rate-limit 公平性限制，以及 encoded cwd path 对 reverse proxy 的要求。
 
 ## 测试策略
 
@@ -711,43 +732,46 @@ Phase 2 摘除 multi-workspace feature gate 的 PR 必须同批更新公开文�
 2. `POST /session` omitted cwd 使用 primary，非 primary cwd 路由到对应 bridge，未知 cwd 返回 `workspace_mismatch`。
 3. Phase 2a multi-workspace sessions only：非 primary session 创建后，prompt、events、cancel、session-scoped permission vote 都命中目标 runtime。
 4. Phase 2a live session ownership resolver 可以通过扫描 registered runtimes 工作；Phase 2b/ACP 前的 session index 命中、stale fallback、not found 再单独覆盖。
-5. Phase 2a 以外的 workspace API 在未实现 plural route 前保持 primary-only 或返回明确 unsupported / `workspace_mismatch`。
-6. Phase 2a 中 parameterized read-only legacy `GET /workspace/:id/sessions` 接受 registered workspace；`session-groups` read 和对应 mutations 后续按 Phase 2b/3 迁移。
-7. legacy workspace-less `/workspace/...` 和 `/file` 仍只作用 primary。
-8. workspace-qualified file route 使用目标 runtime fsFactory。
-9. daemon status 聚合多个 runtime，不因 idle runtime 强制启动 child。
-10. preheat 默认只作用 primary；non-primary runtime 保持 lazy，status 能表达 per-workspace preheat 状态。
-11. `/workspaces/:workspace/acp` 使用目标 runtime 的 bridge 和 MCP sender registry。
-12. multi-workspace 模式下父进程 env 不包含任何 workspace `.env` / workspace `settings.env` 贡献；两个 workspace 有同名 `.env` key 时，各自 ACP child、daemon-side workspace helpers 和 env/status 视图都只看到各自 overlay，non-primary 不继承 primary secret。
-13. Phase 2a 中 channel workers 保持 primary-only，或在 multi-workspace + non-primary channel 选择时 boot error；worker 分组、pidfile 和 status 后续单独落地。
-14. capabilities/status 同时返回 `maxSessionsPerWorkspace` 和 `maxTotalSessions`。
-15. `maxTotalSessions` admission 在并发跨 workspace 创建时原子占位，spawn 失败回滚，attach 不计数，拒绝为 503 + `Retry-After: 5`。
-16. `GET /session/:id/events`、`POST /session/:id/permission/:requestId`、`POST /session/:id/a2ui-action` 按 session id 命中目标 runtime；无 session 的 `POST /permission/:requestId` 保持 primary-only 或命中显式 request index。
-17. device-flow start/get/cancel 在两个 workspace 同时存在时，事件只发给 owning runtime，跨 workspace 查询不泄露 verification fields。
-18. Phase 2a 中 `/voice/stream` primary-only；`/workspaces/:workspace/voice/stream` 在 upgrade dispatcher ready 后单独落地，并使用目标 workspace settings；voice 并发 cap 不随 workspace 数量无意放大。
-19. ACP dispatcher 下 `_qwen/workspace/*` body 里的 `workspaceCwd` 只能匹配 mounted workspace；不匹配返回 `workspace_mismatch`。
-20. 后续 `/workspaces/:workspace/sessions/delete|archive|unarchive` 只操作目标 workspace；legacy `/sessions/*` 只操作 primary。
-21. SDK `acpRouteTable`、`DaemonClient` workspace helpers 使用 plural `/workspaces/:workspace/...`，legacy singular path 只保留兼容；`WorkspaceDaemonClient` 不进入 Phase 2a。
-22. 后续 serve-managed channel pidfile 能表达多个 workspace workers，`qwen channel status` 按 workspace 分组展示，旧单 worker 字段保持兼容。
-23. HTTP telemetry 对 workspace-qualified、session-scoped、unknown workspace 请求分别打正确 workspace/unknown 属性，不再全部使用 primary hash。
-24. auth provider install 在 non-primary workspace 下写目标 workspace settings，legacy route 仍写 primary。
-25. `load/resume` 非 primary persisted session 必须传 workspace，`export` 等无 selector 的 persisted session GET 保持 primary-only，并提供 workspace-qualified 替代 route。
-26. daemon-side provider/voice/preflight/auth helpers 使用目标 runtime effective env，不允许 async 临时改写 `process.env`。
-27. daemon metrics gauge、permission audit ring、child resource sampler 都能聚合或标记 workspace。
-28. user-scope settings 写入按 settings 文件路径串行化；v1 rate limiter 明确保持进程级。
-29. capabilities 顶层 `features[]` 按 primary workspace 推导；non-primary settings/reload 不会失效或翻转 primary feature cache；workspace-specific voice 判断走 workspace status。
-30. capabilities `workspaces[]` entry 返回 `trusted`，untrusted workspace 的 mutation route 和 session 创建/恢复都返回 403 `untrusted_workspace` 且不 spawn child。
-31. 后续 `/workspaces/:workspace/acp` 和 `/workspaces/:workspace/voice/stream` 的 HTTP server upgrade listener 能解析 workspace 并分发到目标 runtime。
-32. Phase 2a 未全部落地前，传入多个 `--workspace` 直接 boot error，包括 yargs 解析出的 array 形态；最后摘掉门闩时再跑完整 Phase 2a 验收。
-33. Phase 2a 允许先扫描 live runtimes 做 session owner resolution；后续 ACP dispatcher `session/new`、load、resume 创建的 session 必须进入 registry session index，随后 REST 侧 export、organization、telemetry workspace 归属不依赖 fallback 扫描。
-34. plural `/workspaces/:workspace/...` route 的 rate-limit tier 与同语义 singular route 一致：read 归 `read`，mutation 归 `mutation`，prompt 类归 `prompt`。
-35. Phase 2a 摘除 feature gate 的 PR 同批更新用户文档、协议文档、quickstart、local deploy 文档和 changelog，不再残留“1 daemon = 1 workspace”作为唯一部署方式，并明确首个 tag 是 `multi_workspace_sessions` 而不是 broader `multi_workspace`。
-36. trust 从 trusted 翻转为 untrusted 后，目标 runtime 更新 status/capabilities、停止或 drain active child/sessions、清理 session index，并拒绝后续 mutation；untrusted 翻转为 trusted 后重新加载 settings/fs boundary/env overlay。
-37. 多 daemon fallback 与单 daemon 多 workspace 的故障半径在用户文档中可见：重启/升级单 daemon 会影响全部 registered workspaces。
-38. daemon token 不提供 per-workspace ACL 的限制在 docs/capacity/compatibility 中明确；token 持有者可访问全部 registered workspaces 的允许 surface。
-39. 默认 `maxTotalSessions = maxSessionsPerWorkspace * workspaceCount` 不提供额外 RSS 保护的说明进入公开文档；显式更低 total cap 才会先于 per-workspace cap 生效。
-40. 聚合 dashboard 若监听全部 workspaces，需要 N 条 workspace event 连接或后续 daemon-level aggregation；v1 不暗示单连接可收到全部 workspace events。
-41. encoded cwd plural route 在含 `%2F` path 的 reverse proxy 环境下有验证或文档说明；如果代理无法可靠透传，后续 opaque workspace id 决策提前。
+5. Phase 2a scan miss 返回 404 `session_not_found`，不得 fallback 到 primary；Phase 2a 不实现 non-primary persisted load/resume 或跨 workspace storage 扫描。
+6. Phase 2a 以外的 workspace API 在未实现 plural route 前保持 primary-only 或返回明确 unsupported / `workspace_mismatch`。
+7. Phase 2a 中 parameterized read-only legacy `GET /workspace/:id/sessions` 接受 registered workspace；`session-groups` read 和对应 mutations 后续按 Phase 2b/3 迁移。
+8. legacy workspace-less `/workspace/...` 和 `/file` 仍只作用 primary。
+9. workspace-qualified file route 使用目标 runtime fsFactory。
+10. daemon status 聚合多个 runtime，不因 idle runtime 强制启动 child。
+11. preheat 默认只作用 primary；non-primary runtime 保持 lazy，status 能表达 per-workspace preheat 状态。
+12. `/workspaces/:workspace/acp` 使用目标 runtime 的 bridge 和 MCP sender registry。
+13. multi-workspace 模式下父进程 env 不包含任何 workspace `.env` / workspace `settings.env` 贡献；两个 workspace 有同名 `.env` key 时，各自 ACP child、daemon-side workspace helpers 和 env/status 视图都只看到各自 overlay，non-primary 不继承 primary secret。
+14. serve 层和 `@qwen-code/acp-bridge` 的 workspace-scoped 代码有 lint/grep 守卫，禁止直接读取 `process.env`；base env 初始化和进程级 flag 读取走白名单。
+15. Phase 2a 中 channel workers 保持 primary-only，或在 multi-workspace + non-primary channel 选择时 boot error；worker 分组、pidfile 和 status 后续单独落地。
+16. capabilities/status 同时返回 `maxSessionsPerWorkspace` 和 `maxTotalSessions`。
+17. multi-workspace boot 日志包含 resolved `maxSessionsPerWorkspace`、`maxTotalSessions` 以及每个 workspace 的 id/primary/trusted 状态。
+18. `maxTotalSessions` admission 在并发跨 workspace 创建时原子占位，spawn 失败回滚，attach 不计数，拒绝为 503 + `Retry-After: 5`。
+19. `GET /session/:id/events`、`POST /session/:id/permission/:requestId`、`POST /session/:id/a2ui-action` 按 session id 命中目标 runtime；无 session 的 `POST /permission/:requestId` 保持 primary-only 或命中显式 request index。
+20. device-flow start/get/cancel 在两个 workspace 同时存在时，事件只发给 owning runtime，跨 workspace 查询不泄露 verification fields。
+21. Phase 2a 中 `/voice/stream` primary-only；`/workspaces/:workspace/voice/stream` 在 upgrade dispatcher ready 后单独落地，并使用目标 workspace settings；voice 并发 cap 不随 workspace 数量无意放大。
+22. ACP dispatcher 下 `_qwen/workspace/*` body 里的 `workspaceCwd` 只能匹配 mounted workspace；不匹配返回 `workspace_mismatch`。
+23. 后续 `/workspaces/:workspace/sessions/delete|archive|unarchive` 只操作目标 workspace；legacy `/sessions/*` 只操作 primary。
+24. SDK `acpRouteTable`、`DaemonClient` workspace helpers 使用 plural `/workspaces/:workspace/...`，legacy singular path 只保留兼容；`WorkspaceDaemonClient` 不进入 Phase 2a。
+25. 后续 serve-managed channel pidfile 能表达多个 workspace workers，`qwen channel status` 按 workspace 分组展示，旧单 worker 字段保持兼容。
+26. HTTP telemetry 对 workspace-qualified、session-scoped、unknown workspace 请求分别打正确 workspace/unknown 属性，不再全部使用 primary hash。
+27. auth provider install 在 non-primary workspace 下写目标 workspace settings，legacy route 仍写 primary。
+28. `load/resume` 非 primary persisted session 必须传 workspace，`export` 等无 selector 的 persisted session GET 保持 primary-only，并提供 workspace-qualified 替代 route。
+29. daemon-side provider/voice/preflight/auth helpers 使用目标 runtime effective env，不允许 async 临时改写 `process.env`。
+30. daemon metrics gauge、permission audit ring、child resource sampler 都能聚合或标记 workspace。
+31. user-scope settings 写入按 settings 文件路径串行化；v1 rate limiter 明确保持进程级。
+32. capabilities 顶层 `features[]` 按 primary workspace 推导；non-primary settings/reload 不会失效或翻转 primary feature cache；workspace-specific voice 判断走 workspace status。
+33. capabilities `workspaces[]` entry 返回 `id`、`primary`、`trusted`，untrusted workspace 的 mutation route 和 session 创建/恢复都返回 403 `untrusted_workspace` 且不 spawn child；单 workspace 模式保持现有 trust 行为。
+34. 后续 `/workspaces/:workspace/acp` 和 `/workspaces/:workspace/voice/stream` 的 HTTP server upgrade listener 能解析 workspace 并分发到目标 runtime。
+35. Phase 2a 未全部落地前，传入多个 `--workspace` 直接 boot error，包括 yargs 解析出的 array 形态；最后摘掉门闩时再跑完整 Phase 2a 验收。
+36. Phase 2a 允许先扫描 live runtimes 做 session owner resolution；后续 ACP dispatcher `session/new`、load、resume 创建的 session 必须进入 registry session index，随后 REST 侧 export、organization、telemetry workspace 归属不依赖 fallback 扫描。
+37. plural `/workspaces/:workspace/...` route 的 rate-limit tier 与同语义 singular route 一致：read 归 `read`，mutation 归 `mutation`，prompt 类归 `prompt`。
+38. Phase 2a 摘除 feature gate 的 PR 同批更新用户文档、协议文档、quickstart、local deploy 文档和 changelog，不再残留“1 daemon = 1 workspace”作为唯一部署方式，并明确首个 tag 是 `multi_workspace_sessions` 而不是 broader `multi_workspace`。
+39. trust 从 trusted 翻转为 untrusted 后，目标 runtime 更新 status/capabilities、停止或 drain active child/sessions、清理 session index，并拒绝后续 mutation；untrusted 翻转为 trusted 后重新加载 settings/fs boundary/env overlay。
+40. 多 daemon fallback 与单 daemon 多 workspace 的故障半径在用户文档中可见：重启/升级单 daemon 会影响全部 registered workspaces。
+41. daemon token 不提供 per-workspace ACL 的限制在 docs/capacity/compatibility 中明确；token 持有者可访问全部 registered workspaces 的允许 surface。
+42. 默认 `maxTotalSessions = maxSessionsPerWorkspace * workspaceCount` 不提供额外 RSS 保护的说明进入公开文档；显式更低 total cap 才会先于 per-workspace cap 生效。
+43. 聚合 dashboard 若监听全部 workspaces，需要 N 条 workspace event 连接或后续 daemon-level aggregation；v1 不暗示单连接可收到全部 workspace events。
+44. Phase 2a 起 capabilities 暴露 stable workspace id；Phase 2b plural resolver 同时接受 id 和 encoded cwd。encoded cwd route 在含 `%2F` path 的 reverse proxy 环境下有文档说明，代理部署优先使用 id。
 
 验收命令按变更范围选择，例如：
 
@@ -762,13 +786,14 @@ npm run build && npm run typecheck
 
 ## 分阶段落地计划
 
-### Phase 1：单 runtime registry，无行为变化
+### Phase 1：单 runtime registry 和 gated prep
 
 - 新增 `WorkspaceRegistry` 和 `WorkspaceRuntime`。
 - `createServeApp` 内部把现有单 bridge/service/fsFactory 包成 primary runtime。
 - route 仍可暂时读 primary runtime，但不再直接依赖裸 `boundWorkspace`。
-- daemon log / daemon id / telemetry service id 改成 daemon-scoped，workspace hash 只作为属性；这对单 workspace 兼容，可以先于 multi-workspace 启用落地。
+- daemon log / daemon id / telemetry service id 改成 daemon-scoped，workspace hash 只作为属性；这对单 workspace 行为低风险，但属于可观察标识变化，Phase 1 changelog/兼容说明要点名。
 - `run-qwen-serve` 先显式处理 repeatable `--workspace` / yargs array 形态。在 feature gate 摘除前，多个 explicit workspaces 直接 boot error，避免 array 被误当成 string 进入现有单 workspace 路径。
+- 覆盖 yargs 单值 string 和重复传参 array 两种输入形态；v1 不加 `--primary-workspace`。
 - 所有现有 daemon 测试应保持不变。
 
 ### Phase 2a：multi-workspace sessions only
@@ -778,13 +803,15 @@ npm run build && npm run typecheck
 - 启动时创建多个 runtime。
 - `/capabilities` 和 `/daemon/status` 暴露 `workspaces`。
 - `/capabilities` 和 status 暴露 `maxSessionsPerWorkspace` / `maxTotalSessions`。
-- `/capabilities` 顶层 `features[]` 暴露 `multi_workspace_sessions`，`workspaces[]` entry 带 `trusted`；不要在此阶段发布泛化的 `multi_workspace` tag。
+- `/capabilities` 顶层 `features[]` 暴露 `multi_workspace_sessions`，`workspaces[]` entry 带稳定 `id`、`primary` 和 `trusted`；不要在此阶段发布泛化的 `multi_workspace` tag。
 - `POST /session` 根据 body cwd 选择 runtime，并完成最小 `/session/:id/...` session-scoped dispatch 闭环：prompt、events、cancel、session-scoped permission。
 - `GET /workspace/:id/sessions` 接受 registered workspace，用来验证 non-primary session 可列出。
-- live session owner resolution 可以先扫描 registered runtimes；bridge lifecycle session index 作为 Phase 2b hardening，不作为 Phase 2a gate。
+- live session owner resolution 可以先扫描 registered runtimes；scan miss 返回 404 `session_not_found`，绝不 fallback 到 primary。bridge lifecycle session index 作为 Phase 2b hardening，不作为 Phase 2a gate。
+- load/resume 不进入 Phase 2a 的 non-primary session-scoped 集合；legacy resume 保持 primary storage only。workspace-aware load/resume 等 Phase 2b lifecycle index 落地后再做。
 - `maxTotalSessions` admission 在 registry 层执行。
+- 多 workspace boot 日志打印 resolved session caps 和每个 workspace 的 trust 状态。
 - preheat 默认只作用 primary；non-primary lazy spawn。
-- env reload 改为 per-runtime effective env / child env overlay；multi-workspace 模式下父进程 env 保持 daemon base env，不包含任何 workspace `.env` / workspace `settings.env` 贡献。daemon-side workspace helpers 也读取 runtime effective env。
+- env reload 改为 per-runtime effective env / child env overlay；multi-workspace 模式下父进程 env 保持 daemon base env，不包含任何 workspace `.env` / workspace `settings.env` 贡献。daemon-side workspace helpers 也读取 runtime effective env，并用 lint 守卫禁止 workspace-scoped 直接读 `process.env`。
 - untrusted workspace 可以注册和展示 read-only 状态，但 session 创建/恢复、ACP `session/new` 和 mutating routes 都返回 403 `untrusted_workspace`，不得 spawn child。
 - trust 翻转更新目标 runtime 的 trusted state、settings/fs boundary/env overlay 和 capabilities/status；trusted -> untrusted 停止或 drain active child/sessions。
 - Phase 2a 不要求所有 workspace APIs 多 workspace 化。`/file`、`/workspace/settings`、`/workspace/memory`、`/workspace/mcp`、workspace tools/auth/voice/MCP/control surfaces 和所有 workspace-less legacy routes 继续 primary-only；未实现的 non-primary surface 返回明确 unsupported / `workspace_mismatch`。
@@ -795,11 +822,12 @@ npm run build && npm run typecheck
 ### Phase 2b：session hardening 和基础 reads
 
 - 引入 bridge lifecycle session index，覆盖 REST 和后续 ACP dispatcher 的所有 session 创建路径。
+- 基于显式 workspace selector 和 lifecycle index 增加 workspace-aware load/resume；不做跨 workspace persisted storage 扫描。
 - 增加 model/mode、metadata/status/tasks、A2UI 等不触达 persisted workspace sidecar 的 session-adjacent route。
 - 新增 `/workspaces/:workspace/sessions`；参数化 read-only legacy session routes 可读取 registered workspace。
 - 参数化 read-only session groups 可读取 registered workspace；mutation 不放宽。
 - rate-limit tier 映射覆盖 `/workspaces/:workspace/...` plural routes，并继承同语义 singular route 的档位。
-- 部署文档补充 encoded cwd path 的 reverse proxy 要求；如果 `/workspaces/:workspace/...` 在常见代理下无法稳定透传 `%2F`，则将 opaque workspace id 提前到后续阶段。
+- plural route resolver 同时接受 `workspaces[].id` 和 encoded cwd；部署文档补充 encoded cwd path 的 reverse proxy 要求，并建议代理部署优先使用 id route。
 - 对已实现的 read-only plural routes 返回目标 runtime 视图；其他 plural routes 继续不暴露或返回明确 unsupported。
 
 ### Phase 3：workspace-qualified REST
@@ -857,15 +885,15 @@ npm run build && npm run typecheck
 
 ### 审计 4：复杂度
 
-发现问题：同时做 route namespace、bridge 内部多 workspace、dynamic add/remove、opaque workspace id 会让首版过大。
+发现问题：同时做 route namespace、bridge 内部多 workspace、dynamic add/remove、并把所有 URL 立即迁到 opaque workspace id 会让首版过大；但完全不暴露 stable id 又会让 `%2F` 代理风险拖到 plural routes 落地时才暴露。
 
-调整：首版不引入 opaque id，不做 dynamic workspace，不改 ACP child 多 cwd 协议。先用 canonical cwd 作为 key，保留现有 URL encoding 风格。
+调整：内部继续用 canonical cwd 作为 primary key，不做 dynamic workspace，不改 ACP child 多 cwd 协议。Phase 2a 在 `workspaces[]` 暴露复用既有 storage/identity hash 的 stable id；真正的 plural route resolver 到 Phase 2b 再同时接受 id 和 encoded cwd。
 
 ### 审计 5：测试可验证性
 
 发现问题：如果第一步就启用多 workspace，回归失败很难判断来自 registry 抽象还是多 workspace 行为。
 
-调整：Phase 1 只引入单 runtime registry，要求完全无行为变化。Phase 2a 再开启 multi-workspace sessions only、capabilities/status、total admission 和 env isolation。
+调整：Phase 1 只引入单 runtime registry、repeatable workspace parsing gate 和 daemon-scoped identity；除已点名的 daemon log/telemetry identity 可观察变化外，不改变 route/session 行为。Phase 2a 再开启 multi-workspace sessions only、capabilities/status、total admission 和 env isolation。
 
 ### 审计 6：资源与写隔离
 
@@ -1069,7 +1097,7 @@ npm run build && npm run typecheck
 
 发现问题：首版 `/workspaces/:workspace/...` 使用 `encodeURIComponent(cwd)`，absolute cwd 必含 `%2F`。反向代理或 LB 可能提前解码、normalize 或拒绝该 path；这对 ACP/voice WebSocket 尤其敏感。
 
-调整：部署文档提示代理需要验证 `%2F` 透传；如果成为 blocker，opaque workspace id 是最直接的后续改进动机。
+调整：Phase 2a 起 `workspaces[]` 暴露 stable id；Phase 2b 第一条 plural route 前，resolver 同时接受 id 和 encoded cwd。部署文档仍提示代理需要验证 `%2F` 透传，但代理部署可以优先走 id route。
 
 ### 审计 40：repeatable --workspace 输入形态
 
@@ -1088,6 +1116,36 @@ npm run build && npm run typecheck
 发现问题：即使 Phase 2a 已收窄为 session closed loop，`multi_workspace` feature tag 和 model/mode/organization/session index 等验收项仍容易让客户端或 reviewer 误以为 file、memory、MCP、settings、ACP/voice/channel、SDK workspace client 等 broader workspace surface 已经可用。session index 作为首个 gate 也会增加 bridge seam 改动，降低第一步可 review 性。
 
 调整：首个启用 tag 改为 `multi_workspace_sessions`。Phase 2a 进一步收窄为 multi-workspace sessions only：static explicit workspaces、capabilities/status workspaces、`POST /session { cwd }`、prompt/events/cancel/session-scoped permission dispatch、`GET /workspace/:id/sessions`、env/trust/capacity/preheat 安全底座。live session owner resolution 可先扫描 registered runtimes；bridge lifecycle index、model/mode、metadata/status/tasks、A2UI、session groups、persisted operations、SDK workspace client 和 workspace-qualified REST/ACP/voice/channel 都后置。
+
+### 审计 43：maintainer baseline 收敛
+
+发现问题：review 过程中 7 个 open decisions 已被 maintainer 确认，如果 RFC 继续以“待确认”描述，会让 Phase 1 是否可开工、Phase 2a 的 gate 条件和 review checklist 不清晰。
+
+调整：明确 Phase 1 可进入实施；v1 采用 repeatable `--workspace` first-wins primary，不新增 `--primary-workspace`；首个 tag 固定为 `multi_workspace_sessions`；`--max-sessions` 在 multi-workspace 模式为 per-workspace，配合 `maxTotalSessions`；ACP/Web Shell、channel、voice、broader REST、WorkspaceDaemonClient 和 dynamic workspace 全部后置。
+
+### 审计 44：Phase 2a live scan 失败语义
+
+发现问题：Phase 2a 允许通过扫描 live runtimes 解析 session owner，但如果扫描 miss fallback 到 primary，会把未知 session 错路由成 primary 请求；如果顺手扫描 persisted storage 做 load/resume，还可能在 primary runtime 中恢复出 cwd 错误的 non-primary session。
+
+调整：Phase 2a scan miss 必须返回 404 `session_not_found`，绝不 fallback primary；load/resume 不进入 Phase 2a non-primary session 集合，legacy resume 保持 primary storage only。workspace-aware load/resume 等 Phase 2b lifecycle index 和显式 workspace selector 落地后再做。
+
+### 审计 45：workspace id 与 encoded cwd
+
+发现问题：encoded cwd 是既有 `/workspace/:id/sessions` 协议形态，Phase 2a 只放宽这条既有 read-only route，不新增代理风险面；但 Phase 2b 的 plural routes 如果只接受 encoded cwd，会在 nginx/LB 默认配置下遇到 `%2F` 透传问题。
+
+调整：Phase 2a 起 `workspaces[]` 暴露 stable `id`，复用现有 per-workspace storage/identity hash。Phase 2b plural resolver 同时接受 id 和 encoded cwd：decoded selector 以 `/` 开头按 path 解析，否则按 id 查找。新客户端和代理部署优先使用 id。
+
+### 审计 46：env 隔离实现质量
+
+发现问题：仅把 `reloadDaemonEnv` 改成 per-runtime overlay 还不足以防回归；serve 层和 `@qwen-code/acp-bridge` 里直接读 `process.env` 的路径较多，后续改动容易绕过 runtime effective env。
+
+调整：把 lint/grep 守卫列为 Phase 2a 验收项。workspace-scoped daemon helpers 和 bridge 代码禁止直接读 `process.env`，base env 初始化、进程级 flag 和测试 fixture 通过白名单放行。
+
+### 审计 47：trust 默认值与单 workspace 兼容
+
+发现问题：如果为 additional workspace 新造默认 trust 策略，会在“默认 trusted”与“默认 untrusted”之间制造新的安全/兼容风险；如果把多 workspace 的严格 untrusted session gate 套到单 workspace，则会改变现有 untrusted 目录下仍可启动 session 的行为。
+
+调整：不新造默认策略，所有 explicit workspace 复用现有 trust storage；从未 trust 过的 registered workspace 显示为 `trusted: false`。严格的 session/mutation gate 只在多个 explicit workspaces 的 daemon 中生效，单 workspace 模式保持当前 trust 行为。
 
 ## 二次无方向审计：方案筛选
 
@@ -1126,9 +1184,9 @@ npm run build && npm run typecheck
 | 继续扩展 `/workspace/:id/...`     | 不作为新主线 | 已有 `/workspace/memory`、`/workspace/settings` 等 legacy route，继续叠加容易造成 route order 和语义冲突。    |
 | 所有 route 加 `?workspaceCwd=`    | 不推荐       | 对 mutation route 不够显式，也容易让 workspace 选择散落到每个 handler 的 query/body 分支里。                  |
 | 新增 `/workspaces/:workspace/...` | 首选         | 与 legacy singular namespace 隔离，workspace-less 旧 route 绑定 primary，新 route 显式选择 workspace。        |
-| 引入 opaque workspace id          | 后置         | 能减少 URL path 暴露和长度问题，但会增加 capabilities、SDK、debug、错误消息复杂度。首版直接沿用 encoded cwd。 |
+| 引入 opaque workspace id          | 部分提前     | Phase 2a 先在 capabilities/status 暴露 stable id，Phase 2b 第一条 plural route 前再让 resolver 接受 id。       |
 
-筛选结果：新 API 使用 plural namespace；workspace-less legacy API 不改变，已参数化 read-only legacy route 只做 additive 兼容放宽；opaque id 等稳定后再评估。
+筛选结果：新 API 使用 plural namespace；workspace-less legacy API 不改变，已参数化 read-only legacy route 只做 additive 兼容放宽；stable workspace id 从 Phase 2a 暴露，plural route 从 Phase 2b 同时接受 id 和 encoded cwd。
 
 ### Round 3：隔离与安全
 
@@ -1182,7 +1240,7 @@ npm run build && npm run typecheck
 
 最适合的实现顺序：
 
-1. 单 runtime registry，无行为变化。
+1. 单 runtime registry 和 gated prep，不改变 route/session 行为。
 2. Phase 2a：multi-workspace sessions only、capabilities/status、total admission、env isolation、trust gate。
 3. Phase 2b：session ownership hardening 和基础 workspace-qualified reads。
 4. workspace-qualified REST routes。
@@ -1214,7 +1272,7 @@ npm run build && npm run typecheck
 2. **R2：单 ACP child 多 workspace。** workspace-level 状态隔离证据不足。
 3. **R3：filesystem multi-root 伪装成 multi-workspace。** 不能解决 session/settings/MCP/memory 归属。
 4. **R4：dynamic workspace first。** 安全边界和资源边界过早扩大。
-5. **R5：opaque workspace id first。** 能改善 URL，但不是首版闭环的必要复杂度。
+5. **R5：opaque workspace id route migration first。** 能改善 URL，但 Phase 2a 不需要新增 plural route；先暴露 stable id，等 Phase 2b 第一条 plural route 前再接入 resolver，是更小的落地面。
 
 ## 最终建议
 
