@@ -170,6 +170,278 @@ describe('sessionCloseDrainBudgetMs', () => {
   });
 });
 
+describe('managed runtime tool bridge', () => {
+  it('hides a Managed Runtime Session from the generic Prompt surface', async () => {
+    const handle = makeChannel();
+    const bridge = makeBridge({ channelFactory: async () => handle.channel });
+    try {
+      const session = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        sourceType: 'managed-gateway',
+        sourceId: SESS_A,
+      });
+
+      expect(() =>
+        bridge.sendPrompt(
+          session.sessionId,
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: 'text', text: 'must not reach Runtime' }],
+          },
+          new AbortController().signal,
+        ),
+      ).toThrow(SessionNotFoundError);
+      await expect(
+        bridge.continueSession(session.sessionId),
+      ).rejects.toBeInstanceOf(SessionNotFoundError);
+      await expect(
+        bridge.generateSessionRecap(session.sessionId),
+      ).rejects.toBeInstanceOf(SessionNotFoundError);
+      expect(() =>
+        bridge.generateSessionContent!(
+          session.sessionId,
+          'must not generate in Runtime',
+          new AbortController().signal,
+        ),
+      ).toThrow(SessionNotFoundError);
+      expect(() =>
+        bridge.enqueueMidTurnMessage(
+          session.sessionId,
+          'must not promote into a Runtime turn',
+        ),
+      ).toThrow(SessionNotFoundError);
+      await expect(
+        bridge.enqueueBackgroundNotification(session.sessionId, {
+          displayText: 'done',
+          modelText: 'must not trigger a Runtime follow-up',
+          taskId: 'task-1',
+          status: 'completed',
+          kind: 'agent',
+        }),
+      ).rejects.toBeInstanceOf(SessionNotFoundError);
+      await expect(
+        bridge.generateSessionBtw(
+          session.sessionId,
+          'must not generate a side answer',
+        ),
+      ).rejects.toBeInstanceOf(SessionNotFoundError);
+      await expect(
+        bridge.launchSessionForkAgent(
+          session.sessionId,
+          'must not launch a Runtime agent',
+        ),
+      ).rejects.toBeInstanceOf(SessionNotFoundError);
+      await expect(
+        bridge.controlSessionGoal(session.sessionId, {
+          action: 'create',
+          objective: 'must not start a Runtime Goal turn',
+        }),
+      ).rejects.toBeInstanceOf(SessionNotFoundError);
+      await expect(
+        bridge.controlSessionWorkflowTask(session.sessionId, 'task-1', 'rerun'),
+      ).rejects.toBeInstanceOf(SessionNotFoundError);
+      expect(handle.agent.promptCalls).toHaveLength(0);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  it('forwards the pinned manifest and Tool execution without a Prompt', async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown> }> =
+      [];
+    const handle = makeChannel({
+      extMethodImpl: async (method, params) => {
+        calls.push({ method, params });
+        if (
+          method === SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolManifest
+        ) {
+          return {
+            capabilityDigest: 'a'.repeat(64),
+            tools: [{ name: 'read_file', description: 'Read a file' }],
+          };
+        }
+        if (
+          method === SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute
+        ) {
+          return {
+            responseParts: [
+              {
+                functionResponse: {
+                  id: params['toolCallId'],
+                  name: params['toolName'],
+                  response: { output: 'proof' },
+                },
+              },
+            ],
+            executionStatus: 'success',
+          };
+        }
+        if (
+          method === SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel
+        ) {
+          return { cancelled: true };
+        }
+        return {};
+      },
+    });
+    const bridge = makeBridge({ channelFactory: async () => handle.channel });
+    try {
+      const session = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        sourceType: 'managed-gateway',
+        sourceId: SESS_A,
+      });
+      const context = { clientId: session.clientId };
+      await expect(
+        bridge.getManagedRuntimeToolManifest(session.sessionId, context),
+      ).resolves.toMatchObject({
+        capabilityDigest: 'a'.repeat(64),
+        tools: [{ name: 'read_file' }],
+      });
+      const request = {
+        executionId: 'execution-1',
+        turnId: 'turn-1',
+        toolCallId: 'call-1',
+        capabilityDigest: 'a'.repeat(64),
+        toolName: 'read_file',
+        input: { file_path: 'proof.txt' },
+      };
+      await expect(
+        bridge.executeManagedRuntimeTool(
+          session.sessionId,
+          request,
+          new AbortController().signal,
+          context,
+        ),
+      ).resolves.toMatchObject({ executionStatus: 'success' });
+      await expect(
+        bridge.cancelManagedRuntimeTool(
+          session.sessionId,
+          request.executionId,
+          context,
+        ),
+      ).resolves.toEqual({ cancelled: true });
+
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute,
+        params: { ...request, sessionId: session.sessionId },
+      });
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel,
+        params: {
+          executionId: request.executionId,
+          sessionId: session.sessionId,
+        },
+      });
+      expect(handle.agent.promptCalls).toHaveLength(0);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  it('sends a matching cancellation when the Gateway aborts execution', async () => {
+    const execution = deferred<Record<string, unknown>>();
+    const cancelled = deferred<void>();
+    const handle = makeChannel({
+      extMethodImpl: async (method, params) => {
+        if (
+          method === SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute
+        ) {
+          return execution.promise;
+        }
+        if (
+          method === SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel
+        ) {
+          expect(params['executionId']).toBe('execution-cancel');
+          execution.resolve({
+            responseParts: [],
+            executionStatus: 'cancelled',
+          });
+          cancelled.resolve();
+          return { cancelled: true };
+        }
+        return {};
+      },
+    });
+    const bridge = makeBridge({ channelFactory: async () => handle.channel });
+    try {
+      const session = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        sourceType: 'managed-gateway',
+        sourceId: SESS_A,
+      });
+      const controller = new AbortController();
+      const pending = bridge.executeManagedRuntimeTool(
+        session.sessionId,
+        {
+          executionId: 'execution-cancel',
+          turnId: 'turn-1',
+          toolCallId: 'call-1',
+          capabilityDigest: 'a'.repeat(64),
+          toolName: 'read_file',
+          input: { file_path: 'proof.txt' },
+        },
+        controller.signal,
+        { clientId: session.clientId },
+      );
+      controller.abort(new Error('deadline'));
+
+      await expect(pending).rejects.toThrow('deadline');
+      await cancelled.promise;
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  it('cancels best-effort when the Tool execution request fails', async () => {
+    const cancelled = deferred<void>();
+    const handle = makeChannel({
+      extMethodImpl: async (method, params) => {
+        if (
+          method === SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute
+        ) {
+          throw new Error('execution transport timed out');
+        }
+        if (
+          method === SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel
+        ) {
+          expect(params['executionId']).toBe('execution-timeout');
+          cancelled.resolve();
+          return { cancelled: true };
+        }
+        return {};
+      },
+    });
+    const bridge = makeBridge({ channelFactory: async () => handle.channel });
+    try {
+      const session = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        sourceType: 'managed-gateway',
+        sourceId: SESS_A,
+      });
+
+      await expect(
+        bridge.executeManagedRuntimeTool(
+          session.sessionId,
+          {
+            executionId: 'execution-timeout',
+            turnId: 'turn-1',
+            toolCallId: 'call-1',
+            capabilityDigest: 'a'.repeat(64),
+            toolName: 'read_file',
+            input: { file_path: 'proof.txt' },
+          },
+          new AbortController().signal,
+          { clientId: session.clientId },
+        ),
+      ).rejects.toThrow('Internal error');
+      await cancelled.promise;
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+});
+
 /**
  * Test-local fake of the daemon-wide growth aggregator `runQwenServe` wires
  * every bridge to: one shared provider set plus the register/read pair.

@@ -81,6 +81,9 @@ const { mockRunManagedAutoMemoryDream, mockRunManagedRememberByAgent } =
 const { mockExecuteGeneration } = vi.hoisted(() => ({
   mockExecuteGeneration: vi.fn(),
 }));
+const { mockExecuteToolCall } = vi.hoisted(() => ({
+  mockExecuteToolCall: vi.fn(),
+}));
 vi.mock('./generation.js', () => ({
   executeGeneration: mockExecuteGeneration,
   GENERATION_MAX_PROMPT_BYTES: 32 * 1024,
@@ -252,6 +255,13 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => ({
   parseGoalControlRequest: (
     await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
   ).parseGoalControlRequest,
+  canonicalToolName: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).canonicalToolName,
+  CONCURRENCY_SAFE_KINDS: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).CONCURRENCY_SAFE_KINDS,
+  executeToolCall: mockExecuteToolCall,
   // The real classes for the same reason as above: `mapGoalControlError`
   // narrows on them with `instanceof`, and a stand-in (or an omission, which
   // resolves to undefined) makes every conflict/transition branch throw before
@@ -2145,6 +2155,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     mockRunManagedAutoMemoryDream.mockReset();
     mockRunManagedRememberByAgent.mockReset();
     mockExecuteGeneration.mockReset();
+    mockExecuteToolCall.mockReset();
     mcpServerRequiresOAuth.clear();
     mockHistoryPendingToolCalls.mockReturnValue([]);
     lastSessionMock = undefined;
@@ -13548,6 +13559,178 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       snapshot,
     });
     expect(dispatch).not.toHaveBeenCalled();
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('exposes and executes only read-only Tools for a Managed Gateway Runtime', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    const innerConfig = await setupSessionMocks(sessionId);
+    const readTool = { kind: 'read' };
+    const editTool = { kind: 'edit' };
+    Object.assign(innerConfig, {
+      getSessionSourceType: vi.fn().mockReturnValue('managed-gateway'),
+      getSessionSourceId: vi.fn().mockReturnValue(sessionId),
+      getToolRegistry: vi.fn().mockReturnValue({
+        getFunctionDeclarations: () => [
+          { name: 'read_file', description: 'Read a file' },
+          { name: 'write_file', description: 'Write a file' },
+        ],
+        getTool: (name: string) =>
+          name === 'read_file'
+            ? readTool
+            : name === 'write_file'
+              ? editTool
+              : undefined,
+      }),
+    });
+    mockExecuteToolCall.mockResolvedValue({
+      responseParts: [
+        {
+          functionResponse: {
+            id: 'call-1',
+            name: 'read_file',
+            response: { output: 'proof' },
+          },
+        },
+      ],
+      executionStatus: 'success',
+    });
+    const { agent, agentPromise } = await bootAcpAgent();
+    await agent.newSession({
+      cwd: '/tmp',
+      mcpServers: [],
+      _meta: {
+        [SESSION_SOURCE_META_KEY]: {
+          sourceType: 'managed-gateway',
+          sourceId: sessionId,
+        },
+      },
+    });
+
+    const manifest = await agent.extMethod(
+      SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolManifest,
+      { sessionId },
+    );
+    expect(manifest).toMatchObject({
+      capabilityDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      tools: [{ name: 'read_file' }],
+    });
+    const capabilityDigest = manifest['capabilityDigest'] as string;
+    await expect(
+      agent.extMethod(
+        SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute,
+        {
+          sessionId,
+          executionId: 'execution-1',
+          turnId: 'turn-1',
+          toolCallId: 'call-1',
+          capabilityDigest,
+          toolName: 'read_file',
+          input: { file_path: 'proof.txt' },
+        },
+      ),
+    ).resolves.toMatchObject({ executionStatus: 'success' });
+    expect(mockExecuteToolCall).toHaveBeenCalledWith(
+      innerConfig,
+      expect.objectContaining({
+        callId: 'call-1',
+        name: 'read_file',
+        prompt_id: 'turn-1',
+      }),
+      expect.any(AbortSignal),
+      { recordToolResult: false },
+    );
+    await expect(
+      agent.extMethod(
+        SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute,
+        {
+          sessionId,
+          executionId: 'execution-2',
+          turnId: 'turn-1',
+          toolCallId: 'call-2',
+          capabilityDigest,
+          toolName: 'write_file',
+          input: { file_path: 'proof.txt', content: 'mutate' },
+        },
+      ),
+    ).rejects.toThrow('unavailable or unsafe');
+    expect(lastSessionMock?.prompt).not.toHaveBeenCalled();
+
+    mockConnectionState.resolve();
+    await agentPromise;
+  });
+
+  it('cancels only the matching active Managed Runtime Tool execution', async () => {
+    const sessionId = '11111111-1111-1111-1111-111111111111';
+    const innerConfig = await setupSessionMocks(sessionId);
+    Object.assign(innerConfig, {
+      getSessionSourceType: vi.fn().mockReturnValue('managed-gateway'),
+      getSessionSourceId: vi.fn().mockReturnValue(sessionId),
+      getToolRegistry: vi.fn().mockReturnValue({
+        getFunctionDeclarations: () => [
+          { name: 'read_file', description: 'Read a file' },
+        ],
+        getTool: (name: string) =>
+          name === 'read_file' ? { kind: 'read' } : undefined,
+      }),
+    });
+    let executionSignal: AbortSignal | undefined;
+    mockExecuteToolCall.mockImplementation(
+      async (_config, _request, signal: AbortSignal) => {
+        executionSignal = signal;
+        await new Promise<void>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      },
+    );
+    const { agent, agentPromise } = await bootAcpAgent();
+    await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+    const manifest = await agent.extMethod(
+      SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolManifest,
+      { sessionId },
+    );
+    const pending = agent.extMethod(
+      SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute,
+      {
+        sessionId,
+        executionId: 'execution-cancel',
+        turnId: 'turn-1',
+        toolCallId: 'call-1',
+        capabilityDigest: manifest['capabilityDigest'],
+        toolName: 'read_file',
+        input: { file_path: 'proof.txt' },
+      },
+    );
+    await vi.waitFor(() => expect(executionSignal).toBeDefined());
+
+    await expect(
+      agent.extMethod(
+        SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel,
+        { sessionId, executionId: 'another-execution' },
+      ),
+    ).resolves.toEqual({ cancelled: false });
+    expect(executionSignal?.aborted).toBe(false);
+    await expect(
+      agent.extMethod(
+        SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel,
+        { sessionId, executionId: 'execution-cancel' },
+      ),
+    ).resolves.toEqual({ cancelled: true });
+    await expect(pending).rejects.toThrow(
+      'Managed Runtime Tool execution was cancelled.',
+    );
+    expect(executionSignal?.aborted).toBe(true);
+    vi.mocked(innerConfig.getSessionSourceType).mockReturnValue('default');
+    await expect(
+      agent.extMethod(
+        SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel,
+        { sessionId, executionId: 'another-execution' },
+      ),
+    ).rejects.toThrow('not owned by the Managed Gateway Runtime');
 
     mockConnectionState.resolve();
     await agentPromise;

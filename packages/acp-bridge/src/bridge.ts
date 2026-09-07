@@ -216,6 +216,8 @@ import type {
   ChildHeapReport,
   RuntimeMcpServerAddResult,
   RuntimeMcpServerRemoveResult,
+  BridgeManagedRuntimeToolManifest,
+  BridgeManagedRuntimeToolExecuteResult,
 } from './bridgeTypes.js';
 import {
   isSessionAttachmentReference,
@@ -2545,6 +2547,7 @@ const DAEMON_CONTINUE_META_KEY = 'qwen.daemon.continueLastTurn';
  */
 const SESSION_RECAP_TIMEOUT_MS = 60_000;
 const SESSION_GENERATION_TIMEOUT_MS = 65_000;
+const MANAGED_RUNTIME_TOOL_TIMEOUT_MS = 10 * 60_000;
 const GENERATION_STREAM_QUEUE_CAPACITY = 128;
 const SESSION_BTW_TIMEOUT_MS = 60_000;
 const SESSION_TRANSCRIPT_TIMEOUT_MS = 60_000;
@@ -4040,6 +4043,21 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       throw new InvalidClientIdError(entry.sessionId, clientId);
     }
     return clientId;
+  };
+
+  const assertSessionAcceptsModelWork = (entry: SessionEntry): void => {
+    if (entry.sourceType === 'managed-gateway') {
+      throw new SessionNotFoundError(entry.sessionId);
+    }
+  };
+
+  const assertManagedRuntimeToolSession = (entry: SessionEntry): void => {
+    if (
+      entry.sourceType !== 'managed-gateway' ||
+      entry.sourceId !== entry.sessionId
+    ) {
+      throw new SessionNotFoundError(entry.sessionId);
+    }
   };
 
   /**
@@ -9172,6 +9190,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       const queuedAt = Date.now();
       const entry = byId.get(sessionId);
       if (!entry) return Promise.reject(new SessionNotFoundError(sessionId));
+      if (entry.sourceType === 'managed-gateway') {
+        throw new SessionNotFoundError(sessionId);
+      }
       if (isClosingOrAuthorizingClose(entry)) {
         return Promise.reject(
           new SessionNotFoundError(
@@ -11463,6 +11484,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     async controlSessionWorkflowTask(sessionId, taskId, action, context) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       resolveTrustedClientId(entry, context?.clientId);
       return requestSessionStatus<{
         changed: boolean;
@@ -11477,6 +11499,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     async controlSessionGoal(sessionId, request, context) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       const info = channelInfoForEntry(entry);
       if (!info || info.isDying) throw new SessionNotFoundError(sessionId);
       resolveTrustedClientId(entry, context?.clientId);
@@ -11508,6 +11531,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       // is then silently dropped at admission.
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       resolveTrustedClientId(entry, context?.clientId);
 
       // Accept/reject pre-check: the agent classifies the last turn (and rejects
@@ -11997,6 +12021,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       // recap is informational-only today — no SSE broadcast.
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       const info = channelInfoForEntry(entry);
       if (!info || info.isDying) throw new SessionNotFoundError(sessionId);
       opts.onDiagnosticLine?.(
@@ -12026,6 +12051,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     generateSessionContent(sessionId, prompt, signal, context) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       const info = channelInfoForEntry(entry);
       if (!info || info.isDying) throw new SessionNotFoundError(sessionId);
       resolveTrustedClientId(entry, context?.clientId);
@@ -12108,6 +12134,94 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         });
 
       return queue;
+    },
+
+    async getManagedRuntimeToolManifest(sessionId, context) {
+      const entry = byId.get(sessionId);
+      if (!entry) throw new SessionNotFoundError(sessionId);
+      assertManagedRuntimeToolSession(entry);
+      resolveTrustedClientId(entry, context?.clientId);
+      return requestSessionStatus<BridgeManagedRuntimeToolManifest>(
+        sessionId,
+        SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolManifest,
+      );
+    },
+
+    async executeManagedRuntimeTool(sessionId, request, signal, context) {
+      const entry = byId.get(sessionId);
+      if (!entry) throw new SessionNotFoundError(sessionId);
+      assertManagedRuntimeToolSession(entry);
+      resolveTrustedClientId(entry, context?.clientId);
+      if (signal.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : new DOMException(
+              'Managed Runtime Tool execution was aborted.',
+              'AbortError',
+            );
+      }
+      const pending =
+        requestSessionStatus<BridgeManagedRuntimeToolExecuteResult>(
+          sessionId,
+          SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute,
+          request as unknown as Record<string, unknown>,
+          MANAGED_RUNTIME_TOOL_TIMEOUT_MS,
+        );
+      return new Promise<BridgeManagedRuntimeToolExecuteResult>(
+        (resolve, reject) => {
+          let settled = false;
+          const cancel = () =>
+            requestSessionStatus<{ cancelled: boolean }>(
+              sessionId,
+              SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel,
+              { executionId: request.executionId },
+            ).catch(() => undefined);
+          const finish = (
+            result?: BridgeManagedRuntimeToolExecuteResult,
+            error?: unknown,
+          ) => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener('abort', onAbort);
+            if (error !== undefined) reject(error);
+            else resolve(result!);
+          };
+          const onAbort = () => {
+            void cancel();
+            finish(
+              undefined,
+              signal.reason instanceof Error
+                ? signal.reason
+                : new DOMException(
+                    'Managed Runtime Tool execution was aborted.',
+                    'AbortError',
+                  ),
+            );
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+          void pending.then(
+            (result) => finish(result),
+            (error: unknown) => {
+              if (settled) return;
+              void cancel();
+              finish(undefined, error);
+            },
+          );
+          if (signal.aborted) onAbort();
+        },
+      );
+    },
+
+    async cancelManagedRuntimeTool(sessionId, executionId, context) {
+      const entry = byId.get(sessionId);
+      if (!entry) throw new SessionNotFoundError(sessionId);
+      assertManagedRuntimeToolSession(entry);
+      resolveTrustedClientId(entry, context?.clientId);
+      return requestSessionStatus<{ cancelled: boolean }>(
+        sessionId,
+        SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel,
+        { executionId },
+      );
     },
 
     getPendingPrompts(sessionId, context) {
@@ -12318,6 +12432,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     ) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       // Authorize the caller against THIS session before doing anything —
       // mirrors `/prompt` and `/btw`. Throws `InvalidClientIdError` when the
       // client-declared id isn't bound to the session, so a token-holding
@@ -12545,6 +12660,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     async enqueueBackgroundNotification(sessionId, notification) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       const info = channelInfoForEntry(entry);
       if (!info || info.isDying) throw new SessionNotFoundError(sessionId);
       entry.pendingAgentNotificationCount++;
@@ -12600,6 +12716,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     async generateSessionBtw(sessionId, question, signal, _context) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       const info = channelInfoForEntry(entry);
       if (!info || info.isDying) throw new SessionNotFoundError(sessionId);
       if (signal?.aborted) return { sessionId, answer: null };
@@ -12643,6 +12760,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
     async launchSessionForkAgent(sessionId, directive, context) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);
+      assertSessionAcceptsModelWork(entry);
       const info = channelInfoForEntry(entry);
       if (!info || info.isDying) throw new SessionNotFoundError(sessionId);
       resolveTrustedClientId(entry, context?.clientId);

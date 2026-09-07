@@ -3786,8 +3786,9 @@ export class Session implements SessionContext {
 
   #isAutomaticWorkHeld(): boolean {
     return (
-      this.requiresManagedConversationBinding &&
-      this.managedConversationBinding?.state !== 'released'
+      this.config.getSessionSourceType() === 'managed-gateway' ||
+      (this.requiresManagedConversationBinding &&
+        this.managedConversationBinding?.state !== 'released')
     );
   }
 

@@ -110,6 +110,26 @@ export type BridgePromptRequest = Omit<PromptRequest, 'prompt'> & {
   prompt: BridgePromptContentBlock[];
 };
 
+export interface BridgeManagedRuntimeToolManifest {
+  capabilityDigest: string;
+  tools: unknown[];
+}
+
+export interface BridgeManagedRuntimeToolExecuteRequest {
+  executionId: string;
+  turnId: string;
+  toolCallId: string;
+  capabilityDigest: string;
+  toolName: string;
+  input: Record<string, unknown>;
+}
+
+export interface BridgeManagedRuntimeToolExecuteResult {
+  responseParts: unknown[];
+  executionStatus?: 'not_started' | 'success' | 'error' | 'cancelled';
+  error?: { message: string; type?: string };
+}
+
 export interface RewindRequest {
   promptId: string;
   rewindFiles?: boolean;
@@ -1465,6 +1485,27 @@ export interface AcpSessionBridge extends WorkspaceEventBridge {
     signal?: AbortSignal,
     context?: BridgeClientRequestContext,
   ): Promise<PromptResponse>;
+
+  /** Read the safe Tool-only capability set pinned by a Managed Runtime. */
+  getManagedRuntimeToolManifest(
+    sessionId: string,
+    context?: BridgeClientRequestContext,
+  ): Promise<BridgeManagedRuntimeToolManifest>;
+
+  /** Execute one safe Tool Call in the Runtime without invoking its model. */
+  executeManagedRuntimeTool(
+    sessionId: string,
+    request: BridgeManagedRuntimeToolExecuteRequest,
+    signal: AbortSignal,
+    context?: BridgeClientRequestContext,
+  ): Promise<BridgeManagedRuntimeToolExecuteResult>;
+
+  /** Cancel one matching Tool-only Runtime execution best-effort. */
+  cancelManagedRuntimeTool(
+    sessionId: string,
+    executionId: string,
+    context?: BridgeClientRequestContext,
+  ): Promise<{ readonly cancelled: boolean }>;
 
   /**
    * Return the pending prompt queue for a session. Includes the currently

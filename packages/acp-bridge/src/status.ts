@@ -162,6 +162,12 @@ export const SERVE_CONTROL_EXT_METHODS = {
   sessionLiveTranscript: 'qwen/control/session/live-transcript',
   sessionBackgroundNotification: 'qwen/control/session/background_notification',
   sessionArtifactsPersist: 'qwen/control/session/artifacts/persist',
+  sessionManagedRuntimeToolManifest:
+    'qwen/control/session/managed-runtime-tools/manifest',
+  sessionManagedRuntimeToolExecute:
+    'qwen/control/session/managed-runtime-tools/execute',
+  sessionManagedRuntimeToolCancel:
+    'qwen/control/session/managed-runtime-tools/cancel',
   workspaceMcpRestart: 'qwen/control/workspace/mcp/restart',
   workspaceMcpManage: 'qwen/control/workspace/mcp/manage',
   workspaceMcpInitialize: 'qwen/control/workspace/mcp/initialize',

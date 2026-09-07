@@ -4146,6 +4146,35 @@ describe('Session', () => {
     expect(mockChat.sendMessageStream).not.toHaveBeenCalled();
   });
 
+  it('does not start automatic work for a Managed Runtime Session', async () => {
+    const scheduler = {
+      hasPendingWork: false,
+      enableDurable: vi.fn().mockResolvedValue(undefined),
+      start: vi.fn(),
+      stop: vi.fn(),
+      list: vi.fn().mockReturnValue([]),
+      getExitSummary: vi.fn().mockReturnValue(undefined),
+    };
+    session.dispose();
+    vi.mocked(mockConfig.getSessionSourceType).mockReturnValue(
+      'managed-gateway',
+    );
+    mockConfig.isCronEnabled = vi.fn().mockReturnValue(true);
+    mockConfig.getCronScheduler = vi.fn().mockReturnValue(scheduler);
+    session = new Session(
+      'test-session-id',
+      mockConfig,
+      mockClient,
+      mockSettings,
+    );
+
+    session.startCronScheduler();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(scheduler.enableDurable).not.toHaveBeenCalled();
+    expect(scheduler.start).not.toHaveBeenCalled();
+  });
+
   it('pins durable cron startup, prompt restart, and stop to the session runtime', async () => {
     const runtimeDir = path.resolve('runtime', 'cron-session');
     const observedStarts: string[] = [];

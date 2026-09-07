@@ -2029,6 +2029,7 @@ export class AcpDispatcher {
                 // transcripts that carry the reserved source string.
                 if (
                   metadata === undefined ||
+                  metadata.sourceType === 'managed-gateway' ||
                   (this.liveSessionIsolation !== undefined &&
                     isReservedStandaloneSessionSource(metadata))
                 ) {

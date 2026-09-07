@@ -101,6 +101,9 @@ import {
   extractDaemonTraceContext,
   withDaemonSpan,
   emptyGoalSnapshot,
+  canonicalToolName,
+  CONCURRENCY_SAFE_KINDS,
+  executeToolCall,
   GoalConflictError,
   GoalInvalidTransitionError,
   GoalPersistenceUnavailableError,
@@ -136,6 +139,7 @@ import {
   type ToolInvocationGuard,
   type WorkflowParams,
   type WorkflowToolResult,
+  type ToolCallRequestInfo,
   type WorkflowRunRegistry,
   getWorkflowTaskMutationKey,
   isTerminalWorkflowStatus,
@@ -145,7 +149,7 @@ import {
   type TurnResultRecordPayload,
   sessionIdContext,
 } from '@qwen-code/qwen-code-core';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual } from 'node:util';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
@@ -155,7 +159,7 @@ import {
   PROTOCOL_VERSION,
 } from '@agentclientprotocol/sdk';
 import { isNotCurrentlyGeneratingCancelError } from '@qwen-code/acp-bridge/bridgeErrors';
-import type { Content } from '@google/genai';
+import type { Content, FunctionDeclaration } from '@google/genai';
 import type {
   Agent,
   AuthenticateRequest,
@@ -827,6 +831,37 @@ function buildAcpLocalReadRoots(config: Config): string[] {
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+const MANAGED_RUNTIME_TOOL_INPUT_MAX_BYTES = 256 * 1024;
+
+function managedRuntimeToolManifest(config: Config): {
+  capabilityDigest: string;
+  tools: FunctionDeclaration[];
+} {
+  const registry = config.getToolRegistry();
+  const tools = registry.getFunctionDeclarations().filter((declaration) => {
+    const name = declaration.name;
+    if (!name) return false;
+    const tool = registry.getTool(canonicalToolName(name));
+    return tool !== undefined && CONCURRENCY_SAFE_KINDS.has(tool.kind);
+  });
+  const capabilityDigest = createHash('sha256')
+    .update(JSON.stringify(tools))
+    .digest('hex');
+  return { capabilityDigest, tools };
+}
+
+function assertManagedRuntimeSession(config: Config, sessionId: string): void {
+  if (
+    config.getSessionSourceType() !== 'managed-gateway' ||
+    config.getSessionSourceId() !== sessionId
+  ) {
+    throw RequestError.invalidParams(
+      undefined,
+      'Session is not owned by the Managed Gateway Runtime.',
+    );
+  }
 }
 
 function parseSessionArtifactEventPayload(
@@ -3399,6 +3434,10 @@ async function assertManagedConversationDirectoryIdentity(
 
 class QwenAgent implements Agent {
   private sessions: Map<string, Session> = new Map();
+  private readonly managedRuntimeToolExecutions = new Map<
+    string,
+    { sessionId: string; controller: AbortController }
+  >();
   private modelProviderReloadRevision = 0;
   private readonly historyMutationTails = new Map<string, Promise<void>>();
   private readonly startingSessionIds = new Set<string>();
@@ -4027,6 +4066,13 @@ class QwenAgent implements Agent {
     options: { shutdownConfig?: boolean } = {},
   ): Promise<void> {
     if (this.sessions.get(sessionId) !== session) return;
+    for (const [executionId, execution] of this.managedRuntimeToolExecutions) {
+      if (execution.sessionId !== sessionId) continue;
+      this.managedRuntimeToolExecutions.delete(executionId);
+      execution.controller.abort(
+        new Error('Managed Runtime Session was closed.'),
+      );
+    }
     try {
       session.dispose();
     } catch (error) {
@@ -11359,6 +11405,167 @@ class QwenAgent implements Agent {
               }
             : null,
         };
+      }
+      case SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolManifest: {
+        const sessionId = params['sessionId'];
+        if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Invalid or missing sessionId',
+          );
+        }
+        const session = this.sessionOrThrow(sessionId);
+        const config = session.getConfig();
+        assertManagedRuntimeSession(config, sessionId);
+        return managedRuntimeToolManifest(config);
+      }
+      case SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolExecute: {
+        const sessionId = params['sessionId'];
+        const executionId = params['executionId'];
+        const turnId = params['turnId'];
+        const toolCallId = params['toolCallId'];
+        const capabilityDigest = params['capabilityDigest'];
+        const toolName = params['toolName'];
+        const input = params['input'];
+        if (typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Invalid or missing sessionId',
+          );
+        }
+        if (
+          typeof executionId !== 'string' ||
+          executionId.length === 0 ||
+          executionId.length > 128 ||
+          typeof turnId !== 'string' ||
+          turnId.length === 0 ||
+          turnId.length > 128 ||
+          typeof toolCallId !== 'string' ||
+          toolCallId.length === 0 ||
+          toolCallId.length > 512 ||
+          typeof toolName !== 'string' ||
+          toolName.length === 0 ||
+          toolName.length > 256 ||
+          typeof capabilityDigest !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(capabilityDigest) ||
+          !isObjectRecord(input)
+        ) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Invalid Managed Runtime Tool execution request.',
+          );
+        }
+        let inputBytes: number;
+        try {
+          inputBytes = Buffer.byteLength(JSON.stringify(input), 'utf8');
+        } catch {
+          throw RequestError.invalidParams(
+            undefined,
+            'Managed Runtime Tool input must be JSON serializable.',
+          );
+        }
+        if (inputBytes > MANAGED_RUNTIME_TOOL_INPUT_MAX_BYTES) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Managed Runtime Tool input exceeds the supported size.',
+          );
+        }
+        if (this.managedRuntimeToolExecutions.has(executionId)) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Managed Runtime Tool executionId is already active.',
+          );
+        }
+        const session = this.sessionOrThrow(sessionId);
+        const config = session.getConfig();
+        assertManagedRuntimeSession(config, sessionId);
+        const manifest = managedRuntimeToolManifest(config);
+        if (manifest.capabilityDigest !== capabilityDigest) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Managed Runtime Tool capability digest changed.',
+          );
+        }
+        const canonicalName = canonicalToolName(toolName);
+        const tool = config.getToolRegistry().getTool(canonicalName);
+        if (
+          !tool ||
+          !CONCURRENCY_SAFE_KINDS.has(tool.kind) ||
+          !manifest.tools.some((declaration) => declaration.name === toolName)
+        ) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Managed Runtime Tool is unavailable or unsafe.',
+          );
+        }
+        const controller = new AbortController();
+        this.managedRuntimeToolExecutions.set(executionId, {
+          sessionId,
+          controller,
+        });
+        const request: ToolCallRequestInfo = {
+          callId: toolCallId,
+          providerCallId: toolCallId,
+          name: toolName,
+          args: structuredClone(input),
+          isClientInitiated: false,
+          prompt_id: turnId,
+        };
+        try {
+          const result = await executeToolCall(
+            config,
+            request,
+            controller.signal,
+            { recordToolResult: false },
+          );
+          return {
+            responseParts: result.responseParts,
+            ...(result.executionStatus === undefined
+              ? {}
+              : { executionStatus: result.executionStatus }),
+            ...(result.error
+              ? {
+                  error: {
+                    message: result.error.message,
+                    ...(result.errorType === undefined
+                      ? {}
+                      : { type: String(result.errorType) }),
+                  },
+                }
+              : {}),
+          };
+        } finally {
+          const active = this.managedRuntimeToolExecutions.get(executionId);
+          if (active?.controller === controller) {
+            this.managedRuntimeToolExecutions.delete(executionId);
+          }
+        }
+      }
+      case SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolCancel: {
+        const sessionId = params['sessionId'];
+        const executionId = params['executionId'];
+        if (
+          typeof sessionId !== 'string' ||
+          !SESSION_ID_RE.test(sessionId) ||
+          typeof executionId !== 'string' ||
+          executionId.length === 0 ||
+          executionId.length > 128
+        ) {
+          throw RequestError.invalidParams(
+            undefined,
+            'Invalid Managed Runtime Tool cancellation request.',
+          );
+        }
+        const session = this.sessionOrThrow(sessionId);
+        assertManagedRuntimeSession(session.getConfig(), sessionId);
+        const active = this.managedRuntimeToolExecutions.get(executionId);
+        if (!active || active.sessionId !== sessionId) {
+          return { cancelled: false };
+        }
+        active.controller.abort(
+          new Error('Managed Runtime Tool execution was cancelled.'),
+        );
+        return { cancelled: true };
       }
       case SERVE_CONTROL_EXT_METHODS.sessionTurnStatus: {
         const sessionId = params['sessionId'];
