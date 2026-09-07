@@ -227,6 +227,10 @@ interface ServeArgs {
   'allow-origin'?: string[];
   'allow-private-auth-base-url': boolean;
   'prompt-deadline-ms'?: number;
+  'experimental-managed-agents': boolean;
+  'experimental-managed-runtime-worker': boolean;
+  'experimental-managed-runtime-url'?: string;
+  'experimental-managed-runtime-token'?: string;
   'writer-idle-timeout-ms'?: number;
   'channel-idle-timeout-ms'?: number;
   'initialize-timeout-ms'?: number;
@@ -269,7 +273,7 @@ export const serveCommand: CommandModule<unknown, ServeArgs> = {
         type: 'string',
         default: DEFAULT_SERVE_HOSTNAME,
         description:
-          'Interface to bind. Loopback (127.0.0.0/8, localhost, ::1, [::1]) is auth-free; anything else requires a token.',
+          'Bind interface. 127.0.0.0/8, localhost, ::1, and [::1] are auth-free; anything else requires a token.',
       })
       .option('token', {
         type: 'string',
@@ -572,6 +576,30 @@ export const serveCommand: CommandModule<unknown, ServeArgs> = {
         description:
           'Server-side wallclock cap on POST /session/:id/prompt (ms). ' +
           'Falls back to QWEN_SERVE_PROMPT_DEADLINE_MS. Positive integer.',
+      })
+      .option('experimental-managed-agents', {
+        type: 'boolean',
+        default: false,
+        description:
+          'Enable the experimental resident Managed Gateway with durable admission and Tool-only workspace Runtimes.',
+      })
+      .option('experimental-managed-runtime-worker', {
+        type: 'boolean',
+        default: false,
+        description:
+          'Expose the private authenticated Managed Runtime worker protocol. Requires a daemon bearer token.',
+      })
+      .option('experimental-managed-runtime-url', {
+        type: 'string',
+        requiresArg: true,
+        description:
+          'Use a separate Managed Runtime worker at this HTTP(S) origin. Requires --experimental-managed-agents.',
+      })
+      .option('experimental-managed-runtime-token', {
+        type: 'string',
+        requiresArg: true,
+        description:
+          'Bearer token for the separate Managed Runtime worker. Falls back to QWEN_MANAGED_RUNTIME_TOKEN, then the daemon token.',
       })
       .option('writer-idle-timeout-ms', {
         type: 'number',
@@ -887,6 +915,24 @@ export const serveCommand: CommandModule<unknown, ServeArgs> = {
           : {}),
         ...(argv['prompt-deadline-ms'] !== undefined
           ? { promptDeadlineMs: argv['prompt-deadline-ms'] }
+          : {}),
+        ...(argv['experimental-managed-agents']
+          ? { experimentalManagedAgents: true }
+          : {}),
+        ...(argv['experimental-managed-runtime-worker']
+          ? { experimentalManagedRuntimeWorker: true }
+          : {}),
+        ...(argv['experimental-managed-runtime-url'] !== undefined
+          ? {
+              experimentalManagedRuntimeUrl:
+                argv['experimental-managed-runtime-url'],
+            }
+          : {}),
+        ...(argv['experimental-managed-runtime-token'] !== undefined
+          ? {
+              experimentalManagedRuntimeToken:
+                argv['experimental-managed-runtime-token'],
+            }
           : {}),
         ...(argv['writer-idle-timeout-ms'] !== undefined
           ? { writerIdleTimeoutMs: argv['writer-idle-timeout-ms'] }

@@ -92,6 +92,8 @@ import type { DaemonLogger } from '../daemon-logger.js';
 import type { SendBridgeError } from '../server/error-response.js';
 import { resolvePromptDeadlineMs } from '../server/prompt-deadline.js';
 import {
+  CLIENT_ID_RE,
+  MAX_CLIENT_ID_LENGTH,
   parseClientIdHeader,
   parseOptionalWorkspaceCwd,
   requireSessionId,
@@ -142,6 +144,7 @@ import {
   writeGenerationSseChunk,
 } from '../generation-sse.js';
 import {
+  rejectManagedGatewayRuntimeSession,
   requirePrimarySessionRuntime,
   requireSessionRuntime,
 } from './session-runtime.js';
@@ -191,6 +194,12 @@ import {
   type RequestedSessionIdAdmission,
   type RequestedSessionIdReservation,
 } from '../session-id-admission.js';
+import {
+  ManagedPromptServiceError,
+  type ManagedGatewayPromptRequest,
+  type ManagedPromptService,
+} from '../managed-prompt-types.js';
+import type { ManagedGatewaySessionEvents } from '../managed-gateway-session-events.js';
 
 // `HEAD` is the most prominent ref name git rejects as a branch name.
 // The surrounding predicate covers the remaining reserved forms (`@`, `-`,
@@ -252,6 +261,8 @@ interface RegisterSessionRoutesDeps {
     StandaloneSessionService,
     'restoreLegacyForCompatibility' | 'dispatchPrompt' | 'continueSession'
   >;
+  managedPromptService?: ManagedPromptService;
+  managedGatewaySessionEvents?: ManagedGatewaySessionEvents;
 }
 
 // Chosen cap for one serialized transcript response, kept proportional to
@@ -273,6 +284,13 @@ const CHANNEL_DELIVERY_AUTHORIZATION_GRACE_MS = 60_000;
 // repeated reference resolves to the same 8 MiB image once per occurrence).
 // Keep a single request from expanding an unbounded number of content blocks.
 const MEDIA_CONTENT_MAX_BLOCKS = 256;
+const MANAGED_PROMPT_MAX_CONTENT_BLOCKS = MEDIA_CONTENT_MAX_BLOCKS + 1;
+const MANAGED_PROMPT_IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+const MANAGED_PROMPT_IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9._:-]+$/;
+const MANAGED_GATEWAY_UUID_NAMESPACE = Buffer.from(
+  '8d65f3c482f4547aac17202c7894eb14',
+  'hex',
+);
 
 // SVG is allowed as an ordinary file resource but never as an inline image.
 // Compare the normalized media type so spelling variants cannot bypass the
@@ -351,6 +369,166 @@ function mediaBlockParseError(
     return 'SVG images are not supported';
   }
   return `each ${entryLabel} must be an inline content block or carry \`attachmentId\`, \`size\`, and \`mimeType\``;
+}
+
+function parseManagedPromptContent(
+  value: unknown,
+  res: Response,
+): BridgePromptContentBlock[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) {
+    res.status(400).json({
+      error:
+        '`prompt` is required and must be a non-empty array of content blocks',
+      code: 'managed_prompt_invalid',
+    });
+    return undefined;
+  }
+  if (value.length > MANAGED_PROMPT_MAX_CONTENT_BLOCKS) {
+    res.status(400).json({
+      error: `\`prompt\` must carry at most ${MANAGED_PROMPT_MAX_CONTENT_BLOCKS} content blocks`,
+      code: 'managed_prompt_invalid',
+    });
+    return undefined;
+  }
+  const prompt: BridgePromptContentBlock[] = [];
+  let mediaBlockCount = 0;
+  for (const block of value) {
+    if (!block || typeof block !== 'object' || Array.isArray(block)) {
+      res.status(400).json({
+        error: 'each `prompt` element must be an object (content block)',
+        code: 'managed_prompt_invalid',
+      });
+      return undefined;
+    }
+    const record = block as Record<string, unknown>;
+    if (record['type'] === 'text') {
+      if (
+        typeof record['text'] !== 'string' ||
+        Object.keys(record).some((key) => key !== 'type' && key !== 'text')
+      ) {
+        res.status(400).json({
+          error: 'managed text blocks may contain only `type` and `text`',
+          code: 'managed_prompt_invalid',
+        });
+        return undefined;
+      }
+      prompt.push({ type: 'text', text: record['text'] });
+      continue;
+    }
+    mediaBlockCount += 1;
+    if (mediaBlockCount > MEDIA_CONTENT_MAX_BLOCKS) {
+      res.status(400).json({
+        error: `\`prompt\` must carry at most ${MEDIA_CONTENT_MAX_BLOCKS} media blocks`,
+        code: 'managed_prompt_invalid',
+      });
+      return undefined;
+    }
+    const parsed = parseMediaContentBlock(block);
+    if (
+      !parsed.valid ||
+      parsed.block.type !== 'image' ||
+      !('data' in parsed.block)
+    ) {
+      res.status(400).json({
+        error:
+          parsed.valid && parsed.block.type !== 'image'
+            ? 'managed prompts support text and inline raster images only'
+            : parsed.valid
+              ? 'managed prompts do not support attachment references'
+              : mediaBlockParseError(parsed.code, '`prompt` image block'),
+        code: 'managed_prompt_invalid',
+      });
+      return undefined;
+    }
+    prompt.push(parsed.block);
+  }
+  return prompt;
+}
+
+function sendManagedPromptServiceError(
+  res: Response,
+  error: ManagedPromptServiceError,
+): void {
+  let status = 400;
+  if (
+    error.code === 'managed_prompt_inbox_full' ||
+    error.code === 'managed_prompt_tenant_inbox_full'
+  ) {
+    status = 429;
+  } else if (error.code === 'managed_prompt_idempotency_conflict') {
+    status = 409;
+  } else if (error.code === 'managed_gateway_turn_active') {
+    status = 409;
+  } else if (error.code === 'managed_prompt_deadline_exceeded') {
+    status = 408;
+  }
+  if (error.retryable) res.setHeader('Retry-After', '1');
+  res.status(status).json({
+    error: error.message,
+    code: error.code,
+    retryable: error.retryable,
+  });
+}
+
+function managedGatewaySessionId(
+  workspaceId: string,
+  managedClientId: string,
+  idempotencyKey: string,
+): string {
+  const bytes = crypto
+    .createHash('sha1')
+    .update(MANAGED_GATEWAY_UUID_NAMESPACE)
+    .update(JSON.stringify([workspaceId, managedClientId, idempotencyKey]))
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function parseManagedGatewayClientId(
+  req: Request,
+  res: Response,
+): string | undefined {
+  const clientId = req.get('X-Qwen-Managed-Client-Id');
+  if (
+    !clientId ||
+    clientId.length > MAX_CLIENT_ID_LENGTH ||
+    !CLIENT_ID_RE.test(clientId)
+  ) {
+    res.status(400).json({
+      error:
+        '`X-Qwen-Managed-Client-Id` must be a non-empty token of 128 characters or fewer',
+      code: 'managed_gateway_client_id_invalid',
+    });
+    return undefined;
+  }
+  return clientId;
+}
+
+function parseManagedGatewayLastEventId(
+  req: Request,
+  res: Response,
+): number | null | undefined {
+  const raw = req.get('Last-Event-ID');
+  if (raw === undefined) return undefined;
+  if (!/^\d+$/.test(raw)) {
+    res.status(400).json({
+      error: '`Last-Event-ID` must be a non-negative safe integer',
+      code: 'managed_gateway_last_event_id_invalid',
+    });
+    return null;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    res.status(400).json({
+      error: '`Last-Event-ID` must be a non-negative safe integer',
+      code: 'managed_gateway_last_event_id_invalid',
+    });
+    return null;
+  }
+  return value;
 }
 const PRIMARY_ONLY_LIVE_SESSION_ROUTES = ['POST /session/:id/cd'] as const;
 const PRIMARY_OR_INTERNAL_LIVE_SESSION_ROUTES = [
@@ -625,6 +803,14 @@ function parseRequestedSessionSource(
   body: Record<string, unknown>,
   res: Response,
 ): { sourceType?: string; sourceId?: string } | null {
+  if (body['sourceType'] === 'managed-gateway') {
+    res.status(400).json({
+      error:
+        'The requested session source is reserved for daemon-owned Managed Gateway Runtimes.',
+      code: 'reserved_session_source',
+    });
+    return null;
+  }
   if (
     isReservedStandaloneSessionSource({
       sourceType:
@@ -734,6 +920,25 @@ export function registerSessionRoutes(
         ? registeredGeneration.guard
         : runtime.generationGuard;
     return guard ? () => guard.assertOpen() : undefined;
+  };
+  const rejectManagedGatewaySession = async (
+    runtime: WorkspaceRuntime,
+    sessionId: string,
+    res: Response,
+  ): Promise<boolean> => {
+    if (rejectManagedGatewayRuntimeSession(runtime, sessionId, res)) {
+      return true;
+    }
+    if (!isValidSessionId(sessionId)) return false;
+    const service = createWorkspaceRuntimeSessionService(runtime);
+    const metadata = await service.readCreationMetadata(sessionId);
+    if (metadata.sourceType !== 'managed-gateway') return false;
+    res.status(404).json({
+      error: `No session with id "${sessionId}"`,
+      code: 'session_not_found',
+      sessionId,
+    });
+    return true;
   };
   const LANGUAGE_CODES = deps.languageCodes;
   const transcriptCursorMasterKey = crypto.randomBytes(32);
@@ -1258,7 +1463,14 @@ export function registerSessionRoutes(
   ): Promise<WorkspaceRuntime | undefined> => {
     const target = resolveQualifiedSessionTarget(req, res);
     if (!target) return undefined;
-    if (target.kind === 'ordinary') return target.runtime;
+    if (target.kind === 'ordinary') {
+      for (const sessionId of sessionIds) {
+        if (await rejectManagedGatewaySession(target.runtime, sessionId, res)) {
+          return undefined;
+        }
+      }
+      return target.runtime;
+    }
     const internalEntry = target.entry;
     const generation =
       internalEntry.state === 'active' ? internalEntry.current : undefined;
@@ -1402,6 +1614,12 @@ export function registerSessionRoutes(
       if (qualifiedTarget.kind === 'ordinary') {
         preResolvedRuntime = qualifiedTarget.runtime;
       }
+    }
+    if (
+      preResolvedRuntime &&
+      (await rejectManagedGatewaySession(preResolvedRuntime, sessionId, res))
+    ) {
+      return;
     }
     const rawFormat = req.query['format'];
     const format = parseSessionExportFormat(rawFormat);
@@ -1967,6 +2185,9 @@ export function registerSessionRoutes(
 
     if (legacyPrimaryFallback) {
       const runtime = workspaceRegistry.primary;
+      if (await rejectManagedGatewaySession(runtime, sessionId, res)) {
+        return undefined;
+      }
       if (loadError === undefined) return runtime;
       try {
         if (await activeInRuntime(runtime, true)) return runtime;
@@ -1986,6 +2207,11 @@ export function registerSessionRoutes(
       return undefined;
     }
     if (liveOwner.kind === 'found') {
+      if (
+        await rejectManagedGatewaySession(liveOwner.runtime, sessionId, res)
+      ) {
+        return undefined;
+      }
       const internalEntry = isInternalWorkspaceRuntime(liveOwner.runtime)
         ? workspaceRegistry.getManagedEntryByWorkspaceCwd(
             liveOwner.runtime.workspaceCwd,
@@ -2065,6 +2291,9 @@ export function registerSessionRoutes(
     if (workspaceRegistry.listEntries().length === 1) {
       const runtime = requirePrimarySessionRuntime(workspaceRegistry, res);
       if (!runtime) return undefined;
+      if (await rejectManagedGatewaySession(runtime, sessionId, res)) {
+        return undefined;
+      }
       try {
         if (await activeInRuntime(runtime, true)) {
           return runtime;
@@ -2088,6 +2317,9 @@ export function registerSessionRoutes(
     }
     if (activeRuntimes.length === 1) {
       const runtime = activeRuntimes[0]!;
+      if (await rejectManagedGatewaySession(runtime, sessionId, res)) {
+        return undefined;
+      }
       setDaemonTelemetryWorkspace(res, runtime.workspaceCwd);
       if (!assertTrustedSessionOwner(res, route, sessionId, runtime)) {
         return undefined;
@@ -2130,6 +2362,12 @@ export function registerSessionRoutes(
     }
     if (owner.kind === 'ambiguous') {
       sendAmbiguousSessionOwner(res, route, sessionId, owner.runtimes);
+      return undefined;
+    }
+    if (
+      owner.kind === 'found' &&
+      (await rejectManagedGatewaySession(owner.runtime, sessionId, res))
+    ) {
       return undefined;
     }
     const matches = new Set<WorkspaceRuntime>();
@@ -2176,6 +2414,9 @@ export function registerSessionRoutes(
         code: 'session_not_found',
         sessionId,
       });
+      return undefined;
+    }
+    if (await rejectManagedGatewaySession(runtime, sessionId, res)) {
       return undefined;
     }
     if (!assertTrustedSessionOwner(res, route, sessionId, runtime)) {
@@ -2254,6 +2495,9 @@ export function registerSessionRoutes(
         return undefined;
       }
       if (owner.kind === 'found') {
+        if (await rejectManagedGatewaySession(owner.runtime, sessionId, res)) {
+          return undefined;
+        }
         if (isInternalWorkspaceRuntime(owner.runtime)) {
           candidates.add(owner.runtime);
         } else {
@@ -2326,6 +2570,11 @@ export function registerSessionRoutes(
     }
     if (!internalRuntime) {
       const runtime = workspaceRegistry.primary;
+      for (const sessionId of sessionIds) {
+        if (await rejectManagedGatewaySession(runtime, sessionId, res)) {
+          return undefined;
+        }
+      }
       setDaemonTelemetryWorkspace(res, runtime.workspaceCwd);
       return runtime;
     }
@@ -2340,6 +2589,9 @@ export function registerSessionRoutes(
           return undefined;
         }
         throw new SessionNotFoundError(sessionId);
+      }
+      if (await rejectManagedGatewaySession(internalRuntime, sessionId, res)) {
+        return undefined;
       }
     }
     const internalEntry = workspaceRegistry.getManagedEntryByWorkspaceCwd(
@@ -3457,6 +3709,7 @@ export function registerSessionRoutes(
       }
       if (resolvedRuntime === undefined) return;
       const { runtime, workspaceCwd } = resolvedRuntime;
+      if (await rejectManagedGatewaySession(runtime, sessionId, res)) return;
       const assertRuntimeGenerationOpen =
         captureRuntimeGenerationAssertion(runtime);
       const approvalMode = parseOptionalApprovalMode(body, res);
@@ -3634,6 +3887,7 @@ export function registerSessionRoutes(
             // gate and must not become unreachable.
             if (
               metadata === undefined ||
+              metadata.sourceType === 'managed-gateway' ||
               (isInternalWorkspaceRuntime(runtime) &&
                 isReservedStandaloneSessionSource(metadata))
             ) {
@@ -4417,6 +4671,12 @@ export function registerSessionRoutes(
     if (!qualifiedTarget) return;
     const preResolvedRuntime =
       qualifiedTarget.kind === 'ordinary' ? qualifiedTarget.runtime : undefined;
+    if (
+      preResolvedRuntime &&
+      (await rejectManagedGatewaySession(preResolvedRuntime, sessionId, res))
+    ) {
+      return;
+    }
     const limit = parseTranscriptLimitQuery(req.query['limit'], res);
     if (limit === null) return;
     const cursor = parseTranscriptCursorQuery(req.query['cursor'], res);
@@ -5144,6 +5404,381 @@ export function registerSessionRoutes(
       },
     ),
   );
+
+  if (deps.managedPromptService && deps.managedGatewaySessionEvents) {
+    app.post('/managed/sessions', mutate(), async (req, res) => {
+      const body = safeBody(req);
+      const unknownField = Object.keys(body).find(
+        (field) =>
+          field !== 'prompt' && field !== 'cwd' && field !== 'deadlineMs',
+      );
+      if (unknownField !== undefined) {
+        res.status(400).json({
+          error: `unsupported Managed Gateway field: ${unknownField}`,
+          code: 'managed_gateway_invalid',
+        });
+        return;
+      }
+      const idempotencyKey = req.get('Idempotency-Key');
+      if (
+        !idempotencyKey ||
+        idempotencyKey.length > MANAGED_PROMPT_IDEMPOTENCY_KEY_MAX_LENGTH ||
+        !MANAGED_PROMPT_IDEMPOTENCY_KEY_RE.test(idempotencyKey)
+      ) {
+        res.status(400).json({
+          error:
+            '`Idempotency-Key` must be a non-empty token of 128 characters or fewer',
+          code: 'managed_prompt_idempotency_key_invalid',
+        });
+        return;
+      }
+      const managedClientId = parseManagedGatewayClientId(req, res);
+      if (!managedClientId) return;
+      const resolvedRuntime = resolveRuntimeForSessionCreation(body, res);
+      if (!resolvedRuntime) return;
+      const { runtime } = resolvedRuntime;
+      setDaemonTelemetryWorkspace(res, runtime.workspaceCwd);
+      if (isInternalWorkspaceRuntime(runtime)) {
+        res.status(400).json({
+          error:
+            'Managed Gateway Sessions are not supported in the internal Conversations workspace.',
+          code: 'managed_gateway_session_not_supported',
+        });
+        return;
+      }
+      if (!runtime.trusted) {
+        sendUntrustedWorkspaceResponse(res, {
+          workspaceCwd: runtime.workspaceCwd,
+          workspaceId: runtime.workspaceId,
+        });
+        return;
+      }
+      const prompt = parseManagedPromptContent(body['prompt'], res);
+      if (!prompt) return;
+      const rawRequestDeadline = body['deadlineMs'];
+      let requestDeadlineMs: number | undefined;
+      if (rawRequestDeadline !== undefined) {
+        if (
+          typeof rawRequestDeadline !== 'number' ||
+          !Number.isSafeInteger(rawRequestDeadline) ||
+          rawRequestDeadline <= 0
+        ) {
+          res.status(400).json({
+            error: '`deadlineMs` must be a positive safe integer',
+            code: 'invalid_deadline_ms',
+          });
+          return;
+        }
+        requestDeadlineMs = rawRequestDeadline;
+      }
+      const effectiveDeadlineMs = resolvePromptDeadlineMs(
+        promptDeadlineMs,
+        requestDeadlineMs,
+      );
+      const deadlineAt =
+        effectiveDeadlineMs === undefined
+          ? undefined
+          : Date.now() + effectiveDeadlineMs;
+      if (deadlineAt !== undefined && !Number.isSafeInteger(deadlineAt)) {
+        res.status(400).json({
+          error: '`deadlineMs` exceeds the supported range',
+          code: 'invalid_deadline_ms',
+        });
+        return;
+      }
+      const sessionId = managedGatewaySessionId(
+        runtime.workspaceId,
+        managedClientId,
+        idempotencyKey,
+      );
+      const request: ManagedGatewayPromptRequest = {
+        mode: 'gateway',
+        turnKind: 'bootstrap',
+        tenantId: runtime.workspaceId,
+        workspaceId: runtime.workspaceId,
+        workspaceCwd: runtime.workspaceCwd,
+        sessionId,
+        messageId: idempotencyKey,
+        managedClientId,
+        prompt,
+        ...(deadlineAt === undefined ? {} : { deadlineAt }),
+      };
+      addDaemonRequestAttribute('qwen-code.prompt_id', idempotencyKey);
+      try {
+        const admission = await deps.managedPromptService!.admit(request);
+        let status = deps.managedGatewaySessionEvents!.authorize(
+          sessionId,
+          managedClientId,
+        );
+        if (
+          admission.state !== 'finished' ||
+          status?.promptId === idempotencyKey
+        ) {
+          status = deps.managedGatewaySessionEvents!.ensure(request);
+        }
+        const durableStatus = deps.managedPromptService!.getStatus(
+          runtime.workspaceId,
+          sessionId,
+          idempotencyKey,
+        );
+        res.status(202).json({
+          managed: true,
+          sessionId,
+          promptId: idempotencyKey,
+          ...(status?.promptId === idempotencyKey
+            ? {
+                eventPath: `/managed/sessions/${sessionId}/events`,
+                statusPath: `/managed/sessions/${sessionId}`,
+              }
+            : {}),
+          ...admission,
+          eventStreamAvailable: status?.promptId === idempotencyKey,
+          phase:
+            status?.promptId === idempotencyKey
+              ? status.phase
+              : durableStatus?.outcome === 'completed'
+                ? 'completed'
+                : 'failed',
+        });
+      } catch (error) {
+        if (error instanceof ManagedPromptServiceError) {
+          sendManagedPromptServiceError(res, error);
+          return;
+        }
+        throw error;
+      }
+    });
+
+    app.post('/managed/sessions/:id/prompts', mutate(), async (req, res) => {
+      const rawSessionId = req.params['id'];
+      const sessionId = rawSessionId
+        ? normalizeSessionIdForLookup(rawSessionId)
+        : undefined;
+      const managedClientId = parseManagedGatewayClientId(req, res);
+      if (!managedClientId) return;
+      const binding =
+        sessionId && isValidSessionId(sessionId)
+          ? deps.managedPromptService!.getGatewayBinding?.(sessionId)
+          : undefined;
+      if (
+        !binding ||
+        binding.sessionId !== sessionId ||
+        binding.managedClientId !== managedClientId
+      ) {
+        res.status(404).json({
+          error: 'Managed Gateway Session not found',
+          code: 'managed_gateway_session_not_found',
+        });
+        return;
+      }
+      const boundSessionId = binding.sessionId;
+      const runtime = workspaceRegistry.getByWorkspaceId(binding.workspaceId);
+      if (
+        !runtime ||
+        runtime.workspaceCwd !== binding.workspaceCwd ||
+        !runtime.trusted ||
+        isInternalWorkspaceRuntime(runtime)
+      ) {
+        res.status(404).json({
+          error: 'Managed Gateway Session runtime is unavailable',
+          code: 'managed_gateway_runtime_unavailable',
+        });
+        return;
+      }
+      setDaemonTelemetryWorkspace(res, runtime.workspaceCwd);
+      const body = safeBody(req);
+      const unknownField = Object.keys(body).find(
+        (field) => field !== 'prompt' && field !== 'deadlineMs',
+      );
+      if (unknownField !== undefined) {
+        res.status(400).json({
+          error: `unsupported Managed Gateway follow-up field: ${unknownField}`,
+          code: 'managed_gateway_invalid',
+        });
+        return;
+      }
+      const idempotencyKey = req.get('Idempotency-Key');
+      if (
+        !idempotencyKey ||
+        idempotencyKey.length > MANAGED_PROMPT_IDEMPOTENCY_KEY_MAX_LENGTH ||
+        !MANAGED_PROMPT_IDEMPOTENCY_KEY_RE.test(idempotencyKey)
+      ) {
+        res.status(400).json({
+          error:
+            '`Idempotency-Key` must be a non-empty token of 128 characters or fewer',
+          code: 'managed_prompt_idempotency_key_invalid',
+        });
+        return;
+      }
+      const prompt = parseManagedPromptContent(body['prompt'], res);
+      if (!prompt) return;
+      const rawRequestDeadline = body['deadlineMs'];
+      let requestDeadlineMs: number | undefined;
+      if (rawRequestDeadline !== undefined) {
+        if (
+          typeof rawRequestDeadline !== 'number' ||
+          !Number.isSafeInteger(rawRequestDeadline) ||
+          rawRequestDeadline <= 0
+        ) {
+          res.status(400).json({
+            error: '`deadlineMs` must be a positive safe integer',
+            code: 'invalid_deadline_ms',
+          });
+          return;
+        }
+        requestDeadlineMs = rawRequestDeadline;
+      }
+      const effectiveDeadlineMs = resolvePromptDeadlineMs(
+        promptDeadlineMs,
+        requestDeadlineMs,
+      );
+      const deadlineAt =
+        effectiveDeadlineMs === undefined
+          ? undefined
+          : Date.now() + effectiveDeadlineMs;
+      if (deadlineAt !== undefined && !Number.isSafeInteger(deadlineAt)) {
+        res.status(400).json({
+          error: '`deadlineMs` exceeds the supported range',
+          code: 'invalid_deadline_ms',
+        });
+        return;
+      }
+      const request: ManagedGatewayPromptRequest = {
+        mode: 'gateway',
+        turnKind: 'continuation',
+        tenantId: binding.tenantId,
+        workspaceId: binding.workspaceId,
+        workspaceCwd: binding.workspaceCwd,
+        sessionId: binding.sessionId,
+        messageId: idempotencyKey,
+        managedClientId: binding.managedClientId,
+        prompt,
+        ...(deadlineAt === undefined ? {} : { deadlineAt }),
+      };
+      addDaemonRequestAttribute('qwen-code.prompt_id', idempotencyKey);
+      try {
+        const admission = await deps.managedPromptService!.admit(request);
+        let status = deps.managedGatewaySessionEvents!.authorize(
+          boundSessionId,
+          managedClientId,
+        );
+        if (
+          admission.state !== 'finished' ||
+          status?.promptId === idempotencyKey
+        ) {
+          status = deps.managedGatewaySessionEvents!.ensure(request);
+        }
+        const durableStatus = deps.managedPromptService!.getStatus(
+          binding.tenantId,
+          boundSessionId,
+          idempotencyKey,
+        );
+        res.status(202).json({
+          managed: true,
+          sessionId: boundSessionId,
+          promptId: idempotencyKey,
+          ...(status?.promptId === idempotencyKey
+            ? {
+                eventPath: `/managed/sessions/${boundSessionId}/events`,
+                statusPath: `/managed/sessions/${boundSessionId}`,
+              }
+            : {}),
+          ...admission,
+          eventStreamAvailable: status?.promptId === idempotencyKey,
+          phase:
+            status?.promptId === idempotencyKey
+              ? status.phase
+              : durableStatus?.outcome === 'completed'
+                ? 'completed'
+                : 'failed',
+        });
+      } catch (error) {
+        if (error instanceof ManagedPromptServiceError) {
+          sendManagedPromptServiceError(res, error);
+          return;
+        }
+        throw error;
+      }
+    });
+
+    app.get('/managed/sessions/:id/events', async (req, res) => {
+      const managedClientId = parseManagedGatewayClientId(req, res);
+      if (!managedClientId) return;
+      const sessionId = req.params['id'];
+      if (
+        !sessionId ||
+        !deps.managedGatewaySessionEvents!.authorize(sessionId, managedClientId)
+      ) {
+        res.status(404).json({
+          error: 'Managed Gateway Session not found',
+          code: 'managed_gateway_session_not_found',
+        });
+        return;
+      }
+      const afterEventId = parseManagedGatewayLastEventId(req, res);
+      if (afterEventId === null) return;
+      const abort = new AbortController();
+      res.once('close', () => abort.abort());
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+      let writeChain = Promise.resolve();
+      const write = (chunk: string): Promise<void> => {
+        writeChain = writeChain.then(() => writeGenerationSseChunk(res, chunk));
+        return writeChain;
+      };
+      await write('retry: 1000\n\n');
+      const heartbeat = setInterval(() => {
+        void write(': heartbeat\n\n').catch(() => abort.abort());
+      }, GENERATION_HEARTBEAT_MS);
+      heartbeat.unref();
+      try {
+        for await (const event of deps.managedGatewaySessionEvents!.subscribe(
+          sessionId,
+          managedClientId,
+          afterEventId,
+          abort.signal,
+        )) {
+          await write(
+            `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
+          );
+        }
+      } catch (error) {
+        if (!abort.signal.aborted) {
+          daemonLog?.warn('managed gateway event stream failed', {
+            sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } finally {
+        clearInterval(heartbeat);
+        if (!res.destroyed) res.end();
+      }
+    });
+
+    app.get('/managed/sessions/:id', (req, res) => {
+      const managedClientId = parseManagedGatewayClientId(req, res);
+      if (!managedClientId) return;
+      const sessionId = req.params['id'];
+      const status = sessionId
+        ? deps.managedGatewaySessionEvents!.authorize(
+            sessionId,
+            managedClientId,
+          )
+        : undefined;
+      if (!status) {
+        res.status(404).json({
+          error: 'Managed Gateway Session not found',
+          code: 'managed_gateway_session_not_found',
+        });
+        return;
+      }
+      res.status(200).set('Cache-Control', 'no-store').json(status);
+    });
+  }
 
   app.post(
     '/session/:id/prompt',
@@ -5954,6 +6589,7 @@ export function registerSessionRoutes(
         });
         return;
       }
+      if (await rejectManagedGatewaySession(runtime, sessionId, res)) return;
       const clientId = parseClientIdHeader(req, res);
       if (clientId === null) return;
       const rawDisplayName = safeBody(req)['displayName'];
@@ -6682,7 +7318,9 @@ export function registerSessionRoutes(
           controller.signal.throwIfAborted();
           if (res.destroyed) return;
           res.status(200).json({
-            sessions: result.sessions,
+            sessions: result.sessions.filter(
+              (session) => session.sourceType !== 'managed-gateway',
+            ),
             ...(result.nextCursor != null
               ? { nextCursor: result.nextCursor }
               : {}),
@@ -6776,6 +7414,7 @@ export function registerSessionRoutes(
       }
       const sessions = bridge
         .listWorkspaceSessions(runtime.workspaceCwd)
+        .filter((session) => session.sourceType !== 'managed-gateway')
         .map((session) => ({
           sessionId: session.sessionId,
           clientCount: session.clientCount,

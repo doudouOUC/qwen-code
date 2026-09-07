@@ -317,6 +317,14 @@ export interface ServeOptions {
    * `POST /session/:id/prompt` from receipt to completion.
    */
   promptDeadlineMs?: number;
+  /** Mount the experimental resident Managed Gateway and Tool Runtime path. */
+  experimentalManagedAgents?: boolean;
+  /** Expose the private authenticated Tool-only Runtime worker protocol. */
+  experimentalManagedRuntimeWorker?: boolean;
+  /** Use a remote Runtime worker origin instead of the local provider. */
+  experimentalManagedRuntimeUrl?: string;
+  /** Bearer credential used only for the remote Runtime worker. */
+  experimentalManagedRuntimeToken?: string;
   /**
    * Per-SSE-connection idle deadline.
    */

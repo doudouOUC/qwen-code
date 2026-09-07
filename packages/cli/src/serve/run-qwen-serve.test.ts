@@ -88,6 +88,14 @@ import type { WorkspaceFileSystemFactory } from './fs/workspace-file-system.js';
 import { ConversationWorkspace } from './conversations/conversation-workspace.js';
 import type { WorkspaceRuntimeProvenance } from './managed-scratch-workspace.js';
 import * as scheduledTaskKeepalive from './scheduled-task-keepalive.js';
+import type { ManagedPromptService } from './managed-prompt-types.js';
+import { ManagedGatewaySessionEvents } from './managed-gateway-session-events.js';
+import type { ManagedGatewayModelRunner } from './managed-gateway-model-runtime.js';
+import type { ManagedRuntimeProvider } from './managed-runtime-provider.js';
+import {
+  MANAGED_RUNTIME_PROTOCOL_VERSION,
+  MANAGED_RUNTIME_ROUTE_PREFIX,
+} from './managed-runtime-protocol.js';
 
 const originalTestRuntimeDir = process.env['QWEN_RUNTIME_DIR'];
 const isolatedTestRuntimeDir = fs.realpathSync(
@@ -504,6 +512,656 @@ function makeRuntimeBridge(): HttpAcpBridge {
     isChannelLive: vi.fn().mockReturnValue(true),
   } as unknown as HttpAcpBridge;
 }
+
+it('wires the opt-in Managed Prompt service into the runtime app', async () => {
+  const workspace = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'qws-managed-prompt-')),
+  );
+  const managedPromptService: ManagedPromptService = {
+    admit: vi.fn(),
+    getStatus: vi.fn(),
+    dispose: vi.fn(),
+  };
+  const originalCreateServeApp = serverModule.createServeApp;
+  let injected: ManagedPromptService | undefined;
+  vi.spyOn(serverModule, 'createServeApp').mockImplementation((...args) => {
+    injected = args[2]?.managedPromptService;
+    return originalCreateServeApp(...args);
+  });
+  let handle: RunHandle | undefined;
+  try {
+    handle = await runQwenServe(
+      {
+        port: 0,
+        hostname: '127.0.0.1',
+        mode: 'http-bridge',
+        workspace,
+        maxSessions: 1,
+        serveWebShell: false,
+        experimentalManagedAgents: true,
+      },
+      { bridge: makeRuntimeBridge(), managedPromptService },
+    );
+    await handle.runtimeReady;
+    expect(injected).toBe(managedPromptService);
+  } finally {
+    await handle?.close();
+    fs.rmSync(workspace, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  }
+});
+
+it('mounts the authenticated Managed Runtime worker protocol', async () => {
+  const workspace = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'qws-managed-runtime-worker-')),
+  );
+  const provider: ManagedRuntimeProvider = {
+    prepare: vi.fn(() => ({
+      ready: Promise.resolve(),
+      getManifest: vi.fn(),
+      execute: vi.fn(),
+    })),
+    cancel: vi.fn().mockResolvedValue(true),
+    release: vi.fn().mockResolvedValue(true),
+    dispose: vi.fn(),
+  };
+  let handle: RunHandle | undefined;
+  try {
+    handle = await runQwenServe(
+      {
+        port: 0,
+        hostname: '127.0.0.1',
+        mode: 'http-bridge',
+        token: 'runtime-worker-secret',
+        workspace,
+        maxSessions: 1,
+        serveWebShell: false,
+        experimentalManagedRuntimeWorker: true,
+      },
+      {
+        bridge: makeRuntimeBridge(),
+        managedRuntimeWorkerProvider: provider,
+        preheatBridge: false,
+      },
+    );
+    await handle.runtimeReady;
+    const body = {
+      protocolVersion: MANAGED_RUNTIME_PROTOCOL_VERSION,
+      tenantId: 'tenant-worker',
+      workspaceId: 'workspace-worker',
+      workspaceCwd: workspace,
+      sessionId: '550e8400-e29b-41d4-a716-446655440109',
+      turnKind: 'bootstrap',
+    };
+    await fetch(`${handle.url}${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then((response) => expect(response.status).toBe(401));
+    const response = await fetch(
+      `${handle.url}${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer runtime-worker-secret',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      protocolVersion: MANAGED_RUNTIME_PROTOCOL_VERSION,
+      ready: true,
+    });
+    expect(provider.prepare).toHaveBeenCalledWith(body);
+  } finally {
+    await handle?.close();
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+it('refuses to expose a Managed Runtime worker without a bearer token', async () => {
+  await expect(
+    runQwenServe(
+      {
+        port: 0,
+        hostname: '127.0.0.1',
+        mode: 'http-bridge',
+        workspace: process.cwd(),
+        serveWebShell: false,
+        experimentalManagedRuntimeWorker: true,
+      },
+      { bridge: makeRuntimeBridge(), preheatBridge: false },
+    ),
+  ).rejects.toThrow('without a bearer token');
+});
+
+it('keeps the model in the Gateway and uses a delayed Runtime only for Tools', async () => {
+  const workspace = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'qws-managed-gateway-')),
+  );
+  const events = new ManagedGatewaySessionEvents();
+  const modelRunner: ManagedGatewayModelRunner = {
+    start: vi.fn().mockResolvedValue(undefined),
+    runTurn: vi.fn(async (request, runtime, sink, signal) => {
+      sink.onModelStarted({
+        round: 0,
+        agentDefinitionId: 'test-definition-v1',
+      });
+      sink.onDelta('authoritative gateway start');
+      if (request.messageId.startsWith('gateway-no-tool')) {
+        return 'authoritative no-Tool answer';
+      }
+      sink.onToolRequested({
+        toolCallId: `call-${request.messageId}`,
+        toolName: 'read_file',
+      });
+      const manifest = await runtime.getManifest(signal);
+      const tool = manifest.tools[0];
+      if (!tool?.name) throw new Error('missing test Tool');
+      const result = await runtime.execute(
+        {
+          executionId: `execution-${request.messageId}`,
+          turnId: request.messageId,
+          toolCallId: `call-${request.messageId}`,
+          capabilityDigest: manifest.capabilityDigest,
+          toolName: tool.name,
+          input: { path: 'README.md' },
+        },
+        signal,
+      );
+      sink.onToolCompleted({
+        toolCallId: `call-${request.messageId}`,
+        toolName: tool.name,
+        failed: result.error !== undefined,
+      });
+      sink.onDelta('authoritative gateway answer');
+      return 'authoritative gateway answer';
+    }),
+    dispose: vi.fn().mockResolvedValue(undefined),
+  };
+  let releaseRuntime!: () => void;
+  const runtimeReadyGate = new Promise<void>((resolve) => {
+    releaseRuntime = resolve;
+  });
+  const bridge = {
+    ...makeRuntimeBridge(),
+    spawnOrAttach: vi.fn(async (req: { sessionId?: string }) => {
+      await runtimeReadyGate;
+      return {
+        sessionId: req.sessionId!,
+        workspaceCwd: workspace,
+        attached: false,
+        clientId: 'runtime-client',
+        hasActivePrompt: false,
+        sourceType: 'managed-gateway',
+        sourceId: req.sessionId!,
+        sourcePersisted: true,
+      };
+    }),
+    getSessionSummary: vi.fn((sessionId: string) => ({
+      sessionId,
+      workspaceCwd: workspace,
+      createdAt: new Date().toISOString(),
+      sourceType: 'managed-gateway',
+      sourceId: sessionId,
+      clientCount: 1,
+      hasActivePrompt: false,
+    })),
+    recordHeartbeat: vi.fn(),
+    resumeSession: vi.fn(),
+    getManagedRuntimeToolManifest: vi.fn().mockResolvedValue({
+      capabilityDigest: 'a'.repeat(64),
+      tools: [{ name: 'read_file', description: 'Read one file' }],
+    }),
+    executeManagedRuntimeTool: vi.fn().mockResolvedValue({
+      responseParts: [
+        {
+          functionResponse: {
+            id: 'call-result',
+            name: 'read_file',
+            response: { output: 'workspace evidence' },
+          },
+        },
+      ],
+      executionStatus: 'success',
+    }),
+    sendPrompt: vi
+      .fn()
+      .mockRejectedValue(
+        new Error('Managed Gateway must not send a Prompt to its Runtime.'),
+      ),
+    closeSession: vi.fn().mockResolvedValue(undefined),
+    detachClient: vi.fn().mockResolvedValue(undefined),
+  } as unknown as HttpAcpBridge;
+  let handle: RunHandle | undefined;
+  try {
+    handle = await runQwenServe(
+      {
+        port: 0,
+        hostname: '127.0.0.1',
+        mode: 'http-bridge',
+        workspace,
+        maxSessions: 1,
+        memoryBudgetMb: 4096,
+        promptDeadlineMs: 10_000,
+        serveWebShell: false,
+        experimentalManagedAgents: true,
+      },
+      {
+        bridge,
+        managedGatewaySessionEvents: events,
+        managedGatewayModelRunner: modelRunner,
+        preheatBridge: false,
+      },
+    );
+    await handle.runtimeReady;
+    const response = await fetch(`${handle.url}/managed/sessions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'gateway-test-message',
+        'x-qwen-managed-client-id': 'gateway-test-client',
+      },
+      body: JSON.stringify({
+        prompt: [{ type: 'text', text: 'inspect the workspace' }],
+      }),
+    });
+    const admitted = (await response.json()) as { sessionId: string };
+    expect(response.status).toBe(202);
+    expect(
+      events.authorize(admitted.sessionId, 'gateway-test-client'),
+    ).toMatchObject({ phase: 'admitted', runtimeReady: false });
+    expect(bridge.sendPrompt).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(admitted.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'agent_running', runtimeReady: false });
+    });
+    expect(bridge.getManagedRuntimeToolManifest).not.toHaveBeenCalled();
+    releaseRuntime();
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(admitted.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'completed', runtimeReady: true });
+    });
+
+    const streamed = [];
+    for await (const event of events.subscribe(
+      admitted.sessionId,
+      'gateway-test-client',
+      undefined,
+      new AbortController().signal,
+    )) {
+      streamed.push(event.type);
+    }
+    expect(streamed.indexOf('agent_started')).toBeLessThan(
+      streamed.indexOf('runtime_ready'),
+    );
+    expect(streamed.indexOf('assistant_delta')).toBeLessThan(
+      streamed.indexOf('runtime_ready'),
+    );
+    expect(bridge.getManagedRuntimeToolManifest).toHaveBeenCalledWith(
+      admitted.sessionId,
+      { clientId: 'runtime-client' },
+    );
+    expect(bridge.executeManagedRuntimeTool).toHaveBeenCalledWith(
+      admitted.sessionId,
+      expect.objectContaining({
+        turnId: 'gateway-test-message',
+        toolName: 'read_file',
+      }),
+      expect.any(AbortSignal),
+      { clientId: 'runtime-client' },
+    );
+    expect(bridge.sendPrompt).not.toHaveBeenCalled();
+
+    const retryResponse = await fetch(`${handle.url}/managed/sessions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'gateway-test-message',
+        'x-qwen-managed-client-id': 'gateway-test-client',
+      },
+      body: JSON.stringify({
+        prompt: [{ type: 'text', text: 'inspect the workspace' }],
+      }),
+    });
+    expect(retryResponse.status).toBe(202);
+    await expect(retryResponse.json()).resolves.toMatchObject({
+      sessionId: admitted.sessionId,
+      created: false,
+      state: 'finished',
+    });
+    expect(modelRunner.runTurn).toHaveBeenCalledTimes(1);
+    expect(bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
+    expect(bridge.sendPrompt).not.toHaveBeenCalled();
+
+    const followUpResponse = await fetch(
+      `${handle.url}/managed/sessions/${admitted.sessionId}/prompts`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'gateway-follow-up-message',
+          'x-qwen-managed-client-id': 'gateway-test-client',
+        },
+        body: JSON.stringify({
+          prompt: [{ type: 'text', text: 'what did you find?' }],
+        }),
+      },
+    );
+    expect(followUpResponse.status).toBe(202);
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(admitted.sessionId, 'gateway-test-client'),
+      ).toMatchObject({
+        promptId: 'gateway-follow-up-message',
+        phase: 'completed',
+        runtimeReady: true,
+      });
+    });
+    expect(bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
+    expect(bridge.resumeSession).not.toHaveBeenCalled();
+    expect(bridge.recordHeartbeat).toHaveBeenCalledWith(admitted.sessionId, {
+      clientId: 'runtime-client',
+    });
+    expect(bridge.getManagedRuntimeToolManifest).toHaveBeenLastCalledWith(
+      admitted.sessionId,
+      { clientId: 'runtime-client' },
+    );
+    const followUpRetry = await fetch(
+      `${handle.url}/managed/sessions/${admitted.sessionId}/prompts`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'gateway-follow-up-message',
+          'x-qwen-managed-client-id': 'gateway-test-client',
+        },
+        body: JSON.stringify({
+          prompt: [{ type: 'text', text: 'what did you find?' }],
+        }),
+      },
+    );
+    expect(followUpRetry.status).toBe(202);
+    await expect(followUpRetry.json()).resolves.toMatchObject({
+      sessionId: admitted.sessionId,
+      created: false,
+      state: 'finished',
+    });
+    expect(modelRunner.runTurn).toHaveBeenCalledTimes(2);
+    expect(bridge.sendPrompt).not.toHaveBeenCalled();
+
+    vi.mocked(bridge.getSessionSummary).mockImplementationOnce(() => {
+      throw new Error('cached Runtime client is stale');
+    });
+    vi.mocked(bridge.resumeSession).mockResolvedValueOnce({
+      sessionId: admitted.sessionId,
+      workspaceCwd: workspace,
+      attached: true,
+      clientId: 'restored-runtime-client',
+      hasActivePrompt: false,
+      sourceType: 'managed-gateway',
+      sourceId: admitted.sessionId,
+      sourcePersisted: true,
+      state: {} as never,
+    });
+    const restoredFollowUp = await fetch(
+      `${handle.url}/managed/sessions/${admitted.sessionId}/prompts`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'gateway-restored-follow-up',
+          'x-qwen-managed-client-id': 'gateway-test-client',
+        },
+        body: JSON.stringify({
+          prompt: [{ type: 'text', text: 'continue after restart' }],
+        }),
+      },
+    );
+    expect(restoredFollowUp.status).toBe(202);
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(admitted.sessionId, 'gateway-test-client'),
+      ).toMatchObject({
+        promptId: 'gateway-restored-follow-up',
+        phase: 'completed',
+      });
+    });
+    expect(bridge.resumeSession).toHaveBeenCalledWith({
+      sessionId: admitted.sessionId,
+      workspaceCwd: workspace,
+      sourceType: 'managed-gateway',
+      sourceId: admitted.sessionId,
+    });
+    expect(bridge.getManagedRuntimeToolManifest).toHaveBeenLastCalledWith(
+      admitted.sessionId,
+      { clientId: 'restored-runtime-client' },
+    );
+    expect(modelRunner.runTurn).toHaveBeenCalledTimes(3);
+    expect(bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
+
+    let releaseNoToolRuntime!: () => void;
+    vi.mocked(bridge.spawnOrAttach).mockImplementationOnce(
+      (req) =>
+        new Promise((resolve) => {
+          releaseNoToolRuntime = () =>
+            resolve({
+              sessionId: req.sessionId!,
+              workspaceCwd: workspace,
+              attached: false,
+              clientId: 'no-tool-runtime-client',
+              hasActivePrompt: false,
+              sourceType: 'managed-gateway',
+              sourceId: req.sessionId!,
+            });
+        }),
+    );
+    const manifestCallsBeforeNoTool = vi.mocked(
+      bridge.getManagedRuntimeToolManifest,
+    ).mock.calls.length;
+    const noToolResponse = await fetch(`${handle.url}/managed/sessions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'gateway-no-tool-message',
+        'x-qwen-managed-client-id': 'gateway-test-client',
+      },
+      body: JSON.stringify({
+        prompt: [{ type: 'text', text: 'answer without workspace evidence' }],
+      }),
+    });
+    const noTool = (await noToolResponse.json()) as { sessionId: string };
+    expect(noToolResponse.status).toBe(202);
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(noTool.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'completed', runtimeReady: false });
+    });
+    expect(bridge.getManagedRuntimeToolManifest).toHaveBeenCalledTimes(
+      manifestCallsBeforeNoTool,
+    );
+    expect(modelRunner.runTurn).toHaveBeenCalledTimes(4);
+    const spawnCallsWhileWarming = vi.mocked(bridge.spawnOrAttach).mock.calls
+      .length;
+    const noToolFollowUpResponse = await fetch(
+      `${handle.url}/managed/sessions/${noTool.sessionId}/prompts`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'gateway-no-tool-follow-up',
+          'x-qwen-managed-client-id': 'gateway-test-client',
+        },
+        body: JSON.stringify({
+          prompt: [{ type: 'text', text: 'another answer without tools' }],
+        }),
+      },
+    );
+    expect(noToolFollowUpResponse.status).toBe(202);
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(noTool.sessionId, 'gateway-test-client'),
+      ).toMatchObject({
+        promptId: 'gateway-no-tool-follow-up',
+        phase: 'completed',
+        runtimeReady: false,
+      });
+    });
+    expect(bridge.spawnOrAttach).toHaveBeenCalledTimes(spawnCallsWhileWarming);
+    expect(bridge.getManagedRuntimeToolManifest).toHaveBeenCalledTimes(
+      manifestCallsBeforeNoTool,
+    );
+    releaseNoToolRuntime();
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(noTool.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'completed', runtimeReady: true });
+    });
+
+    vi.mocked(bridge.spawnOrAttach).mockImplementationOnce(async (req) => ({
+      sessionId: req.sessionId!,
+      workspaceCwd: workspace,
+      attached: true,
+      clientId: 'attached-client',
+      hasActivePrompt: false,
+      sourceType: 'managed-gateway',
+      sourceId: req.sessionId!,
+    }));
+    const collisionResponse = await fetch(`${handle.url}/managed/sessions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'gateway-collision-message',
+        'x-qwen-managed-client-id': 'gateway-test-client',
+      },
+      body: JSON.stringify({
+        prompt: [{ type: 'text', text: 'must not enter an existing Session' }],
+      }),
+    });
+    const collision = (await collisionResponse.json()) as {
+      sessionId: string;
+    };
+    expect(collisionResponse.status).toBe(202);
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(collision.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'failed', runtimeReady: false });
+    });
+    expect(bridge.detachClient).toHaveBeenCalledWith(
+      collision.sessionId,
+      'attached-client',
+    );
+    expect(bridge.sendPrompt).not.toHaveBeenCalled();
+
+    let settleLateSpawn!: () => void;
+    vi.mocked(bridge.spawnOrAttach).mockImplementationOnce(
+      (req) =>
+        new Promise((resolve) => {
+          settleLateSpawn = () =>
+            resolve({
+              sessionId: req.sessionId!,
+              workspaceCwd: workspace,
+              attached: false,
+              clientId: 'late-client',
+              hasActivePrompt: false,
+              sourceType: 'managed-gateway',
+              sourceId: req.sessionId!,
+            });
+        }),
+    );
+    const deadlineResponse = await fetch(`${handle.url}/managed/sessions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'idempotency-key': 'gateway-deadline-message',
+        'x-qwen-managed-client-id': 'gateway-test-client',
+      },
+      body: JSON.stringify({
+        prompt: [{ type: 'text', text: 'deadline test' }],
+        deadlineMs: 250,
+      }),
+    });
+    const deadline = (await deadlineResponse.json()) as { sessionId: string };
+    expect(deadlineResponse.status).toBe(202);
+    await vi.waitFor(() => {
+      expect(settleLateSpawn).toBeTypeOf('function');
+    });
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(deadline.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'failed', runtimeReady: false });
+    });
+    settleLateSpawn();
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(deadline.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'failed', runtimeReady: false });
+    });
+    await vi.waitFor(() => {
+      expect(bridge.closeSession).toHaveBeenCalledWith(deadline.sessionId, {
+        clientId: 'late-client',
+      });
+    });
+    expect(bridge.sendPrompt).not.toHaveBeenCalled();
+
+    vi.mocked(bridge.spawnOrAttach).mockImplementationOnce(async (req) => ({
+      sessionId: req.sessionId!,
+      workspaceCwd: workspace,
+      attached: false,
+      clientId: 'manifest-timeout-client',
+      hasActivePrompt: false,
+      sourceType: 'managed-gateway',
+      sourceId: req.sessionId!,
+    }));
+    let manifestRequested = false;
+    vi.mocked(bridge.getManagedRuntimeToolManifest).mockImplementationOnce(
+      () => {
+        manifestRequested = true;
+        return new Promise(() => undefined);
+      },
+    );
+    const manifestDeadlineResponse = await fetch(
+      `${handle.url}/managed/sessions`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'gateway-manifest-deadline-message',
+          'x-qwen-managed-client-id': 'gateway-test-client',
+        },
+        body: JSON.stringify({
+          prompt: [{ type: 'text', text: 'manifest deadline test' }],
+          deadlineMs: 250,
+        }),
+      },
+    );
+    const manifestDeadline = (await manifestDeadlineResponse.json()) as {
+      sessionId: string;
+    };
+    expect(manifestDeadlineResponse.status).toBe(202);
+    await vi.waitFor(() => expect(manifestRequested).toBe(true));
+    await vi.waitFor(() => {
+      expect(
+        events.authorize(manifestDeadline.sessionId, 'gateway-test-client'),
+      ).toMatchObject({ phase: 'failed', runtimeReady: true });
+    });
+    expect(bridge.executeManagedRuntimeTool).not.toHaveBeenCalledWith(
+      manifestDeadline.sessionId,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  } finally {
+    releaseRuntime();
+    await handle?.close();
+    expect(modelRunner.dispose).not.toHaveBeenCalled();
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
 
 it('restores the Conversations runtime for a persisted scheduled task', async () => {
   delete process.env['QWEN_RUNTIME_DIR'];
@@ -16046,6 +16704,46 @@ describe('runQwenServe startup observability', () => {
       expect(await waitForPreheatStatus(handle, 'succeeded')).toMatchObject({
         status: 'succeeded',
         durationMs: expect.any(Number),
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('skips local ACP preheat for a remote Managed Runtime Gateway', async () => {
+    tmpDir = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'qws-remote-runtime-preheat-')),
+    );
+    const bridge = installInternalBridge(() => Promise.resolve());
+    const managedPromptService: ManagedPromptService = {
+      admit: vi.fn(),
+      getStatus: vi.fn(),
+      dispose: vi.fn(),
+    };
+    const handle = await runQwenServe(
+      {
+        port: 0,
+        hostname: '127.0.0.1',
+        mode: 'http-bridge',
+        token: 'gateway-token',
+        workspace: tmpDir,
+        maxSessions: 1,
+        serveWebShell: false,
+        experimentalManagedAgents: true,
+        experimentalManagedRuntimeUrl: 'http://127.0.0.1:4181',
+        experimentalManagedRuntimeToken: 'runtime-token',
+      },
+      {
+        managedPromptService,
+        preheatBridge: true,
+      },
+    );
+
+    try {
+      await handle.runtimeReady;
+      expect(bridge.preheat).not.toHaveBeenCalled();
+      expect((await readStartup(handle))?.preheat).toMatchObject({
+        status: 'not_scheduled',
       });
     } finally {
       await handle.close();

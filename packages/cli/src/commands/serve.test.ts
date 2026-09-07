@@ -95,6 +95,32 @@ describe('serve command args', () => {
     expect(parsed['experimentalLsp']).toBe(true);
   });
 
+  it('parses Managed Agents as an explicit opt-in', () => {
+    expect(
+      buildParser().strict().parseSync('--experimental-managed-agents')[
+        'experimental-managed-agents'
+      ],
+    ).toBe(true);
+    expect(buildParser().parseSync('')['experimental-managed-agents']).toBe(
+      false,
+    );
+  });
+
+  it('parses the experimental remote Runtime process options', () => {
+    const parsed = buildParser()
+      .strict()
+      .parseSync(
+        '--experimental-managed-runtime-worker ' +
+          '--experimental-managed-runtime-url http://127.0.0.1:4181 ' +
+          '--experimental-managed-runtime-token runtime-secret',
+      );
+    expect(parsed['experimental-managed-runtime-worker']).toBe(true);
+    expect(parsed['experimental-managed-runtime-url']).toBe(
+      'http://127.0.0.1:4181',
+    );
+    expect(parsed['experimental-managed-runtime-token']).toBe('runtime-secret');
+  });
+
   it('parses --permission-response-timeout-ms as a number', () => {
     const parsed = buildParser().parseSync(
       '--permission-response-timeout-ms 60000',
@@ -725,6 +751,42 @@ describe('serve rate limit env parsing', () => {
     expect(mockRunQwenServe).toHaveBeenCalledWith(
       expect.objectContaining({
         compactedReplayMaxBytes: 1024 * 1024,
+      }),
+    );
+  });
+
+  it('passes the experimental Managed Agents opt-in to runQwenServe', async () => {
+    mockRunQwenServe.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:4170/',
+      webShellMounted: false,
+    });
+
+    await startServeHandlerWithArgs('--no-web --experimental-managed-agents');
+
+    expect(mockRunQwenServe).toHaveBeenCalledWith(
+      expect.objectContaining({ experimentalManagedAgents: true }),
+    );
+  });
+
+  it('passes the remote Managed Runtime options to runQwenServe', async () => {
+    mockRunQwenServe.mockResolvedValueOnce({
+      url: 'http://127.0.0.1:4170/',
+      webShellMounted: false,
+    });
+
+    await startServeHandlerWithArgs(
+      '--no-web --experimental-managed-agents ' +
+        '--experimental-managed-runtime-worker ' +
+        '--experimental-managed-runtime-url http://127.0.0.1:4181 ' +
+        '--experimental-managed-runtime-token runtime-secret',
+    );
+
+    expect(mockRunQwenServe).toHaveBeenCalledWith(
+      expect.objectContaining({
+        experimentalManagedAgents: true,
+        experimentalManagedRuntimeWorker: true,
+        experimentalManagedRuntimeUrl: 'http://127.0.0.1:4181',
+        experimentalManagedRuntimeToken: 'runtime-secret',
       }),
     );
   });

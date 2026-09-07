@@ -4,7 +4,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { X509Certificate, createHash, timingSafeEqual } from 'node:crypto';
+import {
+  X509Certificate,
+  createHash,
+  randomUUID,
+  timingSafeEqual,
+} from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
 import * as fs from 'node:fs';
@@ -139,6 +144,21 @@ import type {
   WorkspaceRegistry,
   WorkspaceRuntime,
 } from './workspace-registry.js';
+import type {
+  ManagedGatewayPromptRequest,
+  ManagedPromptService,
+} from './managed-prompt-types.js';
+import type { ManagedGatewaySessionEvents } from './managed-gateway-session-events.js';
+import type { ManagedGatewayModelRunner } from './managed-gateway-model-runtime.js';
+import {
+  LocalManagedRuntimeProvider,
+  RemoteManagedRuntimeProvider,
+  type ManagedRuntimeProvider,
+} from './managed-runtime-provider.js';
+import {
+  MANAGED_RUNTIME_PROTOCOL_VERSION,
+  type ManagedRuntimePrepareRequest,
+} from './managed-runtime-protocol.js';
 import type { SessionArchiveCoordinator } from './server/session-archive.js';
 import type {
   DaemonTrustPolicySnapshot,
@@ -415,6 +435,7 @@ const FAST_PATH_RUNTIME_START_AFTER_HEALTH_MS = 50;
 // Keep manual/non-probed starts moving; health probes cancel this fallback.
 const FAST_PATH_RUNTIME_START_FALLBACK_MS = 1_000;
 const RUNTIME_STARTUP_TIMEOUT_ENV = 'QWEN_SERVE_RUNTIME_STARTUP_TIMEOUT_MS';
+const MANAGED_RUNTIME_TOKEN_ENV = 'QWEN_MANAGED_RUNTIME_TOKEN';
 const MAX_EVENT_RING_SIZE = 1_000_000;
 const DEFAULT_MAX_SESSIONS = 32;
 const DEFAULT_MAX_PENDING_PROMPTS_PER_SESSION = 5;
@@ -446,6 +467,25 @@ function isNonNegativeIntegerOrInfinity(value: number): boolean {
     value === Number.POSITIVE_INFINITY ||
     (Number.isFinite(value) && Number.isInteger(value) && value >= 0)
   );
+}
+
+function remainingManagedPromptDeadlineMs(
+  deadlineAt: number | undefined,
+): number | undefined {
+  return deadlineAt === undefined ? undefined : deadlineAt - Date.now();
+}
+
+function managedRuntimePrepareRequest(
+  request: ManagedGatewayPromptRequest,
+): ManagedRuntimePrepareRequest {
+  return {
+    protocolVersion: MANAGED_RUNTIME_PROTOCOL_VERSION,
+    tenantId: request.tenantId,
+    workspaceId: request.workspaceId,
+    workspaceCwd: request.workspaceCwd,
+    sessionId: request.sessionId,
+    turnKind: request.turnKind,
+  };
 }
 
 function deriveDefaultMaxTotalSessions(
@@ -2039,6 +2079,16 @@ function buildProviderSetupInputs(
 export interface RunQwenServeDeps {
   /** Bridge instance; tests inject a fake. Defaults to a fresh real one. */
   bridge?: AcpSessionBridge;
+  /** Test/embed override for the experimental Managed Prompt service. */
+  managedPromptService?: ManagedPromptService;
+  /** Test/embed override for Managed Gateway Session events. */
+  managedGatewaySessionEvents?: ManagedGatewaySessionEvents;
+  /** Test/embed override for the resident Managed Gateway model. */
+  managedGatewayModelRunner?: ManagedGatewayModelRunner;
+  /** Test/embed override for the Gateway's Runtime transport. */
+  managedRuntimeProvider?: ManagedRuntimeProvider;
+  /** Test/embed override for the private Runtime worker surface. */
+  managedRuntimeWorkerProvider?: ManagedRuntimeProvider;
   /** Test/embed override for the plain HTTP server constructor. */
   httpServerFactory?: (app: Application) => Server;
   /** Test override for resolving `localhost` before authority is derived. */
@@ -3183,7 +3233,10 @@ async function runQwenServeImpl(
   // copy before freezing runtime environments or starting auxiliary workers.
   delete process.env[EXTERNAL_TOOL_GUARD_TOKEN_ENV];
   const channelDeliveryAuthorizations = new ChannelDeliveryAuthorizationStore();
-  const shouldPreheat = !deps.bridge && shouldPreheatBridge(deps);
+  const shouldPreheat =
+    !deps.bridge &&
+    shouldPreheatBridge(deps) &&
+    optsIn.experimentalManagedRuntimeUrl === undefined;
   const startup: DaemonStartupSnapshot = {
     processStartedAt: new Date(
       Date.now() - Math.round(process.uptime() * 1000),
@@ -3263,6 +3316,17 @@ async function runQwenServeImpl(
   loggerLifecycle.scrubApplied(restoreScrubbedLoaderEnv);
 
   const token = resolveServeToken(optsIn.token);
+  const managedRuntimeToken = optsIn.experimentalManagedRuntimeUrl
+    ? optsIn.experimentalManagedRuntimeToken?.trim() ||
+      process.env[MANAGED_RUNTIME_TOKEN_ENV]?.trim() ||
+      token
+    : undefined;
+  if (optsIn.experimentalManagedRuntimeToken !== undefined) {
+    writeStderrLine(
+      `qwen serve: --experimental-managed-runtime-token is visible in the ` +
+        `process command line; prefer ${MANAGED_RUNTIME_TOKEN_ENV}.`,
+    );
+  }
   const bindHostname =
     optsIn.hostname.toLowerCase() === 'localhost'
       ? (await (deps.bindHostnameLookup ?? lookup)(optsIn.hostname)).address
@@ -3319,6 +3383,7 @@ async function runQwenServeImpl(
     ...optsIn,
     hostname: bindHostname,
     token,
+    experimentalManagedRuntimeToken: managedRuntimeToken,
     promptDeadlineMs,
     writerIdleTimeoutMs,
     workspace: rawWorkspace,
@@ -3529,6 +3594,38 @@ async function runQwenServeImpl(
       `Refusing to start with --require-auth set but no bearer token ` +
         `configured. Set ${QWEN_SERVER_TOKEN_ENV} or pass --token, or omit ` +
         `--require-auth to keep the loopback developer default.`,
+    );
+  }
+  if (opts.experimentalManagedRuntimeWorker === true && !token) {
+    throw new Error(
+      `Refusing to expose the Managed Runtime worker without a bearer token. ` +
+        `Set ${QWEN_SERVER_TOKEN_ENV} or pass --token.`,
+    );
+  }
+  if (
+    opts.experimentalManagedRuntimeUrl !== undefined &&
+    opts.experimentalManagedAgents !== true
+  ) {
+    throw new Error(
+      '--experimental-managed-runtime-url requires --experimental-managed-agents.',
+    );
+  }
+  if (
+    optsIn.experimentalManagedRuntimeToken !== undefined &&
+    opts.experimentalManagedRuntimeUrl === undefined
+  ) {
+    throw new Error(
+      '--experimental-managed-runtime-token requires --experimental-managed-runtime-url.',
+    );
+  }
+  if (
+    opts.experimentalManagedRuntimeUrl !== undefined &&
+    !opts.experimentalManagedRuntimeToken
+  ) {
+    throw new Error(
+      `A remote Managed Runtime requires a bearer token. Set ` +
+        `${MANAGED_RUNTIME_TOKEN_ENV}, pass ` +
+        `--experimental-managed-runtime-token, or configure the daemon token.`,
     );
   }
 
@@ -4230,6 +4327,44 @@ async function runQwenServeImpl(
   let runtimeApp: Application | undefined;
   let runtimeAppForCleanup: Application | undefined;
   let bridgeRef: AcpSessionBridge | undefined = deps.bridge;
+  let managedPromptWorkspaceRegistry: WorkspaceRegistry | undefined;
+  let managedPromptService = deps.managedPromptService;
+  let ownsManagedPromptService = false;
+  let managedGatewaySessionEvents = deps.managedGatewaySessionEvents;
+  let managedGatewayModelRunner = deps.managedGatewayModelRunner;
+  let managedRuntimeProvider = deps.managedRuntimeProvider;
+  let managedRuntimeWorkerProvider = deps.managedRuntimeWorkerProvider;
+  const ownedManagedRuntimeProviders = new Set<ManagedRuntimeProvider>();
+  const stopManagedRuntimeProviders = (): void => {
+    for (const provider of ownedManagedRuntimeProviders) provider.dispose();
+    ownedManagedRuntimeProviders.clear();
+    managedRuntimeProvider = undefined;
+    managedRuntimeWorkerProvider = undefined;
+  };
+  const discardManagedGatewayRuntime = (sessionId: string): void => {
+    void managedRuntimeProvider?.release(sessionId).catch(() => undefined);
+  };
+  let ownsManagedGatewaySessionEvents = false;
+  let ownsManagedGatewayModelRunner = false;
+  const stopOwnedManagedAgentResources = async (): Promise<void> => {
+    if (ownsManagedPromptService) {
+      managedPromptService?.dispose();
+      managedPromptService = undefined;
+      managedPromptWorkspaceRegistry = undefined;
+      ownsManagedPromptService = false;
+    }
+    stopManagedRuntimeProviders();
+    if (ownsManagedGatewaySessionEvents) {
+      managedGatewaySessionEvents?.dispose();
+      managedGatewaySessionEvents = undefined;
+      ownsManagedGatewaySessionEvents = false;
+    }
+    if (ownsManagedGatewayModelRunner) {
+      await managedGatewayModelRunner?.dispose().catch(() => undefined);
+      managedGatewayModelRunner = undefined;
+      ownsManagedGatewayModelRunner = false;
+    }
+  };
   let managedProcessRegistry:
     | {
         shutdown(): Promise<void>;
@@ -6236,6 +6371,229 @@ async function runQwenServeImpl(
         scanUnindexedOwners: deps.bridge !== undefined,
       });
     workspaceRegistryForPersistence.current = workspaceRegistry;
+    if (opts.experimentalManagedAgents === true) {
+      managedPromptWorkspaceRegistry = workspaceRegistry;
+    }
+    if (
+      opts.experimentalManagedRuntimeWorker === true &&
+      !managedRuntimeWorkerProvider
+    ) {
+      managedRuntimeWorkerProvider = new LocalManagedRuntimeProvider(
+        workspaceRegistry,
+      );
+      ownedManagedRuntimeProviders.add(managedRuntimeWorkerProvider);
+    }
+    if (opts.experimentalManagedAgents === true && !managedRuntimeProvider) {
+      if (opts.experimentalManagedRuntimeUrl) {
+        managedRuntimeProvider = new RemoteManagedRuntimeProvider({
+          baseUrl: opts.experimentalManagedRuntimeUrl,
+          token: opts.experimentalManagedRuntimeToken!,
+        });
+        ownedManagedRuntimeProviders.add(managedRuntimeProvider);
+      } else if (managedRuntimeWorkerProvider) {
+        managedRuntimeProvider = managedRuntimeWorkerProvider;
+      } else {
+        managedRuntimeProvider = new LocalManagedRuntimeProvider(
+          workspaceRegistry,
+        );
+        ownedManagedRuntimeProviders.add(managedRuntimeProvider);
+      }
+    }
+    if (opts.experimentalManagedAgents === true && !managedPromptService) {
+      try {
+        const managedPromptStateScope = createHash('sha256')
+          .update(
+            opts.port === 0
+              ? `${opts.hostname}:ephemeral:${process.pid}:${randomUUID()}`
+              : `${opts.hostname}:${opts.port}`,
+          )
+          .digest('hex')
+          .slice(0, 16);
+        const managedAgentsStateDir = path.join(
+          path.dirname(daemonLogBaseDir),
+          'managed-agents',
+          managedPromptStateScope,
+        );
+        const [
+          { ManagedGatewaySessionEvents },
+          { ResidentManagedGatewayModelRunner },
+        ] = await Promise.all([
+          import('./managed-gateway-session-events.js'),
+          import('./managed-gateway-model-runtime.js'),
+        ]);
+        if (!managedGatewaySessionEvents) {
+          managedGatewaySessionEvents = new ManagedGatewaySessionEvents();
+          ownsManagedGatewaySessionEvents = true;
+        }
+        if (!managedGatewayModelRunner) {
+          managedGatewayModelRunner = new ResidentManagedGatewayModelRunner(
+            boundWorkspace,
+            managedAgentsStateDir,
+          );
+          ownsManagedGatewayModelRunner = true;
+        }
+        await managedGatewayModelRunner.start();
+        const { createManagedPromptService } = await import(
+          './managed-prompt-service.js'
+        );
+        managedPromptService = await createManagedPromptService({
+          stateDir: managedAgentsStateDir,
+          startPaused: true,
+          workerId: `daemon-${process.pid}-${randomUUID()}`,
+          hasMemoryHeadroom: () => {
+            const budget = opts.daemonMemoryBudget;
+            if (!budget) return false;
+            try {
+              return (
+                process.memoryUsage().rss <
+                budget.effectiveBudgetMb * 1024 * 1024 * 0.8
+              );
+            } catch {
+              return false;
+            }
+          },
+          dispatch: async (request: ManagedGatewayPromptRequest, signal) => {
+            const events = managedGatewaySessionEvents;
+            const registry = managedPromptWorkspaceRegistry;
+            if (!events || !registry) {
+              throw new Error('Managed Gateway resources are unavailable.');
+            }
+            events.ensure(request);
+            events.markRuntimeStarting(request);
+            const runtime = registry.getByWorkspaceId(request.workspaceId);
+            if (
+              !runtime ||
+              runtime.workspaceCwd !== request.workspaceCwd ||
+              !runtime.trusted
+            ) {
+              throw new Error(
+                'Managed Gateway workspace is unavailable or untrusted.',
+              );
+            }
+            const modelRunner = managedGatewayModelRunner;
+            if (!modelRunner) {
+              throw new Error('Managed Gateway model is unavailable.');
+            }
+            const runtimeProvider = managedRuntimeProvider;
+            if (!runtimeProvider) {
+              throw new Error('Managed Runtime provider is unavailable.');
+            }
+
+            let deadlineTimer: NodeJS.Timeout | undefined;
+            const deadlineController = new AbortController();
+            const remainingAtStart = remainingManagedPromptDeadlineMs(
+              request.deadlineAt,
+            );
+            if (remainingAtStart !== undefined) {
+              if (remainingAtStart <= 0) {
+                throw new Error(
+                  'Managed Gateway deadline expired before dispatch.',
+                );
+              }
+              deadlineTimer = setTimeout(
+                () =>
+                  deadlineController.abort(
+                    new Error('Managed Gateway Prompt deadline exceeded.'),
+                  ),
+                remainingAtStart,
+              );
+              deadlineTimer.unref();
+            }
+            const executionSignal = AbortSignal.any([
+              signal,
+              deadlineController.signal,
+            ]);
+            try {
+              const runtimeHandle = runtimeProvider.prepare(
+                managedRuntimePrepareRequest(request),
+              );
+              void runtimeHandle.ready.then(
+                () => {
+                  try {
+                    events.markRuntimeReady(request);
+                  } catch (error) {
+                    daemonLog.warn(
+                      'managed gateway Runtime readiness event failed',
+                      {
+                        workspaceId: request.workspaceId,
+                        sessionId: request.sessionId,
+                        promptId: request.messageId,
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : String(error),
+                      },
+                    );
+                  }
+                },
+                (error: unknown) => {
+                  try {
+                    events.markRuntimeFailed(request);
+                  } catch {
+                    // The ephemeral event binding may already be disposed.
+                  }
+                  daemonLog.warn('managed gateway Runtime warmup failed', {
+                    workspaceId: request.workspaceId,
+                    sessionId: request.sessionId,
+                    promptId: request.messageId,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  });
+                },
+              );
+              await modelRunner.runTurn(
+                request,
+                runtimeHandle,
+                {
+                  onModelStarted: ({ round, agentDefinitionId }) =>
+                    events.markAgentStarted(request, round, agentDefinitionId),
+                  onThought: (text) =>
+                    events.appendAssistantThought(request, text),
+                  onDelta: (text) => events.appendAssistantDelta(request, text),
+                  onToolRequested: ({ toolCallId, toolName }) =>
+                    events.markToolRequested(request, toolCallId, toolName),
+                  onToolCompleted: ({ toolCallId, toolName, failed }) =>
+                    events.markToolCompleted(
+                      request,
+                      toolCallId,
+                      toolName,
+                      failed,
+                    ),
+                },
+                executionSignal,
+              );
+            } finally {
+              if (deadlineTimer) clearTimeout(deadlineTimer);
+            }
+          },
+          onCompleted: (request) => {
+            managedGatewaySessionEvents?.complete(request);
+          },
+          onError: (request, error) => {
+            if (request.turnKind === 'bootstrap') {
+              discardManagedGatewayRuntime(request.sessionId);
+            }
+            managedGatewaySessionEvents?.fail(request, {
+              code: 'managed_gateway_failed',
+              message: 'Managed Gateway turn failed.',
+            });
+            daemonLog.warn('managed prompt failed', {
+              workspaceId: request.workspaceId,
+              sessionId: request.sessionId,
+              promptId: request.messageId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          },
+        });
+      } catch (error) {
+        await stopOwnedManagedAgentResources();
+        throw error;
+      }
+      ownsManagedPromptService = true;
+      daemonLog.info('experimental managed agents enabled', {
+        harnessSlots: 4,
+      });
+    }
     const workspaceVoiceCoordinator = new WorkspaceVoiceCoordinator();
 
     core.registerDaemonGaugeCallbacks({
@@ -7394,6 +7752,16 @@ async function runQwenServeImpl(
       daemonEnv: daemonRuntimeBaseEnv,
       runtimePlatform: deps.runtimePlatform,
       daemonLog,
+      ...(opts.experimentalManagedAgents === true && managedPromptService
+        ? { managedPromptService }
+        : {}),
+      ...(opts.experimentalManagedAgents === true && managedGatewaySessionEvents
+        ? { managedGatewaySessionEvents }
+        : {}),
+      ...(opts.experimentalManagedRuntimeWorker === true &&
+      managedRuntimeWorkerProvider
+        ? { managedRuntimeWorkerProvider }
+        : {}),
       getChannelWorkerSnapshot,
       getChannelWorkerSnapshots,
       getChannelWorkerControl,
@@ -7728,6 +8096,14 @@ async function runQwenServeImpl(
         runWorkspaceTrustOperation(async () => undefined);
       await trustMonitor.start();
     }
+    if (ownsManagedPromptService) {
+      try {
+        await managedPromptService?.start?.();
+      } catch (error) {
+        await stopOwnedManagedAgentResources();
+        throw error;
+      }
+    }
     const activePrimaryBridge =
       workspaceRegistry.primaryEntry.current?.runtime.bridge;
     bridgeRef = activePrimaryBridge;
@@ -7735,7 +8111,13 @@ async function runQwenServeImpl(
   };
 
   if (deps.bridge) {
-    const runtime = await buildRuntime();
+    let runtime: Awaited<ReturnType<typeof buildRuntime>>;
+    try {
+      runtime = await buildRuntime();
+    } catch (error) {
+      await stopOwnedManagedAgentResources();
+      throw error;
+    }
     runtimeAppForCleanup = runtime.app;
     bridgeRef = runtime.bridge;
     if (!opts.channelSelection) {
@@ -8410,6 +8792,7 @@ async function runQwenServeImpl(
       ): Promise<void> => {
         const error = err instanceof Error ? err : new Error(String(err));
         markServeAppStartupFailed(error);
+        await stopOwnedManagedAgentResources();
         if (runtimeStartupSettled) {
           disposeRuntimeAppResources(runtimeApp ?? runtimeAppForCleanup);
           await shutdownBridgeAfterFailedStartup(bridgeForCleanup);
@@ -8804,6 +9187,7 @@ async function runQwenServeImpl(
         runtimeStarting = buildRuntime()
           .then(async (runtime) => {
             if (runtimeStartupSettled) {
+              await stopOwnedManagedAgentResources();
               disposeRuntimeAppResources(runtime.app);
               await shutdownBridgeAfterFailedStartup(runtime.bridge);
               return;
@@ -9162,6 +9546,7 @@ async function runQwenServeImpl(
                   );
                 });
                 startProcessRegistryShutdown();
+                await stopOwnedManagedAgentResources();
                 disposeRuntimeAppResources(appForCleanup);
                 disposeDaemonEventLoopMonitor();
                 // Writer terminals are already in flight. Stop the worker
@@ -9403,6 +9788,22 @@ async function runQwenServeImpl(
         );
       }
     };
+    const rejectServerConstruction = (error: Error): void => {
+      removeCurrentServePidfile();
+      markServeAppStartupFailed(error);
+      disposeRuntimeAppResources(runtimeApp ?? runtimeAppForCleanup);
+      disposeDaemonEventLoopMonitor();
+      void stopOwnedManagedAgentResources().then(
+        () => reject(error),
+        (cleanupError: unknown) =>
+          reject(
+            new AggregateError(
+              [error, cleanupError],
+              'Server construction and Managed Agent cleanup failed.',
+            ),
+          ),
+      );
+    };
     let server: Server;
     if (tlsOptions) {
       try {
@@ -9412,7 +9813,7 @@ async function runQwenServeImpl(
         // "error:0B080074:...key values mismatch") when cert/key don't pair.
         // Wrap it so the operator gets the same actionable framing as the
         // --tls-cert/--tls-key read errors above.
-        reject(
+        rejectServerConstruction(
           new Error(
             `--tls-cert "${opts.tlsCert}" and --tls-key "${opts.tlsKey}" ` +
               `could not be loaded (do they match?): ` +
@@ -9422,7 +9823,14 @@ async function runQwenServeImpl(
         return;
       }
     } else {
-      server = deps.httpServerFactory?.(app) ?? createServer(app);
+      try {
+        server = deps.httpServerFactory?.(app) ?? createServer(app);
+      } catch (err) {
+        rejectServerConstruction(
+          err instanceof Error ? err : new Error(String(err)),
+        );
+        return;
+      }
     }
     serveAppLifecycle.bindServer(server, {
       startupReady: serveAppStartupReady,

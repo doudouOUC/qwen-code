@@ -207,6 +207,11 @@ import {
 import { WorkspaceVoiceCoordinator } from './voice/workspace-voice-coordinator.js';
 import { getActiveSseCount } from './routes/sse-events.js';
 import { SessionArchiveCoordinator } from './server/session-archive.js';
+import {
+  ManagedPromptServiceError,
+  type ManagedPromptService,
+} from './managed-prompt-types.js';
+import { ManagedGatewaySessionEvents } from './managed-gateway-session-events.js';
 
 // ── Worktree mock infrastructure ────────────────────────────────────
 // GitWorktreeService's constructor calls simpleGit() which validates
@@ -11809,6 +11814,24 @@ describe('createServeApp', () => {
       expect(bridge.calls).toHaveLength(0);
     });
 
+    it('rejects the daemon-owned Managed Gateway Runtime source', async () => {
+      const bridge = fakeBridge();
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { bridge },
+      );
+      const res = await request(app)
+        .post('/session')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .send({ sourceType: 'managed-gateway' });
+
+      expect(res.status).toBe(400);
+      expect(res.body.code).toBe('reserved_session_source');
+      expect(res.body.error).toContain('Managed Gateway');
+      expect(bridge.calls).toHaveLength(0);
+    });
+
     it('rejects the reserved standalone source before validating sourceId', async () => {
       const bridge = fakeBridge();
       const app = createServeApp(
@@ -15099,6 +15122,479 @@ describe('createServeApp', () => {
     });
   });
 
+  describe('experimental Managed Prompt routes', () => {
+    function fakeManagedPromptService() {
+      return {
+        admit: vi.fn<ManagedPromptService['admit']>(async () => ({
+          created: true,
+          state: 'admitted',
+          activationReady: true,
+        })),
+        getStatus: vi.fn<ManagedPromptService['getStatus']>(() => undefined),
+        getGatewayBinding: vi.fn<
+          NonNullable<ManagedPromptService['getGatewayBinding']>
+        >(() => undefined),
+        dispose: vi.fn(),
+      } satisfies ManagedPromptService;
+    }
+
+    it('is absent unless Managed Gateway dependencies are explicitly injected', async () => {
+      const app = createServeApp(baseOpts, undefined, {
+        bridge: fakeBridge(),
+      });
+      const res = await request(app)
+        .post('/managed/sessions')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-1')
+        .send({ prompt: [{ type: 'text', text: 'hi' }] });
+      expect(res.status).toBe(404);
+    });
+
+    it('does not mount the Gateway create route without its event broker', async () => {
+      const app = createServeApp(baseOpts, undefined, {
+        bridge: fakeBridge(),
+        managedPromptService: fakeManagedPromptService(),
+      });
+      const res = await request(app)
+        .post('/managed/sessions')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-1')
+        .send({ prompt: [{ type: 'text', text: 'hi' }] });
+      expect(res.status).toBe(404);
+    });
+
+    it('admits the first Prompt before a live Session and preserves retry identity', async () => {
+      const managedPromptService = fakeManagedPromptService();
+      managedPromptService.admit
+        .mockResolvedValueOnce({
+          created: true,
+          state: 'admitted',
+          activationReady: true,
+        })
+        .mockResolvedValueOnce({
+          created: false,
+          state: 'processing',
+          activationReady: true,
+        });
+      const managedGatewaySessionEvents = new ManagedGatewaySessionEvents();
+      const bridge = fakeBridge();
+      const app = createServeApp(baseOpts, undefined, {
+        bridge,
+        managedPromptService,
+        managedGatewaySessionEvents,
+        workspaceRegistry: createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'primary-id',
+            workspaceCwd: WS_BOUND,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]),
+      });
+      const create = () =>
+        request(app)
+          .post('/managed/sessions')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+          .set('Idempotency-Key', 'message-1')
+          .send({
+            prompt: [{ type: 'text', text: 'hi' }],
+          });
+
+      const first = await create();
+      const second = await create();
+      const otherClient = await request(app)
+        .post('/managed/sessions')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-2')
+        .set('Idempotency-Key', 'message-1')
+        .send({ prompt: [{ type: 'text', text: 'hi' }] });
+
+      expect(first.status).toBe(202);
+      expect(first.body).toMatchObject({
+        managed: true,
+        promptId: 'message-1',
+        created: true,
+        phase: 'admitted',
+        eventStreamAvailable: true,
+      });
+      expect(first.body.sessionId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(second.status).toBe(202);
+      expect(second.body).toMatchObject({
+        sessionId: first.body.sessionId,
+        created: false,
+        eventStreamAvailable: true,
+      });
+      expect(otherClient.status).toBe(202);
+      expect(otherClient.body.sessionId).not.toBe(first.body.sessionId);
+      expect(managedPromptService.admit).toHaveBeenCalledTimes(3);
+      expect(managedPromptService.admit).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          mode: 'gateway',
+          sessionId: first.body.sessionId,
+          messageId: 'message-1',
+          managedClientId: 'managed-client-1',
+          prompt: [{ type: 'text', text: 'hi' }],
+        }),
+      );
+      expect(bridge.calls).toHaveLength(0);
+    });
+
+    it('admits an authorized follow-up from its durable binding only', async () => {
+      const sessionId = '11111111-1111-4111-8111-111111111111';
+      const managedPromptService = fakeManagedPromptService();
+      managedPromptService.getGatewayBinding.mockReturnValue({
+        tenantId: 'primary-id',
+        workspaceId: 'primary-id',
+        workspaceCwd: WS_BOUND,
+        sessionId,
+        managedClientId: 'managed-client-1',
+      });
+      const bridge = fakeBridge();
+      const events = new ManagedGatewaySessionEvents();
+      const app = createServeApp(baseOpts, undefined, {
+        bridge,
+        managedPromptService,
+        managedGatewaySessionEvents: events,
+        workspaceRegistry: createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'primary-id',
+            workspaceCwd: WS_BOUND,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]),
+      });
+
+      const denied = await request(app)
+        .post(`/managed/sessions/${sessionId}/prompts`)
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'wrong-client')
+        .set('Idempotency-Key', 'message-2')
+        .send({ prompt: [{ type: 'text', text: 'follow up' }] });
+      expect(denied.status).toBe(404);
+      expect(managedPromptService.admit).not.toHaveBeenCalled();
+
+      const admitted = await request(app)
+        .post(`/managed/sessions/${sessionId}/prompts`)
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-2')
+        .send({ prompt: [{ type: 'text', text: 'follow up' }] });
+
+      expect(admitted.status).toBe(202);
+      expect(admitted.body).toMatchObject({
+        sessionId,
+        promptId: 'message-2',
+        phase: 'admitted',
+        eventStreamAvailable: true,
+      });
+      expect(managedPromptService.admit).toHaveBeenCalledWith({
+        mode: 'gateway',
+        turnKind: 'continuation',
+        tenantId: 'primary-id',
+        workspaceId: 'primary-id',
+        workspaceCwd: WS_BOUND,
+        sessionId,
+        messageId: 'message-2',
+        managedClientId: 'managed-client-1',
+        prompt: [{ type: 'text', text: 'follow up' }],
+      });
+    });
+
+    it('does not replace the current turn preview when the initial turn is retried', async () => {
+      const managedPromptService = fakeManagedPromptService();
+      const bridge = fakeBridge();
+      const events = new ManagedGatewaySessionEvents();
+      const app = createServeApp(baseOpts, undefined, {
+        bridge,
+        managedPromptService,
+        managedGatewaySessionEvents: events,
+        workspaceRegistry: createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'primary-id',
+            workspaceCwd: WS_BOUND,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]),
+      });
+
+      const initial = await request(app)
+        .post('/managed/sessions')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-1')
+        .send({ prompt: [{ type: 'text', text: 'hi' }] });
+      const initialRequest = managedPromptService.admit.mock.calls[0]![0];
+      if (initialRequest.mode !== 'gateway') {
+        throw new Error('expected a Gateway admission');
+      }
+      events.complete(initialRequest);
+      managedPromptService.getGatewayBinding.mockReturnValue({
+        tenantId: 'primary-id',
+        workspaceId: 'primary-id',
+        workspaceCwd: WS_BOUND,
+        sessionId: initial.body.sessionId,
+        managedClientId: 'managed-client-1',
+      });
+
+      const followUp = await request(app)
+        .post(`/managed/sessions/${initial.body.sessionId}/prompts`)
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-2')
+        .send({ prompt: [{ type: 'text', text: 'follow up' }] });
+      expect(followUp.status).toBe(202);
+      expect(
+        events.authorize(initial.body.sessionId, 'managed-client-1'),
+      ).toMatchObject({
+        promptId: 'message-2',
+        phase: 'admitted',
+      });
+
+      managedPromptService.admit.mockResolvedValueOnce({
+        created: false,
+        state: 'finished',
+        activationReady: true,
+      });
+      managedPromptService.getStatus.mockReturnValueOnce({
+        messageId: 'message-1',
+        state: 'finished',
+        activationReady: true,
+        admittedAt: 1,
+        outcome: 'completed',
+        finishedAt: 2,
+      });
+      const retry = await request(app)
+        .post('/managed/sessions')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-1')
+        .send({ prompt: [{ type: 'text', text: 'hi' }] });
+
+      expect(retry.status).toBe(202);
+      expect(retry.body).toMatchObject({
+        promptId: 'message-1',
+        created: false,
+        state: 'finished',
+        phase: 'completed',
+        eventStreamAvailable: false,
+      });
+      expect(retry.body).not.toHaveProperty('eventPath');
+      expect(
+        events.authorize(initial.body.sessionId, 'managed-client-1'),
+      ).toMatchObject({
+        promptId: 'message-2',
+        phase: 'admitted',
+      });
+    });
+
+    it('maps an active Managed Gateway turn to a retryable conflict', async () => {
+      const sessionId = '11111111-1111-4111-8111-111111111111';
+      const managedPromptService = fakeManagedPromptService();
+      managedPromptService.getGatewayBinding.mockReturnValue({
+        tenantId: 'primary-id',
+        workspaceId: 'primary-id',
+        workspaceCwd: WS_BOUND,
+        sessionId,
+        managedClientId: 'managed-client-1',
+      });
+      managedPromptService.admit.mockRejectedValue(
+        new ManagedPromptServiceError(
+          'managed_gateway_turn_active',
+          'turn active',
+          true,
+        ),
+      );
+      const bridge = fakeBridge();
+      const app = createServeApp(baseOpts, undefined, {
+        bridge,
+        managedPromptService,
+        managedGatewaySessionEvents: new ManagedGatewaySessionEvents(),
+        workspaceRegistry: createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'primary-id',
+            workspaceCwd: WS_BOUND,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]),
+      });
+
+      const response = await request(app)
+        .post(`/managed/sessions/${sessionId}/prompts`)
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-2')
+        .send({ prompt: [{ type: 'text', text: 'follow up' }] });
+
+      expect(response.status).toBe(409);
+      expect(response.headers['retry-after']).toBe('1');
+      expect(response.body).toMatchObject({
+        code: 'managed_gateway_turn_active',
+        retryable: true,
+      });
+    });
+
+    it('does not recreate an evicted finished preview as an admitted stream', async () => {
+      const managedPromptService = fakeManagedPromptService();
+      managedPromptService.admit.mockResolvedValueOnce({
+        created: false,
+        state: 'finished',
+        activationReady: true,
+      });
+      managedPromptService.getStatus.mockReturnValueOnce({
+        messageId: 'message-1',
+        state: 'finished',
+        activationReady: true,
+        admittedAt: 1,
+        outcome: 'completed',
+        finishedAt: 2,
+      });
+      const bridge = fakeBridge();
+      const app = createServeApp(baseOpts, undefined, {
+        bridge,
+        managedPromptService,
+        managedGatewaySessionEvents: new ManagedGatewaySessionEvents(),
+        workspaceRegistry: createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'primary-id',
+            workspaceCwd: WS_BOUND,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]),
+      });
+      const res = await request(app)
+        .post('/managed/sessions')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-1')
+        .send({ prompt: [{ type: 'text', text: 'hi' }] });
+
+      expect(res.status).toBe(202);
+      expect(res.body).toMatchObject({
+        created: false,
+        state: 'finished',
+        phase: 'completed',
+        eventStreamAvailable: false,
+      });
+      expect(res.body).not.toHaveProperty('eventPath');
+      expect(res.body).not.toHaveProperty('statusPath');
+    });
+
+    it('authorizes Gateway status and streams the combined event journal', async () => {
+      const managedPromptService = fakeManagedPromptService();
+      const managedGatewaySessionEvents = new ManagedGatewaySessionEvents();
+      const bridge = fakeBridge();
+      const app = createServeApp(baseOpts, undefined, {
+        bridge,
+        managedPromptService,
+        managedGatewaySessionEvents,
+        workspaceRegistry: createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'primary-id',
+            workspaceCwd: WS_BOUND,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]),
+      });
+      const created = await request(app)
+        .post('/managed/sessions')
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1')
+        .set('Idempotency-Key', 'message-1')
+        .send({ prompt: [{ type: 'text', text: 'hi' }] });
+      const admitted = managedPromptService.admit.mock.calls[0]![0];
+      if (admitted.mode !== 'gateway') {
+        throw new Error('expected a Gateway admission');
+      }
+      managedGatewaySessionEvents.markRuntimeStarting(admitted);
+      managedGatewaySessionEvents.markAgentStarted(admitted, 0, 'definition');
+      managedGatewaySessionEvents.appendAssistantDelta(admitted, 'answer');
+      managedGatewaySessionEvents.complete(admitted);
+
+      const denied = await request(app)
+        .get(`/managed/sessions/${created.body.sessionId}`)
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'wrong-client');
+      expect(denied.status).toBe(404);
+
+      const status = await request(app)
+        .get(`/managed/sessions/${created.body.sessionId}`)
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1');
+      expect(status.status).toBe(200);
+      expect(status.headers['cache-control']).toBe('no-store');
+      expect(status.body).toMatchObject({ phase: 'completed' });
+
+      const stream = await request(app)
+        .get(`/managed/sessions/${created.body.sessionId}/events`)
+        .set('Host', `127.0.0.1:${baseOpts.port}`)
+        .set('X-Qwen-Managed-Client-Id', 'managed-client-1');
+      expect(stream.status).toBe(200);
+      expect(stream.headers['content-type']).toContain('text/event-stream');
+      expect(stream.text).toContain('event: accepted');
+      expect(stream.text).toContain('event: assistant_delta');
+      expect(stream.text).toContain('event: completed');
+      expect(stream.text).toContain('"text":"answer"');
+    });
+
+    it.each([
+      [
+        'missing managed client id',
+        undefined,
+        'message-1',
+        { prompt: [{ type: 'text', text: 'hi' }] },
+      ],
+      [
+        'invalid managed client id',
+        'bad client',
+        'message-1',
+        { prompt: [{ type: 'text', text: 'hi' }] },
+      ],
+      [
+        'unknown body field',
+        'managed-client-1',
+        'message-1',
+        { prompt: [{ type: 'text', text: 'hi' }], clientId: 'spoofed' },
+      ],
+    ])(
+      'rejects Gateway %s before durable admission',
+      async (_label, clientId, key, body) => {
+        const managedPromptService = fakeManagedPromptService();
+        const app = createServeApp(baseOpts, undefined, {
+          bridge: fakeBridge(),
+          managedPromptService,
+          managedGatewaySessionEvents: new ManagedGatewaySessionEvents(),
+        });
+        let pending = request(app)
+          .post('/managed/sessions')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .set('Idempotency-Key', key);
+        if (clientId) {
+          pending = pending.set('X-Qwen-Managed-Client-Id', clientId);
+        }
+        const res = await pending.send(body);
+        expect(res.status).toBe(400);
+        expect(managedPromptService.admit).not.toHaveBeenCalled();
+      },
+    );
+  });
+
   describe('POST /session/:id/prompt', () => {
     it('202 with promptId on success; route :id wins over body sessionId', async () => {
       const bridge = fakeBridge({
@@ -15749,7 +16245,7 @@ describe('createServeApp', () => {
       }
     }
 
-    it('returns the list returned by the bridge', async () => {
+    it('returns ordinary bridge Sessions without Managed Runtimes', async () => {
       // #3803 §02 (commit 0c6e963cd): the route now rejects
       // cross-workspace queries with 400 workspace_mismatch (so
       // orchestrators don't mistake "no sessions here" for
@@ -15770,6 +16266,15 @@ describe('createServeApp', () => {
             createdAt: '2026-05-17T12:01:00.000Z',
             clientCount: 0,
             hasActivePrompt: true,
+          },
+          {
+            sessionId: 'managed-runtime',
+            workspaceCwd: WS_BOUND,
+            createdAt: '2026-05-17T12:02:00.000Z',
+            sourceType: 'managed-gateway',
+            sourceId: 'managed-session',
+            clientCount: 1,
+            hasActivePrompt: false,
           },
         ],
       });
@@ -20480,7 +20985,7 @@ describe('createServeApp', () => {
 
       expect(res.status).toBe(200);
       expect(res.body).toEqual(summary);
-      expect(bridge.summaryCalls).toEqual(['s-1']);
+      expect(bridge.summaryCalls).toEqual(['s-1', 's-1']);
     });
 
     it('200 omits displayName when the live session has none', async () => {
@@ -20586,7 +21091,254 @@ describe('createServeApp', () => {
 
       expect(res.status).toBe(404);
       expect(res.body.sessionId).toBe('ghost');
-      expect(bridge.summaryCalls).toEqual(['ghost']);
+      expect(bridge.summaryCalls).toEqual(['ghost', 'ghost']);
+    });
+
+    it('hides a Managed Gateway Runtime from generic Session routes', async () => {
+      const sessionId = '550e8400-e29b-41d4-a716-446655440099';
+      const summary: BridgeSessionSummary = {
+        sessionId,
+        workspaceCwd: WS_BOUND,
+        createdAt: '2026-09-02T00:00:00.000Z',
+        sourceType: 'managed-gateway',
+        sourceId: sessionId,
+        clientCount: 1,
+        hasActivePrompt: false,
+      };
+      const bridge = fakeBridge({ summaryImpl: () => summary });
+      const workspaceRegistry = createWorkspaceRegistry([
+        makeWorkspaceRuntimeForTest({
+          workspaceId: 'ws-primary',
+          workspaceCwd: WS_BOUND,
+          primary: true,
+          trusted: true,
+          bridge,
+        }),
+      ]);
+      const app = createServeApp(
+        { ...baseOpts, workspace: WS_BOUND },
+        undefined,
+        { workspaceRegistry },
+      );
+
+      const [
+        status,
+        close,
+        changeDirectory,
+        transcript,
+        unqualifiedTranscript,
+        unqualifiedExport,
+        qualifiedExport,
+        metadata,
+        organization,
+        load,
+        resume,
+        batchDelete,
+      ] = await Promise.all([
+        request(app)
+          .get(`/session/${sessionId}/status`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`),
+        request(app)
+          .delete(`/session/${sessionId}`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`),
+        request(app)
+          .post(`/session/${sessionId}/cd`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ path: WS_BOUND }),
+        request(app)
+          .get(`/workspaces/ws-primary/session/${sessionId}/transcript`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`),
+        request(app)
+          .get(`/session/${sessionId}/transcript`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`),
+        request(app)
+          .get(`/session/${sessionId}/export`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`),
+        request(app)
+          .get(`/workspaces/ws-primary/session/${sessionId}/export`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`),
+        request(app)
+          .patch(`/workspaces/ws-primary/session/${sessionId}/metadata`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ displayName: 'hidden' }),
+        request(app)
+          .patch(`/session/${sessionId}/organization`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ isPinned: true }),
+        request(app)
+          .post(`/session/${sessionId}/load`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND }),
+        request(app)
+          .post(`/session/${sessionId}/resume`)
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ cwd: WS_BOUND }),
+        request(app)
+          .post('/sessions/delete')
+          .set('Host', `127.0.0.1:${baseOpts.port}`)
+          .send({ sessionIds: [sessionId] }),
+      ]);
+
+      expect({
+        status: status.status,
+        close: close.status,
+        changeDirectory: changeDirectory.status,
+        transcript: transcript.status,
+        unqualifiedTranscript: unqualifiedTranscript.status,
+        unqualifiedExport: unqualifiedExport.status,
+        qualifiedExport: qualifiedExport.status,
+        metadata: metadata.status,
+        organization: organization.status,
+        load: load.status,
+        resume: resume.status,
+        batchDelete: batchDelete.status,
+      }).toEqual({
+        status: 404,
+        close: 404,
+        changeDirectory: 404,
+        transcript: 404,
+        unqualifiedTranscript: 404,
+        unqualifiedExport: 404,
+        qualifiedExport: 404,
+        metadata: 404,
+        organization: 404,
+        load: 404,
+        resume: 404,
+        batchDelete: 404,
+      });
+
+      for (const response of [
+        status,
+        close,
+        changeDirectory,
+        transcript,
+        unqualifiedTranscript,
+        unqualifiedExport,
+        qualifiedExport,
+        metadata,
+        organization,
+        load,
+        resume,
+        batchDelete,
+      ]) {
+        expect(response.status).toBe(404);
+        expect(response.body).toEqual({
+          error: `No session with id "${sessionId}"`,
+          code: 'session_not_found',
+          sessionId,
+        });
+      }
+      expect(bridge.closeCalls).toHaveLength(0);
+      expect(bridge.changeSessionCwdCalls).toHaveLength(0);
+    });
+
+    it('keeps a persisted Managed Gateway Runtime hidden after restart', async () => {
+      const sessionId = '550e8400-e29b-41d4-a716-446655440098';
+      const runtimeDir = await fsp.mkdtemp(
+        path.join(os.tmpdir(), 'managed-runtime-hidden-'),
+      );
+      try {
+        const chatsDir = path.join(
+          new Storage(WS_BOUND, runtimeDir).getProjectDir(),
+          'chats',
+        );
+        await fsp.mkdir(chatsDir, { recursive: true });
+        const timestamp = '2026-09-02T00:00:00.000Z';
+        await fsp.writeFile(
+          path.join(chatsDir, `${sessionId}.jsonl`),
+          `${[
+            {
+              uuid: `${sessionId}-user`,
+              parentUuid: null,
+              sessionId,
+              timestamp,
+              type: 'user',
+              message: { role: 'user', parts: [{ text: 'hidden' }] },
+              cwd: WS_BOUND,
+            },
+            {
+              uuid: `${sessionId}-source`,
+              parentUuid: `${sessionId}-user`,
+              sessionId,
+              timestamp,
+              type: 'system',
+              subtype: 'session_source',
+              systemPayload: {
+                sourceType: 'managed-gateway',
+                sourceId: sessionId,
+              },
+              cwd: WS_BOUND,
+            },
+          ]
+            .map((record) => JSON.stringify(record))
+            .join('\n')}\n`,
+          'utf8',
+        );
+        const bridge = fakeBridge();
+        const workspaceRegistry = createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'ws-primary',
+            workspaceCwd: WS_BOUND,
+            sessionRuntimeBaseDir: runtimeDir,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]);
+        const app = createServeApp(
+          { ...baseOpts, workspace: WS_BOUND },
+          undefined,
+          { workspaceRegistry },
+        );
+
+        const responses = await Promise.all([
+          request(app)
+            .get(`/workspaces/ws-primary/session/${sessionId}/transcript`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`),
+          request(app)
+            .get(`/session/${sessionId}/transcript`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`),
+          request(app)
+            .get(`/workspaces/ws-primary/session/${sessionId}/export`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`),
+          request(app)
+            .get(`/session/${sessionId}/export`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`),
+          request(app)
+            .patch(`/workspaces/ws-primary/session/${sessionId}/metadata`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`)
+            .send({ displayName: 'hidden' }),
+          request(app)
+            .patch(`/session/${sessionId}/organization`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`)
+            .send({ isPinned: true }),
+          request(app)
+            .post(`/session/${sessionId}/load`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`)
+            .send({ cwd: WS_BOUND }),
+          request(app)
+            .post(`/session/${sessionId}/resume`)
+            .set('Host', `127.0.0.1:${baseOpts.port}`)
+            .send({ cwd: WS_BOUND }),
+          request(app)
+            .post('/sessions/delete')
+            .set('Host', `127.0.0.1:${baseOpts.port}`)
+            .send({ sessionIds: [sessionId] }),
+        ]);
+
+        for (const response of responses) {
+          expect(response.status).toBe(404);
+          expect(response.body).toEqual({
+            error: `No session with id "${sessionId}"`,
+            code: 'session_not_found',
+            sessionId,
+          });
+        }
+        expect(bridge.loadCalls).toHaveLength(0);
+        expect(bridge.resumeCalls).toHaveLength(0);
+      } finally {
+        await fsp.rm(runtimeDir, { recursive: true, force: true });
+      }
     });
   });
 

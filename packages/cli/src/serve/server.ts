@@ -41,6 +41,7 @@ import {
   isTrustedLoopbackMode,
   MutableOriginAllowlist,
   parseAllowOriginPatterns,
+  requestWasAuthenticated,
 } from './auth.js';
 import { isLoopbackBind } from './loopback-binds.js';
 import {
@@ -332,6 +333,10 @@ import {
 } from './live/provider-credentials.js';
 import type { ChildHeapPolicySnapshot } from '@qwen-code/acp-bridge/childHeapPolicy';
 import { invalidateWorkspaceSessionListCache } from './server/session-list.js';
+import type { ManagedPromptService } from './managed-prompt-types.js';
+import type { ManagedGatewaySessionEvents } from './managed-gateway-session-events.js';
+import type { ManagedRuntimeProvider } from './managed-runtime-provider.js';
+import { registerManagedRuntimeWorkerRoutes } from './routes/managed-runtime-worker.js';
 
 export {
   createDefaultFsAuditEmit,
@@ -656,6 +661,12 @@ export interface ServeAppDeps {
   validateLiveProviderCredential?: (
     credential: LiveProviderCredential,
   ) => Promise<void>;
+  /** Experimental Managed Gateway admission. Omit to hide its routes. */
+  managedPromptService?: ManagedPromptService;
+  /** Process-local Managed Gateway event broker. Omit to hide its routes. */
+  managedGatewaySessionEvents?: ManagedGatewaySessionEvents;
+  /** Experimental authenticated Tool-only Runtime worker surface. */
+  managedRuntimeWorkerProvider?: ManagedRuntimeProvider;
 }
 
 /**
@@ -2693,6 +2704,22 @@ export function createServeApp(
   const virtualSubagentSessions = new VirtualSubagentSessions();
   const liveConversationWorkspaceForRoutes = deps.liveConversationWorkspace;
 
+  if (deps.managedRuntimeWorkerProvider) {
+    registerManagedRuntimeWorkerRoutes(app, {
+      provider: deps.managedRuntimeWorkerProvider,
+      authorize: (req, res, next) => {
+        if (
+          listenerIdentityOf(req).kind !== 'primary' ||
+          !requestWasAuthenticated(req)
+        ) {
+          res.status(401).json({ error: 'Unauthorized' });
+          return;
+        }
+        next();
+      },
+    });
+  }
+
   registerSessionRoutes(app, {
     boundWorkspace: primaryBoundWorkspace,
     bridge: primaryBridge,
@@ -2708,6 +2735,8 @@ export function createServeApp(
     languageCodes,
     virtualSubagentSessions,
     conversationRuntimeActivity,
+    managedPromptService: deps.managedPromptService,
+    managedGatewaySessionEvents: deps.managedGatewaySessionEvents,
     ...(standaloneSessionService ? { standaloneSessionService } : {}),
     isLiveSessionActive: (sessionId: string) =>
       liveCoordinator.isActiveSession(sessionId),
