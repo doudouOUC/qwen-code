@@ -5406,6 +5406,226 @@ export function registerSessionRoutes(
   );
 
   if (deps.managedPromptService && deps.managedGatewaySessionEvents) {
+    const managedService = deps.managedPromptService;
+    const managedEvents = deps.managedGatewaySessionEvents;
+    const managedSummary = (sessionId: string, clientId: string) => {
+      const status = managedEvents.authorize(sessionId, clientId);
+      if (!status) return undefined;
+      const binding = managedService.getGatewayBinding?.(sessionId);
+      const runtime = binding
+        ? workspaceRegistry.getByWorkspaceId(binding.workspaceId)
+        : undefined;
+      const available =
+        runtime?.trusted === true &&
+        runtime.workspaceCwd === binding?.workspaceCwd &&
+        !isInternalWorkspaceRuntime(runtime);
+      const finished = ['completed', 'failed', 'cancelled'].includes(
+        status.phase,
+      );
+      return {
+        ...status,
+        capabilities: {
+          canSend:
+            available &&
+            finished &&
+            (managedService.canContinue?.(sessionId) ??
+              status.phase === 'completed'),
+          canCancel:
+            available &&
+            !finished &&
+            status.phase !== 'cancelling' &&
+            managedService.cancel !== undefined,
+        },
+      };
+    };
+    const managedReadIdentity = (req: Request, res: Response) => {
+      const clientId = parseManagedGatewayClientId(req, res);
+      if (!clientId) return undefined;
+      const rawId = req.params['id'];
+      const sessionId = rawId ? normalizeSessionIdForLookup(rawId) : undefined;
+      if (!sessionId || !managedEvents.authorize(sessionId, clientId)) {
+        res.status(404).json({
+          error: 'Managed Gateway Session not found',
+          code: 'managed_gateway_session_not_found',
+        });
+        return undefined;
+      }
+      return { sessionId, clientId };
+    };
+    const managedLimit = (req: Request, res: Response) => {
+      const raw = req.query['limit'];
+      if (raw === undefined) return 50;
+      if (
+        typeof raw !== 'string' ||
+        !/^\d+$/.test(raw) ||
+        Number(raw) < 1 ||
+        Number(raw) > 100
+      ) {
+        res.status(400).json({
+          error: 'limit must be an integer between 1 and 100',
+          code: 'managed_gateway_page_invalid',
+        });
+        return undefined;
+      }
+      return Number(raw);
+    };
+    app.get('/managed/sessions', async (req, res) => {
+      const clientId = parseManagedGatewayClientId(req, res);
+      if (!clientId) return;
+      const limit = managedLimit(req, res);
+      if (!limit) return;
+      const cwd = req.query['cwd'];
+      if (
+        cwd !== undefined &&
+        (typeof cwd !== 'string' || !path.isAbsolute(cwd))
+      ) {
+        res.status(400).json({
+          error: 'cwd must be an absolute workspace path',
+          code: 'managed_gateway_page_invalid',
+        });
+        return;
+      }
+      const workspaceCwd =
+        typeof cwd === 'string' ? path.resolve(cwd) : undefined;
+      let cursor: { at: number; id: string } | undefined;
+      if (req.query['cursor'] !== undefined) {
+        try {
+          const raw = req.query['cursor'];
+          if (typeof raw !== 'string' || raw.length > 2048) throw new Error();
+          const parsed = JSON.parse(
+            Buffer.from(raw, 'base64url').toString('utf8'),
+          );
+          if (
+            !Number.isSafeInteger(parsed.at) ||
+            typeof parsed.id !== 'string' ||
+            parsed.clientId !== clientId ||
+            parsed.cwd !== (workspaceCwd ?? null)
+          )
+            throw new Error();
+          cursor = parsed;
+        } catch {
+          res.status(400).json({
+            error: 'Invalid Managed catalog cursor',
+            code: 'managed_gateway_page_invalid',
+          });
+          return;
+        }
+      }
+      await managedEvents.flush();
+      const rows = managedEvents
+        .list(clientId)
+        .filter(
+          (status) =>
+            workspaceCwd === undefined || status.workspaceCwd === workspaceCwd,
+        )
+        .sort(
+          (a, b) =>
+            b.createdAt - a.createdAt || a.sessionId.localeCompare(b.sessionId),
+        )
+        .filter(
+          (status) =>
+            !cursor ||
+            status.createdAt < cursor.at ||
+            (status.createdAt === cursor.at &&
+              status.sessionId.localeCompare(cursor.id) > 0),
+        );
+      const page = rows.slice(0, limit);
+      const last = page.at(-1);
+      res
+        .status(200)
+        .set('Cache-Control', 'no-store')
+        .json({
+          sessions: page.map((status) =>
+            managedSummary(status.sessionId, clientId),
+          ),
+          ...(rows.length > limit && last
+            ? {
+                nextCursor: Buffer.from(
+                  JSON.stringify({
+                    at: last.createdAt,
+                    id: last.sessionId,
+                    clientId,
+                    cwd: workspaceCwd ?? null,
+                  }),
+                ).toString('base64url'),
+              }
+            : {}),
+        });
+    });
+    app.get('/managed/sessions/:id/transcript', async (req, res) => {
+      const identity = managedReadIdentity(req, res);
+      if (!identity) return;
+      const limit = managedLimit(req, res);
+      if (!limit) return;
+      const rawBefore = req.query['before'];
+      if (
+        rawBefore !== undefined &&
+        (typeof rawBefore !== 'string' ||
+          !/^\d+$/.test(rawBefore) ||
+          !Number.isSafeInteger(Number(rawBefore)) ||
+          Number(rawBefore) < 1)
+      ) {
+        res.status(400).json({
+          error: 'Invalid Managed transcript cursor',
+          code: 'managed_gateway_page_invalid',
+        });
+        return;
+      }
+      const page = await managedEvents.transcript(
+        identity.sessionId,
+        identity.clientId,
+        rawBefore === undefined ? undefined : Number(rawBefore),
+        limit,
+      );
+      res.status(200).set('Cache-Control', 'no-store').json(page);
+    });
+    app.post('/managed/sessions/:id/cancel', mutate(), async (req, res) => {
+      const identity = managedReadIdentity(req, res);
+      if (!identity) return;
+      const body = safeBody(req);
+      const promptId = body['promptId'];
+      if (
+        Object.keys(body).some((field) => field !== 'promptId') ||
+        typeof promptId !== 'string' ||
+        !MANAGED_PROMPT_IDEMPOTENCY_KEY_RE.test(promptId) ||
+        promptId.length > MANAGED_PROMPT_IDEMPOTENCY_KEY_MAX_LENGTH
+      ) {
+        res.status(400).json({
+          error: 'An exact promptId is required',
+          code: 'managed_gateway_invalid',
+        });
+        return;
+      }
+      const binding = managedService.getGatewayBinding?.(identity.sessionId);
+      const runtime = binding
+        ? workspaceRegistry.getByWorkspaceId(binding.workspaceId)
+        : undefined;
+      if (
+        !runtime ||
+        !runtime.trusted ||
+        runtime.workspaceCwd !== binding?.workspaceCwd ||
+        isInternalWorkspaceRuntime(runtime)
+      ) {
+        res.status(409).json({
+          error: 'Managed workspace is unavailable',
+          code: 'managed_gateway_runtime_unavailable',
+        });
+        return;
+      }
+      if (!managedService.cancel) {
+        res.status(501).json({
+          error: 'Managed cancellation is unavailable',
+          code: 'managed_gateway_cancel_unavailable',
+        });
+        return;
+      }
+      const accepted = await managedService.cancel(
+        identity.sessionId,
+        promptId,
+      );
+      await managedEvents.flush();
+      res.status(200).json({ accepted });
+    });
     app.post('/managed/sessions', mutate(), async (req, res) => {
       const body = safeBody(req);
       const unknownField = Object.keys(body).find(
@@ -5437,6 +5657,10 @@ export function registerSessionRoutes(
       const resolvedRuntime = resolveRuntimeForSessionCreation(body, res);
       if (!resolvedRuntime) return;
       const { runtime } = resolvedRuntime;
+      if (resolvedRuntime.workspaceCwd !== runtime.workspaceCwd) {
+        sendWorkspaceMismatch(res, resolvedRuntime.workspaceCwd);
+        return;
+      }
       setDaemonTelemetryWorkspace(res, runtime.workspaceCwd);
       if (isInternalWorkspaceRuntime(runtime)) {
         res.status(400).json({
@@ -5521,6 +5745,7 @@ export function registerSessionRoutes(
           sessionId,
           idempotencyKey,
         );
+        await managedEvents.flush();
         res.status(202).json({
           managed: true,
           sessionId,
@@ -5536,9 +5761,7 @@ export function registerSessionRoutes(
           phase:
             status?.promptId === idempotencyKey
               ? status.phase
-              : durableStatus?.outcome === 'completed'
-                ? 'completed'
-                : 'failed',
+              : (durableStatus?.outcome ?? 'failed'),
         });
       } catch (error) {
         if (error instanceof ManagedPromptServiceError) {
@@ -5673,6 +5896,7 @@ export function registerSessionRoutes(
           boundSessionId,
           idempotencyKey,
         );
+        await managedEvents.flush();
         res.status(202).json({
           managed: true,
           sessionId: boundSessionId,
@@ -5688,9 +5912,7 @@ export function registerSessionRoutes(
           phase:
             status?.promptId === idempotencyKey
               ? status.phase
-              : durableStatus?.outcome === 'completed'
-                ? 'completed'
-                : 'failed',
+              : (durableStatus?.outcome ?? 'failed'),
         });
       } catch (error) {
         if (error instanceof ManagedPromptServiceError) {
@@ -5759,24 +5981,14 @@ export function registerSessionRoutes(
       }
     });
 
-    app.get('/managed/sessions/:id', (req, res) => {
-      const managedClientId = parseManagedGatewayClientId(req, res);
-      if (!managedClientId) return;
-      const sessionId = req.params['id'];
-      const status = sessionId
-        ? deps.managedGatewaySessionEvents!.authorize(
-            sessionId,
-            managedClientId,
-          )
-        : undefined;
-      if (!status) {
-        res.status(404).json({
-          error: 'Managed Gateway Session not found',
-          code: 'managed_gateway_session_not_found',
-        });
-        return;
-      }
-      res.status(200).set('Cache-Control', 'no-store').json(status);
+    app.get('/managed/sessions/:id', async (req, res) => {
+      const identity = managedReadIdentity(req, res);
+      if (!identity) return;
+      await managedEvents.flush();
+      res
+        .status(200)
+        .set('Cache-Control', 'no-store')
+        .json(managedSummary(identity.sessionId, identity.clientId));
     });
   }
 

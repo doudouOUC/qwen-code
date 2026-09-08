@@ -35,7 +35,8 @@ export interface ManagedPromptStatus {
   readonly state: 'admitted' | 'processing' | 'finished';
   readonly activationReady: boolean;
   readonly admittedAt: number;
-  readonly outcome?: 'completed' | 'failed';
+  readonly outcome?: 'completed' | 'failed' | 'cancelled';
+  readonly cancelRequested?: boolean;
   readonly finishedAt?: number;
 }
 
@@ -58,6 +59,8 @@ export interface ManagedPromptService {
   getGatewayBinding?(
     sessionId: string,
   ): ManagedGatewaySessionBinding | undefined;
+  canContinue?(sessionId: string): boolean;
+  cancel?(sessionId: string, messageId: string): Promise<boolean>;
   dispose(): void;
 }
 

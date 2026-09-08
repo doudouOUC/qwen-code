@@ -798,3 +798,17 @@ export type {
   DaemonSessionArtifactStorage,
   SessionMetadataResult,
 } from './types.js';
+
+export type {
+  DaemonManagedSessionPhase,
+  DaemonManagedRuntimeState,
+  DaemonManagedSessionSummary,
+  DaemonManagedSessionList,
+  DaemonManagedSessionEventType,
+  DaemonManagedSessionEvent,
+  DaemonManagedSessionTranscript,
+  DaemonManagedPromptRequest,
+  DaemonManagedSessionCreateRequest,
+  DaemonManagedPromptAdmission,
+  DaemonManagedRequestOptions,
+} from './managed-sessions.js';

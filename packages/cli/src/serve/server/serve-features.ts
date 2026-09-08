@@ -39,6 +39,8 @@ export function advertisedMaxSessions(
 }
 
 interface CreateServeFeaturesDeps {
+  managedSessionsAvailable?: boolean;
+  managedSessionCancelAvailable?: boolean;
   opts: ServeOptions;
   boundWorkspace: string;
   persistSettingAvailable: boolean;
@@ -123,6 +125,8 @@ export function createServeFeatures(
       const currentAcpHttpEnabled =
         acpHttpEnabled ?? resolveAcpHttpEnabled(env as NodeJS.ProcessEnv);
       return getAdvertisedServeFeatures(undefined, {
+        managedSessionsAvailable: deps.managedSessionsAvailable,
+        managedSessionCancelAvailable: deps.managedSessionCancelAvailable,
         requireAuth: opts.requireAuth === true,
         mcpPoolActive: opts.mcpPoolActive !== false,
         allowOriginActive:

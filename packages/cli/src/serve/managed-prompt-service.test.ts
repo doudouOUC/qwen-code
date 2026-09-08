@@ -89,6 +89,124 @@ describe('createManagedPromptService', () => {
     });
   });
 
+  it('cancels a queued turn without capacity and never dispatches it after restart', async () => {
+    const dispatch = vi.fn(async () => undefined);
+    const service = await createManagedPromptService({
+      stateDir: root,
+      workerId: 'cancel-a',
+      hasMemoryHeadroom: () => false,
+      dispatch,
+    });
+    services.push(service);
+    const input = request('queued');
+    await service.admit(input);
+    expect(await service.cancel!(input.sessionId, input.messageId)).toBe(true);
+    expect(
+      service.getStatus(input.tenantId, input.sessionId, input.messageId),
+    ).toMatchObject({ state: 'finished', outcome: 'cancelled' });
+    const queued = await FileManagedActivationStore.open(
+      path.join(root, 'activations.jsonl'),
+    );
+    expect(queued.listPending()).toHaveLength(0);
+    service.dispose();
+    const reopened = await createManagedPromptService({
+      stateDir: root,
+      workerId: 'cancel-b',
+      hasMemoryHeadroom: () => true,
+      dispatch,
+    });
+    services.push(reopened);
+    expect(await reopened.admit(input)).toMatchObject({
+      created: false,
+      state: 'finished',
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(reopened.canContinue!(input.sessionId)).toBe(false);
+  });
+
+  it('cancels the exact running turn while completed older turns remain unchanged', async () => {
+    let entered = false;
+    const service = await createManagedPromptService({
+      stateDir: root,
+      workerId: 'cancel-a',
+      hasMemoryHeadroom: () => true,
+      dispatch: async (input, signal) => {
+        if (input.turnKind === 'bootstrap') return;
+        entered = true;
+        await new Promise<void>((_resolve, reject) =>
+          signal.addEventListener('abort', () => reject(signal.reason), {
+            once: true,
+          }),
+        );
+      },
+    });
+    services.push(service);
+    const initial = request('message-a');
+    await service.admit(initial);
+    await waitUntil(() => service.canContinue!(initial.sessionId));
+    const followup = gatewayContinuation('next');
+    await service.admit(followup);
+    await waitUntil(() => entered);
+    expect(await service.cancel!(initial.sessionId, initial.messageId)).toBe(
+      false,
+    );
+    expect(
+      service.getStatus(
+        followup.tenantId,
+        followup.sessionId,
+        followup.messageId,
+      )?.state,
+    ).toBe('processing');
+    expect(await service.cancel!(followup.sessionId, followup.messageId)).toBe(
+      true,
+    );
+    await waitUntil(
+      () =>
+        service.getStatus(
+          followup.tenantId,
+          followup.sessionId,
+          followup.messageId,
+        )?.state === 'finished',
+    );
+    expect(
+      service.getStatus(
+        followup.tenantId,
+        followup.sessionId,
+        followup.messageId,
+      )?.outcome,
+    ).toBe('cancelled');
+    expect(service.canContinue!(initial.sessionId)).toBe(true);
+  });
+
+  it('preserves completion when dispatch has already committed despite a concurrent cancellation request', async () => {
+    const gate = deferred();
+    let entered = false;
+    const service = await createManagedPromptService({
+      stateDir: root,
+      workerId: 'cancel-a',
+      hasMemoryHeadroom: () => true,
+      dispatch: async () => {
+        entered = true;
+        await gate.promise;
+      },
+    });
+    services.push(service);
+    const input = request('race');
+    await service.admit(input);
+    await waitUntil(() => entered);
+    await service.cancel!(input.sessionId, input.messageId);
+    gate.resolve();
+    await waitUntil(
+      () =>
+        service.getStatus(input.tenantId, input.sessionId, input.messageId)
+          ?.state === 'finished',
+    );
+    expect(
+      service.getStatus(input.tenantId, input.sessionId, input.messageId)
+        ?.outcome,
+    ).toBe('completed');
+  });
+
   it('acknowledges durable admission without waiting for dispatch completion', async () => {
     const gate = deferred();
     const started: string[] = [];

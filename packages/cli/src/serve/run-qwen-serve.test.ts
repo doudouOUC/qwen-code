@@ -645,21 +645,26 @@ it('keeps the model in the Gateway and uses a delayed Runtime only for Tools', a
   const modelRunner: ManagedGatewayModelRunner = {
     start: vi.fn().mockResolvedValue(undefined),
     runTurn: vi.fn(async (request, runtime, sink, signal) => {
-      sink.onModelStarted({
+      await sink.onModelStarted({
         round: 0,
         agentDefinitionId: 'test-definition-v1',
       });
-      sink.onDelta('authoritative gateway start');
+      await sink.onDelta('authoritative gateway start');
       if (request.messageId.startsWith('gateway-no-tool')) {
         return 'authoritative no-Tool answer';
       }
-      sink.onToolRequested({
+      await sink.onToolRequested({
         toolCallId: `call-${request.messageId}`,
         toolName: 'read_file',
       });
       const manifest = await runtime.getManifest(signal);
       const tool = manifest.tools[0];
       if (!tool?.name) throw new Error('missing test Tool');
+      await sink.onToolStarted?.({
+        toolCallId: `call-${request.messageId}`,
+        toolName: tool.name,
+        input: { path: 'README.md' },
+      });
       const result = await runtime.execute(
         {
           executionId: `execution-${request.messageId}`,
@@ -671,12 +676,12 @@ it('keeps the model in the Gateway and uses a delayed Runtime only for Tools', a
         },
         signal,
       );
-      sink.onToolCompleted({
+      await sink.onToolCompleted({
         toolCallId: `call-${request.messageId}`,
         toolName: tool.name,
         failed: result.error !== undefined,
       });
-      sink.onDelta('authoritative gateway answer');
+      await sink.onDelta('authoritative gateway answer');
       return 'authoritative gateway answer';
     }),
     dispose: vi.fn().mockResolvedValue(undefined),
@@ -777,7 +782,7 @@ it('keeps the model in the Gateway and uses a delayed Runtime only for Tools', a
     await vi.waitFor(() => {
       expect(
         events.authorize(admitted.sessionId, 'gateway-test-client'),
-      ).toMatchObject({ phase: 'agent_running', runtimeReady: false });
+      ).toMatchObject({ phase: 'waiting_runtime', runtimeReady: false });
     });
     expect(bridge.getManagedRuntimeToolManifest).not.toHaveBeenCalled();
     releaseRuntime();
@@ -796,6 +801,9 @@ it('keeps the model in the Gateway and uses a delayed Runtime only for Tools', a
     )) {
       streamed.push(event.type);
     }
+    expect(streamed.indexOf('tool_started')).toBeGreaterThan(
+      streamed.indexOf('runtime_ready'),
+    );
     expect(streamed.indexOf('agent_started')).toBeLessThan(
       streamed.indexOf('runtime_ready'),
     );

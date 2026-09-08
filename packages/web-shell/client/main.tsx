@@ -81,10 +81,14 @@ function getInitialLanguage(): WebShellLanguage {
 }
 
 function getSessionIdFromUrl(): string | undefined {
+  if (new URLSearchParams(window.location.search).get('managed') === '1')
+    return undefined;
   return parseSessionId(window.location.pathname);
 }
 
 function getWorkspaceIdFromUrl(): string | undefined {
+  if (new URLSearchParams(window.location.search).get('managed') === '1')
+    return undefined;
   return (
     new URLSearchParams(window.location.search).get('workspace') || undefined
   );

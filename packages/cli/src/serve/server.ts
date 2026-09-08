@@ -975,6 +975,12 @@ export function createServeApp(
     createServeFeatures({
       opts,
       boundWorkspace,
+      managedSessionsAvailable:
+        deps.managedPromptService !== undefined &&
+        deps.managedGatewaySessionEvents !== undefined,
+      managedSessionCancelAvailable:
+        deps.managedPromptService?.cancel !== undefined &&
+        deps.managedGatewaySessionEvents !== undefined,
       persistSettingAvailable: deps.persistSetting !== undefined,
       sessionArtifactsPersistenceAvailable:
         deps.sessionArtifactsPersistenceAvailable !== false,

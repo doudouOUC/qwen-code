@@ -34,18 +34,24 @@ export interface ManagedGatewayAgentSink {
   readonly onModelStarted: (model: {
     round: number;
     agentDefinitionId: string;
-  }) => void;
-  readonly onThought: (text: string) => void;
-  readonly onDelta: (text: string) => void;
+  }) => void | Promise<void>;
+  readonly onThought: (text: string) => void | Promise<void>;
+  readonly onDelta: (text: string) => void | Promise<void>;
   readonly onToolRequested: (call: {
     toolCallId: string;
     toolName: string;
-  }) => void;
+  }) => void | Promise<void>;
+  readonly onToolStarted?: (call: {
+    toolCallId: string;
+    toolName: string;
+    input: unknown;
+  }) => void | Promise<void>;
   readonly onToolCompleted: (result: {
     toolCallId: string;
     toolName: string;
     failed: boolean;
-  }) => void;
+    output?: unknown;
+  }) => void | Promise<void>;
 }
 
 export interface ManagedGatewayToolRuntime {
@@ -442,7 +448,7 @@ export class ResidentManagedGatewayModelRunner
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       signal.throwIfAborted();
-      sink.onModelStarted({
+      await sink.onModelStarted({
         round,
         agentDefinitionId: agentDefinition.id,
       });
@@ -469,11 +475,11 @@ export class ResidentManagedGatewayModelRunner
       for await (const chunk of stream) {
         signal.throwIfAborted();
         const thought = thoughtText(getThoughtSummary(chunk));
-        if (thought) sink.onThought(thought);
+        if (thought) await sink.onThought(thought);
         const delta = getResponseText(chunk) ?? '';
         if (delta) {
           text += delta;
-          sink.onDelta(delta);
+          await sink.onDelta(delta);
         }
         const chunkCalls = getFunctionCalls(chunk) ?? [];
         const chunkCallParts =
@@ -534,7 +540,7 @@ export class ResidentManagedGatewayModelRunner
       let runtimeManifest: ValidatedManagedRuntimeToolManifest | undefined;
       for (const call of calls) {
         signal.throwIfAborted();
-        sink.onToolRequested({
+        await sink.onToolRequested({
           toolCallId: call.id,
           toolName: call.name,
         });
@@ -550,7 +556,7 @@ export class ResidentManagedGatewayModelRunner
               'Tool is unavailable.',
             ),
           );
-          sink.onToolCompleted({
+          await sink.onToolCompleted({
             toolCallId: call.id,
             toolName: call.name,
             failed: true,
@@ -561,6 +567,12 @@ export class ResidentManagedGatewayModelRunner
           await runtime.getManifest(signal),
         );
         assertRuntimeCompatibility(agentDefinition, runtimeManifest, call.name);
+        await sink.onToolStarted?.({
+          toolCallId: call.id,
+          toolName: call.name,
+          input: call.args,
+        });
+        signal.throwIfAborted();
         const result = await runtime.execute(
           {
             executionId: randomUUID(),
@@ -575,9 +587,11 @@ export class ResidentManagedGatewayModelRunner
         responseParts.push(
           ...validatedResponseParts(result, call.id, call.name),
         );
-        sink.onToolCompleted({
+        await sink.onToolCompleted({
           toolCallId: call.id,
           toolName: call.name,
+          output:
+            result.error ?? validatedResponseParts(result, call.id, call.name),
           failed:
             result.error !== undefined ||
             (result.executionStatus !== undefined &&

@@ -121,7 +121,8 @@ const rootDir = join(__dirname, '..');
 // measured combined bundle bounded here.
 // Bumped from 215KB to 216KB for the daemon JSON-RPC error-detail surfacing
 // (structured `code`/`data` forwarding in the error payload).
-const MAX_DAEMON_BROWSER_BUNDLE_BYTES = 216 * 1024;
+// Managed Session REST/SSE adds 2,150 bytes (220,220 -> 222,370 measured).
+const MAX_DAEMON_BROWSER_BUNDLE_BYTES = 218 * 1024;
 // The opt-in `daemon/transports` browser bundle legitimately ships the concrete
 // ACP transports (AcpHttpTransport/AcpWsTransport/AutoReconnect + negotiate), so
 // it's larger than the default barrel — but still budgeted so a future PR can't

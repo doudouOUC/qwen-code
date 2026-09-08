@@ -6422,7 +6422,9 @@ async function runQwenServeImpl(
           import('./managed-gateway-model-runtime.js'),
         ]);
         if (!managedGatewaySessionEvents) {
-          managedGatewaySessionEvents = new ManagedGatewaySessionEvents();
+          managedGatewaySessionEvents = await ManagedGatewaySessionEvents.open(
+            path.join(managedAgentsStateDir, 'presentation.jsonl'),
+          );
           ownsManagedGatewaySessionEvents = true;
         }
         if (!managedGatewayModelRunner) {
@@ -6545,20 +6547,46 @@ async function runQwenServeImpl(
                 request,
                 runtimeHandle,
                 {
-                  onModelStarted: ({ round, agentDefinitionId }) =>
-                    events.markAgentStarted(request, round, agentDefinitionId),
-                  onThought: (text) =>
-                    events.appendAssistantThought(request, text),
-                  onDelta: (text) => events.appendAssistantDelta(request, text),
-                  onToolRequested: ({ toolCallId, toolName }) =>
-                    events.markToolRequested(request, toolCallId, toolName),
-                  onToolCompleted: ({ toolCallId, toolName, failed }) =>
+                  onModelStarted: async ({ round, agentDefinitionId }) => {
+                    events.markAgentStarted(request, round, agentDefinitionId);
+                    await events.flush();
+                  },
+                  onThought: async (text) => {
+                    events.appendAssistantThought(request, text);
+                    await events.flush();
+                  },
+                  onDelta: async (text) => {
+                    events.appendAssistantDelta(request, text);
+                    await events.flush();
+                  },
+                  onToolRequested: async ({ toolCallId, toolName }) => {
+                    events.markToolRequested(request, toolCallId, toolName);
+                    await events.flush();
+                  },
+                  onToolStarted: async ({ toolCallId, toolName, input }) => {
+                    events.markToolStarted(
+                      request,
+                      toolCallId,
+                      toolName,
+                      input,
+                    );
+                    await events.flush();
+                  },
+                  onToolCompleted: async ({
+                    toolCallId,
+                    toolName,
+                    failed,
+                    output,
+                  }) => {
                     events.markToolCompleted(
                       request,
                       toolCallId,
                       toolName,
                       failed,
-                    ),
+                      output,
+                    );
+                    await events.flush();
+                  },
                 },
                 executionSignal,
               );
@@ -6566,10 +6594,25 @@ async function runQwenServeImpl(
               if (deadlineTimer) clearTimeout(deadlineTimer);
             }
           },
-          onCompleted: (request) => {
-            managedGatewaySessionEvents?.complete(request);
+          onRecovered: async (request, status) => {
+            managedGatewaySessionEvents?.recover(request, status);
+            await managedGatewaySessionEvents?.flush();
           },
-          onError: (request, error) => {
+          onCancelling: async (request) => {
+            managedGatewaySessionEvents?.cancelling(request);
+            await managedGatewaySessionEvents?.flush();
+          },
+          onCancelled: async (request) => {
+            if (request.turnKind === 'bootstrap')
+              discardManagedGatewayRuntime(request.sessionId);
+            managedGatewaySessionEvents?.cancelled(request);
+            await managedGatewaySessionEvents?.flush();
+          },
+          onCompleted: async (request) => {
+            managedGatewaySessionEvents?.complete(request);
+            await managedGatewaySessionEvents?.flush();
+          },
+          onError: async (request, error) => {
             if (request.turnKind === 'bootstrap') {
               discardManagedGatewayRuntime(request.sessionId);
             }
@@ -6577,6 +6620,7 @@ async function runQwenServeImpl(
               code: 'managed_gateway_failed',
               message: 'Managed Gateway turn failed.',
             });
+            await managedGatewaySessionEvents?.flush();
             daemonLog.warn('managed prompt failed', {
               workspaceId: request.workspaceId,
               sessionId: request.sessionId,

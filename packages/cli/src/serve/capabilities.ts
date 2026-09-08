@@ -30,6 +30,8 @@ export interface ServeCapabilityDescriptor {
 }
 
 export const SERVE_CAPABILITY_REGISTRY = {
+  managed_sessions: { since: 'v1' },
+  managed_session_cancel: { since: 'v1' },
   health: { since: 'v1' },
   daemon_status: { since: 'v1' },
   capabilities: { since: 'v1' },
@@ -474,6 +476,8 @@ export type ServeFeature = keyof typeof SERVE_CAPABILITY_REGISTRY;
  * advertised.
  */
 export interface AdvertiseFeatureToggles {
+  managedSessionsAvailable?: boolean;
+  managedSessionCancelAvailable?: boolean;
   requireAuth?: boolean;
   mcpPoolActive?: boolean;
   externalToolGuardActive?: boolean;
@@ -703,6 +707,13 @@ export const CONDITIONAL_SERVE_FEATURES: ReadonlyMap<
     'realtime_voice',
     (toggles) =>
       toggles.acpHttpEnabled === true && toggles.realtimeVoiceEnabled === true,
+  ],
+  ['managed_sessions', (toggles) => toggles.managedSessionsAvailable === true],
+  [
+    'managed_session_cancel',
+    (toggles) =>
+      toggles.managedSessionsAvailable === true &&
+      toggles.managedSessionCancelAvailable === true,
   ],
   ['web_terminal', (toggles) => toggles.acpHttpEnabled === true],
 ]);

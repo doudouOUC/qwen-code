@@ -50,7 +50,8 @@ export interface ManagedSessionMessageSnapshot {
   readonly activationReady: boolean;
   readonly state: 'admitted' | 'processing' | 'finished';
   readonly fence?: ManagedActivationFence;
-  readonly outcome?: ManagedActivationOutcome;
+  readonly outcome?: ManagedActivationOutcome | 'cancelled';
+  readonly cancelRequested?: boolean;
   readonly finishedAt?: number;
 }
 
@@ -97,7 +98,8 @@ interface MessageState {
   activationReady: boolean;
   state: 'admitted' | 'processing' | 'finished';
   fence?: ManagedActivationFence;
-  outcome?: ManagedActivationOutcome;
+  outcome?: ManagedActivationOutcome | 'cancelled';
+  cancelRequested?: boolean;
   finishedAt?: number;
 }
 
@@ -108,6 +110,10 @@ interface EventBase {
 }
 
 type InboxEvent =
+  | (EventBase & {
+      readonly type: 'user.message.cancel_requested';
+      readonly identity: ManagedSessionMessageIdentity;
+    })
   | (EventBase & {
       readonly type: 'user.message.admitted';
       readonly message: ManagedSessionUserMessage;
@@ -125,7 +131,7 @@ type InboxEvent =
       readonly type: 'user.message.finished';
       readonly identity: ManagedSessionMessageIdentity;
       readonly fence: ManagedActivationFence;
-      readonly outcome: ManagedActivationOutcome;
+      readonly outcome: ManagedActivationOutcome | 'cancelled';
     });
 
 type JsonObject = Record<string, unknown>;
@@ -194,8 +200,8 @@ function fence(value: unknown): ManagedActivationFence {
   };
 }
 
-function outcome(value: unknown): ManagedActivationOutcome {
-  if (value !== 'completed' && value !== 'failed') {
+function outcome(value: unknown): ManagedActivationOutcome | 'cancelled' {
+  if (value !== 'completed' && value !== 'failed' && value !== 'cancelled') {
     throw new Error('outcome is invalid.');
   }
   return value;
@@ -304,6 +310,12 @@ function parseEvent(
           type: 'user.message.activation_ready',
           identity: identity(record['identity']),
         };
+      case 'user.message.cancel_requested':
+        return {
+          ...base,
+          type: 'user.message.cancel_requested',
+          identity: identity(record['identity']),
+        };
       case 'user.message.processing':
         return {
           ...base,
@@ -341,6 +353,7 @@ function snapshot(state: MessageState): ManagedSessionMessageSnapshot {
     admissionSequence: state.admissionSequence,
     activationReady: state.activationReady,
     state: state.state,
+    ...(state.cancelRequested ? { cancelRequested: true } : {}),
     ...(state.fence ? { fence: state.fence } : {}),
     ...(state.outcome ? { outcome: state.outcome } : {}),
     ...(state.finishedAt === undefined ? {} : { finishedAt: state.finishedAt }),
@@ -555,10 +568,30 @@ export class FileManagedSessionInbox {
     });
   }
 
+  requestCancel(
+    input: ManagedSessionMessageIdentity,
+  ): Promise<ManagedSessionMessageSnapshot> {
+    const captured = structuredClone(input);
+    return this.serial(async () => {
+      const messageIdentity = identity(captured);
+      const state = this.required(messageIdentity);
+      if (state.state === 'finished' || state.cancelRequested)
+        return snapshot(state);
+      await this.persist({
+        v: 1,
+        sequence: this.nextSequence,
+        at: this.getCurrentTime(),
+        type: 'user.message.cancel_requested',
+        identity: messageIdentity,
+      });
+      return snapshot(this.required(messageIdentity));
+    });
+  }
+
   finish(
     input: ManagedSessionMessageIdentity,
     inputFence: ManagedActivationFence,
-    inputOutcome: ManagedActivationOutcome,
+    inputOutcome: ManagedActivationOutcome | 'cancelled',
   ): Promise<ManagedSessionMessageSnapshot> {
     const capturedInput = {
       tenantId: input.tenantId,
@@ -701,6 +734,16 @@ export class FileManagedSessionInbox {
         );
       }
       state.activationReady = true;
+    } else if (event.type === 'user.message.cancel_requested') {
+      const state = this.required(event.identity);
+      if (state.state === 'finished' || state.cancelRequested)
+        throw new Error('Inbox contains an invalid cancellation request.');
+      state.cancelRequested = true;
+      if (state.state === 'admitted') {
+        state.state = 'finished';
+        state.outcome = 'cancelled';
+        state.finishedAt = event.at;
+      }
     } else if (event.type === 'user.message.processing') {
       const state = this.required(event.identity);
       this.assertFenceIdentity(event.identity, event.fence);

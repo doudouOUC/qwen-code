@@ -5,6 +5,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, rm, appendFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import type { ManagedGatewayPromptRequest } from './managed-prompt-types.js';
 import { ManagedGatewaySessionEvents } from './managed-gateway-session-events.js';
 
@@ -145,8 +148,8 @@ describe('ManagedGatewaySessionEvents', () => {
         .filter((event) => event.type === 'accepted')
         .map((event) => event.data),
     ).toEqual([
-      { sessionId: 'session-a', promptId: 'prompt-a' },
-      { sessionId: 'session-a', promptId: 'prompt-b' },
+      { sessionId: 'session-a', promptId: 'prompt-a', prompt: first.prompt },
+      { sessionId: 'session-a', promptId: 'prompt-b', prompt: second.prompt },
     ]);
     expect(streamed.at(-1)).toMatchObject({
       type: 'completed',
@@ -257,5 +260,186 @@ describe('ManagedGatewaySessionEvents', () => {
       streamed.push(event.type);
     }
     expect(streamed).toEqual(['accepted', 'stream_gap']);
+  });
+});
+
+describe('durable Managed presentation', () => {
+  it('restores catalog, bounded history pages and monotonic IDs after restart and a partial tail', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'managed-presentation-'));
+    const file = path.join(root, 'events.jsonl');
+    try {
+      const first = await ManagedGatewaySessionEvents.open(file);
+      const input = request();
+      first.ensure(input);
+      for (let i = 0; i < 8; i++)
+        first.appendAssistantDelta(input, `part-${i}`);
+      first.markRuntimeReady(input);
+      first.complete(input);
+      await first.flush();
+      const page = await first.transcript(
+        input.sessionId,
+        input.managedClientId,
+        undefined,
+        3,
+      );
+      expect(page.events).toHaveLength(3);
+      expect(page.olderCursor).toBeDefined();
+      const older = await first.transcript(
+        input.sessionId,
+        input.managedClientId,
+        Number(page.olderCursor),
+        100,
+      );
+      expect(
+        [...older.events, ...page.events].map((event) => event.id),
+      ).toEqual(Array.from({ length: page.lastEventId }, (_, i) => i + 1));
+      first.dispose();
+      await appendFile(file, '{"partial":');
+      const reopened = await ManagedGatewaySessionEvents.open(file);
+      expect(reopened.list(input.managedClientId)).toHaveLength(1);
+      expect(
+        reopened.authorize(input.sessionId, input.managedClientId),
+      ).toMatchObject({ phase: 'completed', runtimeState: 'unknown' });
+      expect(reopened.list('another-client')).toHaveLength(0);
+      const next = request({
+        messageId: 'next',
+        turnKind: 'continuation',
+        prompt: [{ type: 'text', text: 'continue' }],
+      });
+      reopened.ensure(next);
+      reopened.appendAssistantDelta(next, 'follow-up');
+      reopened.complete(next);
+      await reopened.flush();
+      const later = await reopened.transcript(
+        input.sessionId,
+        input.managedClientId,
+      );
+      expect(later.lastEventId).toBe(page.lastEventId + 3);
+      expect(later.events.at(-1)?.promptId).toBe('next');
+      expect(
+        later.events
+          .filter((event) => event.type === 'accepted')
+          .map((event) => event.data),
+      ).toEqual([
+        expect.objectContaining({ prompt: input.prompt }),
+        expect.objectContaining({ prompt: next.prompt }),
+      ]);
+      reopened.dispose();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps durable completed sessions readable after live cache eviction', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'managed-presentation-'));
+    try {
+      const events = await ManagedGatewaySessionEvents.open(
+        path.join(root, 'events.jsonl'),
+      );
+      for (let i = 0; i < 66; i++) {
+        const input = request({ sessionId: `session-${i}` });
+        events.ensure(input);
+        events.appendAssistantDelta(input, 'saved answer');
+        events.complete(input);
+      }
+      await events.flush();
+      expect(events.list('managed-client-a')).toHaveLength(66);
+      const history = await events.transcript('session-0', 'managed-client-a');
+      expect(
+        history.events.some((event) => event.type === 'assistant_delta'),
+      ).toBe(true);
+      const replay = [];
+      for await (const event of events.subscribe(
+        'session-0',
+        'managed-client-a',
+        0,
+        new AbortController().signal,
+      ))
+        replay.push(event);
+      expect(replay).toEqual([
+        expect.objectContaining({
+          type: 'stream_gap',
+          id: history.lastEventId,
+        }),
+      ]);
+      events.dispose();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('separates waiting, actual Tool execution, terminal outcome and stale warmup results', () => {
+    const events = new ManagedGatewaySessionEvents();
+    const first = request();
+    events.ensure(first);
+    events.markRuntimeStarting(first);
+    events.markAgentStarted(first, 0, 'definition');
+    events.markToolRequested(first, 'call', 'read_file');
+    expect(
+      events.authorize(first.sessionId, first.managedClientId)?.phase,
+    ).toBe('waiting_runtime');
+    events.markRuntimeReady(first);
+    events.markToolStarted(first, 'call', 'read_file', { path: 'file' });
+    expect(
+      events.authorize(first.sessionId, first.managedClientId)?.phase,
+    ).toBe('tool_running');
+    events.complete(first);
+    const next = request({ messageId: 'next', turnKind: 'continuation' });
+    events.ensure(next);
+    events.markRuntimeStarting(next);
+    events.markRuntimeFailed(first);
+    expect(
+      events.authorize(first.sessionId, first.managedClientId)?.runtimeState,
+    ).toBe('starting');
+    events.complete(next);
+    events.markRuntimeFailed(next);
+    expect(
+      events.authorize(first.sessionId, first.managedClientId),
+    ).toMatchObject({ phase: 'completed', runtimeState: 'failed' });
+  });
+});
+
+describe('inbox presentation reconciliation', () => {
+  it('repairs a missing terminal before a newly admitted turn, without replaying older turns', async () => {
+    const events = new ManagedGatewaySessionEvents();
+    const first = request();
+    const next = request({ messageId: 'next', turnKind: 'continuation' });
+    events.ensure(first, 10);
+    events.appendAssistantDelta(first, 'saved answer');
+    const firstStatus = {
+      messageId: first.messageId,
+      state: 'finished' as const,
+      outcome: 'completed' as const,
+      activationReady: true,
+      admittedAt: 10,
+    };
+    const nextStatus = {
+      messageId: next.messageId,
+      state: 'admitted' as const,
+      activationReady: true,
+      admittedAt: 20,
+    };
+    events.recover(first, firstStatus);
+    events.recover(next, nextStatus);
+    events.recover(first, firstStatus);
+    events.recover(next, nextStatus);
+    expect(
+      events.authorize(first.sessionId, first.managedClientId),
+    ).toMatchObject({
+      promptId: 'next',
+      phase: 'admitted',
+      createdAt: 10,
+      admittedAt: 20,
+    });
+    const page = await events.transcript(
+      first.sessionId,
+      first.managedClientId,
+    );
+    expect(page.events.map((e) => [e.promptId, e.type])).toEqual([
+      ['prompt-a', 'accepted'],
+      ['prompt-a', 'assistant_delta'],
+      ['prompt-a', 'completed'],
+      ['next', 'accepted'],
+    ]);
   });
 });

@@ -270,9 +270,13 @@ describe('ResidentManagedGatewayModelRunner', () => {
     const getManifest = vi.fn();
     const order: string[] = [];
     const sink: ManagedGatewayAgentSink = {
-      onModelStarted: vi.fn(() => order.push('started')),
+      onModelStarted: vi.fn(() => {
+        order.push('started');
+      }),
       onThought: vi.fn(),
-      onDelta: vi.fn(() => order.push('delta')),
+      onDelta: vi.fn(() => {
+        order.push('delta');
+      }),
       onToolRequested: vi.fn(),
       onToolCompleted: vi.fn(),
     };

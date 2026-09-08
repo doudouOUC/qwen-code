@@ -129,6 +129,11 @@ import {
   type ModelDialogMode,
 } from './components/dialogs/ModelDialog';
 import { ModelFallbacksDialog } from './components/dialogs/ModelFallbacksDialog';
+import { ManagedSessionsPage } from './components/managed/ManagedSessionsPage';
+import {
+  managedSelectionFromUrl,
+  saveManagedSelection,
+} from './components/managed/managed-session-storage';
 import { AgentsManagerPage } from './components/agents/AgentsManagerPage';
 import { MemoryMessage } from './components/messages/MemoryMessage';
 import { AuthMessage } from './components/messages/AuthMessage';
@@ -5437,8 +5442,16 @@ export function App({
     | 'plugins'
     | 'agents'
     | 'channels'
+    | 'managed'
     | null
-  >(null);
+  >(() => (managedSelectionFromUrl().open ? 'managed' : null));
+  const [managedSessionId, setManagedSessionId] = useState<string | undefined>(
+    () => managedSelectionFromUrl().sessionId,
+  );
+  useEffect(() => {
+    saveManagedSelection(activePanel === 'managed', managedSessionId);
+  }, [activePanel, managedSessionId]);
+
   const activePanelRef = useRef(activePanel);
   // Deep-link target for the Settings panel (e.g. 'Daemon' from the Local
   // Control QR popover). Cleared on any panel close/switch, not just
@@ -5480,7 +5493,8 @@ export function App({
         | 'skills'
         | 'plugins'
         | 'agents'
-        | 'channels',
+        | 'channels'
+        | 'managed',
     ) => {
       setMainView('chat');
       setActivePanel(panel);
@@ -12625,6 +12639,10 @@ export function App({
                     closeMobileDrawer();
                     openPanel('channels');
                   }}
+                  onOpenManagedSessions={workspace.capabilities?.features?.includes('managed_sessions') ? () => {
+                    closeMobileDrawer();
+                    openPanel('managed');
+                  } : undefined}
                   onOpenDaemonStatus={() => {
                     closeMobileDrawer();
                     openPanel('status');
@@ -12922,6 +12940,8 @@ export function App({
                               ? t('plugins.title')
                             : activePanel === 'channels'
                               ? t('channels.title')
+                            : activePanel === 'managed'
+                              ? t('managed.title')
                               : t('sessionsOverview.title')
                   }
                 >
@@ -12994,11 +13014,13 @@ export function App({
                         ? t('settings.title')
                         : activePanel === 'status'
                           ? t('daemon.title')
-                          : t('sessionsOverview.title')}
+                          : activePanel === 'managed'
+                            ? t('managed.title')
+                            : t('sessionsOverview.title')}
                     </div>
                     </div>
                   )}
-                  <div className={styles.panelBody} key={activePanel}>
+                  <div className={`${styles.panelBody} ${activePanel === 'managed' ? styles.managedPanelBody : ''}`} key={activePanel}>
                     <ShadowDomBoundary
                       enabled={
                         shadowDomOptions.plugins &&
@@ -13086,6 +13108,13 @@ export function App({
                       <SkillsManagerPage
                         onClose={closePanel}
                         onUseSkill={handleUseSkill}
+                      />
+                    ) : activePanel === 'managed' ? (
+                      <ManagedSessionsPage
+                        key={workspace.baseUrl}
+                        sessionId={managedSessionId}
+                        onSelectSession={setManagedSessionId}
+                        workspaceCwd={lockedWorkspaceCwd}
                       />
                     ) : activePanel === 'agents' ? (
                       <AgentsManagerPage

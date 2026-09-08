@@ -1422,6 +1422,13 @@ vi.doMock('./components/channels/ChannelsManagerPage', async () => {
       React.createElement('div', { 'data-testid': 'channels-manager-page' }),
   };
 });
+vi.doMock('./components/managed/ManagedSessionsPage', async () => {
+  const React = await import('react');
+  return {
+    ManagedSessionsPage: () =>
+      React.createElement('div', { 'data-testid': 'managed-sessions-page' }),
+  };
+});
 vi.doMock('./components/SplitView', async () => {
   const React = await import('react');
   return {
@@ -18157,6 +18164,33 @@ describe('App session callbacks', () => {
 
     expect(container.querySelector('[data-testid="inline-panel"]')).toBeNull();
   });
+
+  it.each(['shell', 'ask_user_question'])(
+    'reveals a pending %s approval while Managed Agents is open',
+    async (toolName) => {
+      window.history.replaceState(
+        null,
+        '',
+        '/?managed=1&managedSession=managed-one',
+      );
+      const { container, rerender } = renderApp();
+      await flush();
+      expect(
+        container.querySelector('[data-testid="managed-sessions-page"]'),
+      ).not.toBeNull();
+      await act(async () => {
+        testState.blocks = [makePendingPermissionBlock({ toolName })];
+        rerender();
+        await Promise.resolve();
+      });
+      expect(
+        container.querySelector('[data-testid="inline-panel"]'),
+      ).toBeNull();
+      expect(new URLSearchParams(window.location.search).has('managed')).toBe(
+        false,
+      );
+    },
+  );
 
   it('does not open the extensions manager page with /extension manage', async () => {
     const { container } = renderApp();

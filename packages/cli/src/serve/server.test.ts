@@ -15138,6 +15138,161 @@ describe('createServeApp', () => {
       } satisfies ManagedPromptService;
     }
 
+    it('reads a caller-scoped Managed catalog and transcript without attaching a Runtime', async () => {
+      const bridge = fakeBridge();
+      const events = new ManagedGatewaySessionEvents();
+      const cancel = vi.fn(async () => true);
+      const service = {
+        ...fakeManagedPromptService(),
+        canContinue: () => true,
+        cancel,
+      };
+      service.getGatewayBinding.mockImplementation((id) =>
+        service.admit.mock.calls
+          .map(([input]) => input)
+          .find((input) => input.sessionId === id),
+      );
+      const app = createServeApp(baseOpts, undefined, {
+        bridge,
+        managedPromptService: service,
+        managedGatewaySessionEvents: events,
+        workspaceRegistry: createWorkspaceRegistry([
+          makeWorkspaceRuntimeForTest({
+            workspaceId: 'primary-id',
+            workspaceCwd: WS_BOUND,
+            primary: true,
+            trusted: true,
+            bridge,
+          }),
+        ]),
+      });
+      const host = `127.0.0.1:${baseOpts.port}`;
+      const get = (url: string, client = 'catalog-client') =>
+        request(app)
+          .get(url)
+          .set('Host', host)
+          .set('X-Qwen-Managed-Client-Id', client);
+      const invalidWorkspace = await request(app)
+        .post('/managed/sessions')
+        .set('Host', host)
+        .set('X-Qwen-Managed-Client-Id', 'catalog-client')
+        .set('Idempotency-Key', 'unknown-workspace')
+        .send({
+          cwd: path.join(WS_BOUND, 'unregistered'),
+          prompt: [{ type: 'text', text: 'must not use primary' }],
+        });
+      expect(invalidWorkspace.status).toBe(400);
+      expect(invalidWorkspace.body.code).toBe('workspace_mismatch');
+      expect(service.admit).not.toHaveBeenCalled();
+      const ids: string[] = [];
+      for (const key of ['catalog-a', 'catalog-b']) {
+        const created = await request(app)
+          .post('/managed/sessions')
+          .set('Host', host)
+          .set('X-Qwen-Managed-Client-Id', 'catalog-client')
+          .set('Idempotency-Key', key)
+          .send({ prompt: [{ type: 'text', text: key }] });
+        expect(created.status).toBe(202);
+        const input = service.admit.mock.calls.at(-1)![0];
+        events.appendAssistantDelta(input, `answer-${key}`);
+        events.complete(input);
+        ids.push(created.body.sessionId);
+      }
+      const first = await get('/managed/sessions?limit=1');
+      expect(first.status).toBe(200);
+      expect(first.body.sessions).toHaveLength(1);
+      const second = await get(
+        `/managed/sessions?limit=1&cursor=${first.body.nextCursor}`,
+      );
+      expect(
+        new Set(
+          [...first.body.sessions, ...second.body.sessions].map(
+            (row: { sessionId: string }) => row.sessionId,
+          ),
+        ),
+      ).toEqual(new Set(ids));
+      expect((await get('/managed/sessions', 'other')).body.sessions).toEqual(
+        [],
+      );
+      expect(
+        (await get(`/managed/sessions/${ids[0]}/transcript`, 'other')).status,
+      ).toBe(404);
+      const transcript = await get(
+        `/managed/sessions/${ids[0]}/transcript?limit=2`,
+      );
+      expect(transcript.body.events.at(-1).type).toBe('completed');
+      expect(transcript.body.olderCursor).toBeDefined();
+      expect(
+        (await get(`/managed/sessions/${ids[0]}`)).body.capabilities,
+      ).toEqual({ canSend: true, canCancel: false });
+      expect((await get('/managed/sessions?limit=10000')).status).toBe(400);
+      expect(
+        (await get(`/managed/sessions/${ids[0]}/transcript?before=-1`)).status,
+      ).toBe(400);
+      expect((await get('/capabilities')).body.features).toEqual(
+        expect.arrayContaining(['managed_sessions', 'managed_session_cancel']),
+      );
+      const post = (client: string, body: object) =>
+        request(app)
+          .post(`/managed/sessions/${ids[0]}/cancel`)
+          .set('Host', host)
+          .set('X-Qwen-Managed-Client-Id', client)
+          .send(body);
+      expect((await post('other', { promptId: 'catalog-a' })).status).toBe(404);
+      expect((await post('catalog-client', {})).status).toBe(400);
+      expect(cancel).not.toHaveBeenCalled();
+      expect(
+        (await post('catalog-client', { promptId: 'catalog-a' })).body,
+      ).toEqual({ accepted: true });
+      expect(cancel).toHaveBeenCalledExactlyOnceWith(ids[0], 'catalog-a');
+      for (const inaccessible of [
+        { workspaceId: 'primary-id', workspaceCwd: WS_BOUND, trusted: false },
+        {
+          workspaceId: 'unrelated',
+          workspaceCwd: path.join(WS_BOUND, 'other'),
+          trusted: true,
+        },
+      ]) {
+        const restricted = createServeApp(baseOpts, undefined, {
+          bridge,
+          managedPromptService: service,
+          managedGatewaySessionEvents: events,
+          workspaceRegistry: createWorkspaceRegistry([
+            makeWorkspaceRuntimeForTest({
+              ...inaccessible,
+              primary: true,
+              bridge,
+            }),
+          ]),
+        });
+        const detail = await request(restricted)
+          .get(`/managed/sessions/${ids[0]}`)
+          .set('Host', host)
+          .set('X-Qwen-Managed-Client-Id', 'catalog-client');
+        expect(detail.status).toBe(200);
+        expect(detail.body.capabilities).toEqual({
+          canSend: false,
+          canCancel: false,
+        });
+        const history = await request(restricted)
+          .get(`/managed/sessions/${ids[0]}/transcript`)
+          .set('Host', host)
+          .set('X-Qwen-Managed-Client-Id', 'catalog-client');
+        expect(history.status).toBe(200);
+        expect(history.body.events).not.toHaveLength(0);
+        const cancelled = await request(restricted)
+          .post(`/managed/sessions/${ids[0]}/cancel`)
+          .set('Host', host)
+          .set('X-Qwen-Managed-Client-Id', 'catalog-client')
+          .send({ promptId: 'catalog-a' });
+        expect(cancelled.status).toBe(409);
+      }
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(bridge.calls).toHaveLength(0);
+      expect(bridge.loadCalls).toHaveLength(0);
+      expect(bridge.resumeCalls).toHaveLength(0);
+    });
+
     it('is absent unless Managed Gateway dependencies are explicitly injected', async () => {
       const app = createServeApp(baseOpts, undefined, {
         bridge: fakeBridge(),

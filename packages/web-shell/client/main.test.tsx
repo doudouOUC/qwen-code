@@ -76,4 +76,18 @@ describe('StandaloneApp', () => {
       testState.props?.webShellProps.composerToolbarAdditionalActions,
     ).toEqual(['addMenu']);
   });
+
+  it('does not restore an ordinary Runtime session when opening a Managed history link', () => {
+    window.history.replaceState(
+      null,
+      '',
+      '/session/old-runtime?workspace=removed-workspace&managed=1&managedSession=gateway-session',
+    );
+    act(() => root.render(<StandaloneApp daemonToken="token" />));
+    expect(testState.props?.sessionId).toBeUndefined();
+    expect(testState.props?.workspaceId).toBeUndefined();
+    expect(
+      new URLSearchParams(window.location.search).get('managedSession'),
+    ).toBe('gateway-session');
+  });
 });

@@ -92,6 +92,10 @@ interface EventBase {
 
 type JournalEvent =
   | (EventBase & {
+      readonly type: 'activation.cancelled';
+      readonly identity: ManagedActivationIdentity;
+    })
+  | (EventBase & {
       readonly type: 'activation.queued';
       readonly activation: ManagedActivationDescriptor;
     })
@@ -210,6 +214,12 @@ function parseEvent(line: string, lineNumber: number): JournalEvent {
       case 'activation.assigned':
       case 'activation.renewed':
         return { ...base, type: record['type'], lease: lease(record['lease']) };
+      case 'activation.cancelled':
+        return {
+          ...base,
+          type: 'activation.cancelled',
+          identity: identity(record['identity']),
+        };
       case 'activation.released':
         return {
           ...base,
@@ -353,6 +363,23 @@ export class FileManagedActivationStore {
         created: true,
         activation: snapshot(this.activations.get(activationKey(activation))!),
       };
+    });
+  }
+
+  cancelQueued(input: ManagedActivationIdentity): Promise<boolean> {
+    const captured = structuredClone(input);
+    return this.serial(async () => {
+      const activation = identity(captured);
+      const state = this.activations.get(activationKey(activation));
+      if (!state || state.status !== 'queued') return false;
+      await this.persist({
+        v: 1,
+        sequence: this.nextSequence,
+        at: this.getCurrentTime(),
+        type: 'activation.cancelled',
+        identity: activation,
+      });
+      return true;
     });
   }
 
@@ -531,6 +558,13 @@ export class FileManagedActivationStore {
         queueSequence: event.sequence,
         status: 'queued',
       });
+    } else if (event.type === 'activation.cancelled') {
+      const state = this.activations.get(activationKey(event.identity));
+      if (!state || state.status !== 'queued')
+        throw new Error('Journal contains an invalid queued cancellation.');
+      state.status = 'released';
+      state.outcome = 'failed';
+      state.releasedAt = event.at;
     } else if (event.type === 'activation.assigned') {
       const state = this.activations.get(activationKey(event.lease));
       const expectedEpoch = this.nextEpoch.get(sessionKey(event.lease)) ?? 1;

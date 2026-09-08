@@ -41,8 +41,23 @@ export interface CreateManagedPromptServiceOptions {
     request: ManagedPromptRequest,
     signal: AbortSignal,
   ) => Promise<void>;
-  readonly onCompleted?: (request: ManagedPromptRequest) => void;
-  readonly onError?: (request: ManagedPromptRequest, error: unknown) => void;
+  readonly onCompleted?: (
+    request: ManagedPromptRequest,
+  ) => void | Promise<void>;
+  readonly onRecovered?: (
+    request: ManagedPromptRequest,
+    status: ManagedPromptStatus,
+  ) => void | Promise<void>;
+  readonly onCancelling?: (
+    request: ManagedPromptRequest,
+  ) => void | Promise<void>;
+  readonly onCancelled?: (
+    request: ManagedPromptRequest,
+  ) => void | Promise<void>;
+  readonly onError?: (
+    request: ManagedPromptRequest,
+    error: unknown,
+  ) => void | Promise<void>;
   readonly startPaused?: boolean;
 }
 
@@ -227,6 +242,7 @@ export async function createManagedPromptService(
   const activations = await FileManagedActivationStore.open(
     path.join(options.stateDir, 'activations.jsonl'),
   );
+  const running = new Map<string, AbortController>();
   const gatewayBindings = new Map<string, ManagedGatewaySessionBinding>();
   const recordGatewayBinding = (request: ManagedGatewayPromptRequest): void => {
     const candidate = gatewayBinding(request);
@@ -266,6 +282,26 @@ export async function createManagedPromptService(
       completedGatewaySessions.add(request.sessionId);
     }
   }
+  for (const entry of inbox.listAll()) {
+    await options.onRecovered?.(parseRequest(entry.message.payload), {
+      messageId: entry.message.messageId,
+      state: entry.state,
+      activationReady: entry.activationReady,
+      admittedAt: entry.admittedAt,
+      outcome: entry.outcome,
+      finishedAt: entry.finishedAt,
+      cancelRequested: entry.cancelRequested,
+    });
+  }
+  // Finish the queue half of a cancellation interrupted between journal writes.
+  for (const entry of inbox.listAll()) {
+    if (entry.outcome === 'cancelled')
+      await activations.cancelQueued({
+        tenantId: entry.message.tenantId,
+        sessionId: entry.message.sessionId,
+        activationId: entry.message.messageId,
+      });
+  }
   const scheduler = new EmbeddedHarnessScheduler({
     store: activations,
     workerId: options.workerId,
@@ -297,6 +333,13 @@ export async function createManagedPromptService(
         messageIdentity,
         context.fence,
       );
+      const cancellation = new AbortController();
+      const runKey = JSON.stringify(messageIdentity);
+      running.set(runKey, cancellation);
+      const executionSignal = AbortSignal.any([
+        context.signal,
+        cancellation.signal,
+      ]);
       let request: ManagedPromptRequest | undefined;
       try {
         request = parseRequest(processing.message.payload);
@@ -310,6 +353,10 @@ export async function createManagedPromptService(
             'Managed Prompt payload identity does not match its activation.',
             false,
           );
+        }
+        if (inbox.get(messageIdentity)?.cancelRequested) {
+          cancellation.abort(new Error('Managed Prompt cancelled.'));
+          throw cancellation.signal.reason;
         }
         if (recoveredProcessing) {
           throw new ManagedPromptServiceError(
@@ -331,29 +378,38 @@ export async function createManagedPromptService(
             false,
           );
         }
-        await options.dispatch(request, context.signal);
+        await options.dispatch(request, executionSignal);
         if (context.signal.aborted) {
           throw context.signal.reason;
         }
         await inbox.finish(messageIdentity, context.fence, 'completed');
         completedGatewaySessions.add(request.sessionId);
         try {
-          options.onCompleted?.(request);
+          await options.onCompleted?.(request);
         } catch {
           // An observer must not turn a committed Prompt into a failed one.
         }
       } catch (error) {
         if (!context.signal.aborted) {
-          await inbox.finish(messageIdentity, context.fence, 'failed');
+          const wasCancelled =
+            inbox.get(messageIdentity)?.cancelRequested === true;
+          await inbox.finish(
+            messageIdentity,
+            context.fence,
+            wasCancelled ? 'cancelled' : 'failed',
+          );
           if (request) {
             try {
-              options.onError?.(request, error);
+              if (wasCancelled) await options.onCancelled?.(request);
+              else await options.onError?.(request, error);
             } catch {
               // An observer must not strand a durable activation.
             }
           }
         }
         throw error;
+      } finally {
+        if (running.get(runKey) === cancellation) running.delete(runKey);
       }
     },
   });
@@ -515,6 +571,7 @@ export async function createManagedPromptService(
         state: result.state,
         activationReady: result.activationReady,
         admittedAt: result.admittedAt,
+        ...(result.cancelRequested ? { cancelRequested: true } : {}),
         ...(result.outcome ? { outcome: result.outcome } : {}),
         ...(result.finishedAt === undefined
           ? {}
@@ -524,6 +581,40 @@ export async function createManagedPromptService(
     getGatewayBinding(sessionId): ManagedGatewaySessionBinding | undefined {
       const binding = gatewayBindings.get(sessionId);
       return binding ? structuredClone(binding) : undefined;
+    },
+    canContinue(sessionId) {
+      return completedGatewaySessions.has(sessionId);
+    },
+    cancel(sessionId, messageId) {
+      if (disposed) throw new Error('Managed Prompt service is disposed.');
+      return serializeAdmission(async () => {
+        const binding = gatewayBindings.get(sessionId);
+        if (!binding) return false;
+        const messageIdentity = {
+          tenantId: binding.tenantId,
+          sessionId,
+          messageId,
+        };
+        const existing = inbox.get(messageIdentity);
+        if (!existing || existing.state === 'finished') return false;
+        const cancelled = await inbox.requestCancel(messageIdentity);
+        const request = parseRequest(cancelled.message.payload);
+        if (cancelled.outcome === 'cancelled') {
+          await activations.cancelQueued({
+            tenantId: binding.tenantId,
+            sessionId,
+            activationId: messageId,
+          });
+          await options.onCancelled?.(request);
+        } else {
+          running
+            .get(JSON.stringify(messageIdentity))
+            ?.abort(new Error('Managed Prompt cancelled.'));
+          await options.onCancelling?.(request);
+        }
+        scheduler.notifyCapacityChanged();
+        return true;
+      });
     },
     dispose(): void {
       if (disposed) return;

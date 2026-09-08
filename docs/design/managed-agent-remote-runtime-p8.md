@@ -202,7 +202,11 @@ qwen serve --no-web --port 4170 \
 ```
 
 Without `--experimental-managed-runtime-url`, P8 preserves the P7 local
-in-process provider. The public Managed Session API is unchanged.
+in-process provider. The original P8 Prompt API remains compatible. The
+[Managed session surfaces](managed-agent-session-surfaces.md) follow-up adds
+Gateway-owned catalog/history reads, recoverable display streaming, exact-Prompt
+cancellation, and capability-gated Web Shell navigation. These reads do not
+prepare or attach a Runtime, including when that worker is absent.
 
 When a remote Runtime URL is configured, the Gateway skips the ordinary
 boot-time ACP child preheat. Non-Managed compatibility routes remain mounted
