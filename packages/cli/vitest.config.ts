@@ -61,6 +61,10 @@ export default defineConfig({
         __dirname,
         '../acp-bridge/src/bridge.ts',
       ),
+      '@qwen-code/acp-bridge/channel': path.resolve(
+        __dirname,
+        '../acp-bridge/src/channel.ts',
+      ),
       '@qwen-code/acp-bridge/spawnChannel': path.resolve(
         __dirname,
         '../acp-bridge/src/spawnChannel.ts',

@@ -7518,82 +7518,95 @@ describe('runQwenServe runtime startup failures', () => {
     }
   });
 
-  it('disposes ACP routing when runtime containment fails', async () => {
-    tmpDir = fs.realpathSync(
-      fs.mkdtempSync(path.join(os.tmpdir(), 'qws-runtime-acp-cleanup-')),
-    );
-    const trustedSnapshot = {
-      revision: 'trusted',
-      folderTrustEnabled: false,
-      ideTrust: undefined,
-      trustedFolders: {},
-    } as Awaited<
-      ReturnType<typeof trustPolicyRuntime.readDaemonTrustPolicySnapshot>
-    >;
-    const untrustedSnapshot = {
-      revision: 'untrusted',
-      folderTrustEnabled: true,
-      ideTrust: undefined,
-      trustedFolders: {},
-    } as Awaited<
-      ReturnType<typeof trustPolicyRuntime.readDaemonTrustPolicySnapshot>
-    >;
-    let currentSnapshot = trustedSnapshot;
-    vi.spyOn(
-      trustPolicyRuntime,
-      'readDaemonTrustPolicySnapshot',
-    ).mockImplementation(async () => currentSnapshot);
-    const bootBridge = makeRuntimeBridge();
-    vi.mocked(bootBridge.shutdown)
-      .mockRejectedValueOnce(new Error('shutdown failed'))
-      .mockResolvedValue(undefined);
-    vi.mocked(bootBridge.killAllSync).mockImplementationOnce(() => {
-      throw new Error('kill failed');
-    });
-    vi.spyOn(acpBridge, 'createAcpSessionBridge').mockReturnValue(
-      bootBridge as ReturnType<typeof acpBridge.createAcpSessionBridge>,
-    );
-    let disposeWorkspace:
-      | ReturnType<typeof vi.fn<(workspaceId: string) => void>>
-      | undefined;
-    const originalCreateServeApp = serverModule.createServeApp;
-    vi.spyOn(serverModule, 'createServeApp').mockImplementation((...args) => {
-      const app = originalCreateServeApp(...args);
-      const acpHandle = app.locals['acpHandle'] as
-        | { disposeWorkspace?: (workspaceId: string) => void }
-        | undefined;
-      if (acpHandle?.disposeWorkspace) {
-        disposeWorkspace = vi.fn(acpHandle.disposeWorkspace);
-        acpHandle.disposeWorkspace = disposeWorkspace;
-      }
-      return app;
-    });
-
-    const handle = await runQwenServe(
-      {
-        port: 0,
-        hostname: '127.0.0.1',
-        mode: 'http-bridge',
-        workspace: tmpDir,
-        maxSessions: 1,
-        serveWebShell: false,
-      },
-      { resolveOnListen: true },
-    );
-
-    try {
-      await handle.runtimeReady;
-      expect(disposeWorkspace).toBeDefined();
-      currentSnapshot = untrustedSnapshot;
-      qwenCore.ideContextStore.set({
-        workspaceState: { isTrusted: false },
+  it.each([false, true])(
+    'keeps failed runtime teardown blocked when synchronous kill throws=%s',
+    async (killThrows) => {
+      tmpDir = fs.realpathSync(
+        fs.mkdtempSync(path.join(os.tmpdir(), 'qws-runtime-acp-cleanup-')),
+      );
+      const trustedSnapshot = {
+        revision: 'trusted',
+        folderTrustEnabled: false,
+        ideTrust: undefined,
+        trustedFolders: {},
+      } as Awaited<
+        ReturnType<typeof trustPolicyRuntime.readDaemonTrustPolicySnapshot>
+      >;
+      const untrustedSnapshot = {
+        revision: 'untrusted',
+        folderTrustEnabled: true,
+        ideTrust: undefined,
+        trustedFolders: {},
+      } as Awaited<
+        ReturnType<typeof trustPolicyRuntime.readDaemonTrustPolicySnapshot>
+      >;
+      let currentSnapshot = trustedSnapshot;
+      vi.spyOn(
+        trustPolicyRuntime,
+        'readDaemonTrustPolicySnapshot',
+      ).mockImplementation(async () => currentSnapshot);
+      const bootBridge = makeRuntimeBridge();
+      vi.mocked(bootBridge.shutdown)
+        .mockRejectedValueOnce(new Error('shutdown failed'))
+        .mockResolvedValue(undefined);
+      vi.mocked(bootBridge.killAllSync).mockImplementationOnce(() => {
+        if (killThrows) throw new Error('kill failed');
       });
-      await vi.waitFor(() => expect(disposeWorkspace).toHaveBeenCalledOnce());
-    } finally {
-      qwenCore.ideContextStore.clear();
-      await handle.close();
-    }
-  });
+      vi.spyOn(acpBridge, 'createAcpSessionBridge').mockReturnValue(
+        bootBridge as ReturnType<typeof acpBridge.createAcpSessionBridge>,
+      );
+      let disposeWorkspace:
+        | ReturnType<typeof vi.fn<(workspaceId: string) => void>>
+        | undefined;
+      let workspaceRegistry:
+        | import('./workspace-registry.js').WorkspaceRegistry
+        | undefined;
+      const originalCreateServeApp = serverModule.createServeApp;
+      vi.spyOn(serverModule, 'createServeApp').mockImplementation((...args) => {
+        workspaceRegistry = args[2]?.workspaceRegistry;
+        const app = originalCreateServeApp(...args);
+        const acpHandle = app.locals['acpHandle'] as
+          | { disposeWorkspace?: (workspaceId: string) => void }
+          | undefined;
+        if (acpHandle?.disposeWorkspace) {
+          disposeWorkspace = vi.fn(acpHandle.disposeWorkspace);
+          acpHandle.disposeWorkspace = disposeWorkspace;
+        }
+        return app;
+      });
+
+      const handle = await runQwenServe(
+        {
+          port: 0,
+          hostname: '127.0.0.1',
+          mode: 'http-bridge',
+          workspace: tmpDir,
+          maxSessions: 1,
+          serveWebShell: false,
+        },
+        { resolveOnListen: true },
+      );
+
+      try {
+        await handle.runtimeReady;
+        expect(disposeWorkspace).toBeDefined();
+        currentSnapshot = untrustedSnapshot;
+        qwenCore.ideContextStore.set({
+          workspaceState: { isTrusted: false },
+        });
+        await vi.waitFor(() => expect(disposeWorkspace).toHaveBeenCalledOnce());
+        await vi.waitFor(() =>
+          expect(workspaceRegistry?.getEntryByWorkspaceCwd(tmpDir)?.state).toBe(
+            'blocked',
+          ),
+        );
+        expect(acpBridge.createAcpSessionBridge).toHaveBeenCalledOnce();
+      } finally {
+        qwenCore.ideContextStore.clear();
+        await handle.close();
+      }
+    },
+  );
 
   it('rejects the embedded run handle by default when the runtime fails to mount', async () => {
     tmpDir = fs.realpathSync(
@@ -15337,13 +15350,13 @@ describe('runQwenServe channel worker supervisor', () => {
     );
     expect(worker.stop).toHaveBeenCalledTimes(1);
     expect(bridge.shutdown).toHaveBeenCalledTimes(1);
-    expect(bridge.killAllSync).toHaveBeenCalledTimes(1);
+    expect(bridge.killAllSync).toHaveBeenCalledTimes(2);
     expect(pidfile.removeServeServiceInfo).not.toHaveBeenCalled();
 
     await expect(handle.close()).resolves.toBeUndefined();
     expect(worker.stop).toHaveBeenCalledTimes(2);
-    expect(bridge.shutdown).toHaveBeenCalledTimes(1);
-    expect(bridge.killAllSync).toHaveBeenCalledTimes(1);
+    expect(bridge.shutdown).toHaveBeenCalledTimes(2);
+    expect(bridge.killAllSync).toHaveBeenCalledTimes(2);
     expect(pidfile.removeServeServiceInfo).toHaveBeenCalledWith(process.pid);
   });
 

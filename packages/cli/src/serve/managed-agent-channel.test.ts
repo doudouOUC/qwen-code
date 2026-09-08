@@ -1,0 +1,379 @@
+/**
+ * @license
+ * Copyright 2026 Qwen Team
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AgentSideConnection } from '@agentclientprotocol/sdk';
+import { FakeAgent } from '@qwen-code/acp-bridge/internal/testUtils';
+import { createAcpSessionBridge } from '@qwen-code/acp-bridge/bridge';
+import { AcpChannelTeardownError } from '@qwen-code/acp-bridge/channel';
+import {
+  PRIVATE_ACP_CAPABILITY_ENV,
+  Storage,
+  type Config,
+} from '@qwen-code/qwen-code-core';
+import {
+  EXTERNAL_TOOL_GUARD_PROVIDER_ATTACHED_VALUE,
+  EXTERNAL_TOOL_GUARD_REQUIRED_VALUE,
+  EXTERNAL_TOOL_GUARD_TOKEN_ENV,
+  PRIVATE_EXTERNAL_TOOL_GUARD_ENV,
+  PRIVATE_EXTERNAL_TOOL_GUARD_PROVIDER_ENV,
+} from '@qwen-code/acp-bridge/externalToolGuard';
+import { createAcpAgentHost } from '../acp-integration/acpAgent.js';
+import { loadCliConfig, type CliArgs } from '../config/config.js';
+import { loadSettings, type LoadedSettings } from '../config/settings.js';
+import { createManagedAgentChannelFactory } from './managed-agent-channel.js';
+import { createWorkspaceGenerationGuard } from './workspace-registry.js';
+
+vi.mock('../acp-integration/acpAgent.js', () => ({
+  createAcpAgentHost: vi.fn(),
+  AcpAgentHostStartupCleanupError: class extends AggregateError {},
+}));
+vi.mock('../config/config.js', () => ({
+  loadCliConfig: vi.fn(),
+  buildDisabledSkillNamesProvider: vi.fn(() => () => new Set()),
+}));
+vi.mock('../config/settings.js', () => ({ loadSettings: vi.fn() }));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe('managed Agent channel', () => {
+  let root: string;
+  let cwd: string;
+  let guard: ReturnType<typeof createWorkspaceGenerationGuard>;
+  let closed: ReturnType<typeof deferred<void>>;
+  const shutdown = vi.fn<Config['shutdown']>();
+  const dispose =
+    vi.fn<Awaited<ReturnType<typeof createAcpAgentHost>>['dispose']>();
+  const config = { shutdown } as unknown as Config;
+  const privateOverrides = {
+    [PRIVATE_ACP_CAPABILITY_ENV]: 'synthetic-private-parent',
+  };
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    shutdown.mockResolvedValue(undefined);
+    dispose.mockResolvedValue(undefined);
+    root = await realpath(await mkdtemp(join(tmpdir(), 'managed-channel-')));
+    cwd = join(root, 'workspace');
+    await mkdir(cwd);
+    guard = createWorkspaceGenerationGuard();
+    closed = deferred<void>();
+    vi.mocked(loadSettings).mockReturnValue({
+      merged: {},
+      getUserHooks: () => ({}),
+      getProjectHooks: () => ({}),
+    } as LoadedSettings);
+    vi.mocked(loadCliConfig).mockResolvedValue(config);
+    vi.mocked(createAcpAgentHost).mockImplementation(
+      async (_config, _settings, _argv, createStream) => {
+        createStream();
+        return {
+          connection: { closed: closed.promise } as AgentSideConnection,
+          dispose,
+          getActiveSessions: () => [],
+          isTrustedManagedParent: () => true,
+        };
+      },
+    );
+  });
+
+  afterEach(async () => {
+    guard.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  function factory(environment: NodeJS.ProcessEnv = {}, argv = {} as CliArgs) {
+    return createManagedAgentChannelFactory({
+      workspaceCwd: cwd,
+      sessionRuntimeBaseDir: join(root, 'output'),
+      runtimeEnvironment: environment,
+      workspaceTrusted: false,
+      generationGuard: guard,
+      argv,
+    });
+  }
+
+  it('pins copied settings, argv, environment and output while consuming private markers', async () => {
+    const ambient = { ...process.env };
+    const env = {
+      MODEL_KEY: 'workspace-key',
+      DROP_KEY: 'old',
+      [PRIVATE_ACP_CAPABILITY_ENV]: 'ambient-capability',
+      QWEN_SERVER_TOKEN: 'daemon-token',
+      [EXTERNAL_TOOL_GUARD_TOKEN_ENV]: 'guard-token',
+      QWEN_CODE_SIMPLE: '1',
+    };
+    const argv = { extensions: ['original'], insecure: true } as CliArgs;
+    const create = factory(env, argv);
+    env.MODEL_KEY = 'changed';
+    argv.extensions!.push('changed');
+    let outputRoot: string | undefined;
+    vi.mocked(loadCliConfig).mockImplementation(async () => {
+      outputRoot = Storage.getRuntimeBaseDir();
+      return config;
+    });
+    const channel = await create(cwd, {
+      ...privateOverrides,
+      DROP_KEY: undefined,
+      QWEN_SERVER_TOKEN: 'cannot-reintroduce',
+      [PRIVATE_EXTERNAL_TOOL_GUARD_ENV]: EXTERNAL_TOOL_GUARD_REQUIRED_VALUE,
+      [PRIVATE_EXTERNAL_TOOL_GUARD_PROVIDER_ENV]:
+        EXTERNAL_TOOL_GUARD_PROVIDER_ATTACHED_VALUE,
+    });
+    const policy = vi.mocked(loadCliConfig).mock.calls[0][9]!;
+    expect(outputRoot).toBe(join(root, 'output'));
+    expect(policy.workspaceTrusted).toBe(false);
+    expect(policy.runtimeEnvironment).toEqual({
+      MODEL_KEY: 'workspace-key',
+      QWEN_CODE_SERVE: '1',
+      QWEN_CODE_NO_RELAUNCH: 'true',
+      QWEN_TLS_INSECURE: '1',
+    });
+    expect(loadSettings).toHaveBeenCalledWith(cwd, {
+      runtimeEnvironment: policy.runtimeEnvironment,
+      workspaceTrusted: false,
+      skipWorkspaceSettings: true,
+    });
+    const hostArgs = vi.mocked(createAcpAgentHost).mock.calls[0];
+    expect(hostArgs[2]).toMatchObject({ extensions: ['original'], acp: true });
+    expect(hostArgs[4]).toEqual({
+      runtimeEnvironment: policy.runtimeEnvironment,
+      privateParentCapability: 'synthetic-private-parent',
+      externalToolGuardRequired: true,
+      externalToolGuardProviderAttached: true,
+    });
+    expect(process.env).toEqual(ambient);
+    await channel.kill();
+  });
+
+  it('rejects another workspace and missing private parent before config creation', async () => {
+    const other = join(root, 'other');
+    await mkdir(other);
+    const create = factory();
+    await expect(create(other, privateOverrides)).rejects.toThrow('workspace');
+    await expect(create(cwd)).rejects.toThrow('private ACP parent');
+    expect(loadCliConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a closed generation before config creation', async () => {
+    const create = factory();
+    guard.close();
+    await expect(create(cwd, privateOverrides)).rejects.toThrow(
+      'no longer active',
+    );
+    expect(loadCliConfig).not.toHaveBeenCalled();
+  });
+
+  it('cleans a Config that finishes loading after generation closure', async () => {
+    const loading = deferred<Config>();
+    vi.mocked(loadCliConfig).mockReturnValue(loading.promise);
+    const pending = factory()(cwd, privateOverrides);
+    void pending.catch(() => {});
+    await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledOnce());
+    guard.close();
+    loading.resolve(config);
+    await expect(pending).rejects.toThrow('no longer active');
+    expect(createAcpAgentHost).not.toHaveBeenCalled();
+    expect(shutdown).toHaveBeenCalledWith({
+      shutdownTelemetry: false,
+      strictResourceCleanup: true,
+    });
+  });
+
+  it('retains cleanup failure when generation closes during Config loading', async () => {
+    const loading = deferred<Config>();
+    vi.mocked(loadCliConfig).mockReturnValue(loading.promise);
+    shutdown.mockRejectedValueOnce(new Error('resource still alive'));
+    const pending = factory()(cwd, privateOverrides);
+    void pending.catch(() => {});
+    await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledOnce());
+    guard.close();
+    loading.resolve(config);
+    await expect(pending).rejects.toMatchObject({
+      cause: {
+        errors: [expect.any(Error), new Error('resource still alive')],
+      },
+    });
+  });
+
+  it('keeps factory startup cleanup failure visible to Bridge shutdown', async () => {
+    const loading = deferred<Config>();
+    vi.mocked(loadCliConfig).mockReturnValue(loading.promise);
+    shutdown.mockRejectedValueOnce(new Error('startup resource still alive'));
+    const bridge = createAcpSessionBridge({
+      boundWorkspace: cwd,
+      channelFactory: factory(),
+      channelIdleTimeoutMs: 0,
+    });
+    const starting = bridge.preheat();
+    void starting.catch(() => {});
+    await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledOnce());
+    guard.close();
+    const stopping = bridge.shutdown();
+    void stopping.catch(() => {});
+    loading.resolve(config);
+    await expect(starting).rejects.toBeInstanceOf(AcpChannelTeardownError);
+    await expect(stopping).rejects.toBeInstanceOf(AcpChannelTeardownError);
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(createAcpAgentHost).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'awaits a host born during Bridge shutdown, cleanup failure=%s',
+    async (fails) => {
+      const loading = deferred<Config>();
+      vi.mocked(loadCliConfig).mockReturnValue(loading.promise);
+      vi.mocked(createAcpAgentHost).mockImplementationOnce(
+        async (_config, _settings, _argv, createStream) => ({
+          connection: new AgentSideConnection(
+            () => new FakeAgent(),
+            createStream(),
+          ),
+          dispose,
+          getActiveSessions: () => [],
+          isTrustedManagedParent: () => true,
+        }),
+      );
+      if (fails)
+        dispose.mockRejectedValueOnce(new Error('late host still alive'));
+      const bridge = createAcpSessionBridge({
+        boundWorkspace: cwd,
+        channelFactory: factory(),
+        channelIdleTimeoutMs: 0,
+      });
+      const starting = bridge.preheat();
+      void starting.catch(() => {});
+      await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledOnce());
+      const stopping = bridge.shutdown();
+      void stopping.catch(() => {});
+      loading.resolve(config);
+      if (fails) {
+        await expect(starting).rejects.toBeInstanceOf(AcpChannelTeardownError);
+        await expect(stopping).rejects.toBeInstanceOf(AcpChannelTeardownError);
+      } else {
+        await expect(starting).rejects.toThrow('shutting down');
+        await stopping;
+      }
+      expect(dispose).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each([false, true])(
+    'gates the next host on prior disposal, failure=%s',
+    async (fails) => {
+      const cleanup = deferred<void>();
+      dispose.mockReturnValueOnce(cleanup.promise);
+      const create = factory();
+      const first = await create(cwd, privateOverrides);
+      const stopping = first.kill();
+      const stopOutcome = stopping.then(
+        () => 'stopped',
+        () => 'failed',
+      );
+      const next = create(cwd, privateOverrides);
+      const nextOutcome = next.then(
+        (channel) => ({ channel }),
+        (error: unknown) => ({ error }),
+      );
+      await first.transportFailed;
+      await Promise.resolve();
+      expect(loadCliConfig).toHaveBeenCalledOnce();
+      if (fails) cleanup.reject(new Error('old host still alive'));
+      else cleanup.resolve();
+      await stopOutcome;
+      const result = await nextOutcome;
+      if (fails) {
+        expect('error' in result).toBe(true);
+        if (!('error' in result)) throw new Error('Expected teardown failure');
+        expect(result.error).toBeInstanceOf(AcpChannelTeardownError);
+        await expect(create(cwd, privateOverrides)).rejects.toBe(result.error);
+        expect(loadCliConfig).toHaveBeenCalledOnce();
+      } else {
+        expect(loadCliConfig).toHaveBeenCalledTimes(2);
+        if (!('channel' in result)) throw result.error;
+        await result.channel.kill();
+      }
+    },
+  );
+
+  it('waits for disposal instead of publishing a host born after closure', async () => {
+    const original = vi.mocked(createAcpAgentHost).getMockImplementation()!;
+    const initialized = deferred<void>();
+    const release = deferred<void>();
+    const cleanup = deferred<void>();
+    dispose.mockReturnValueOnce(cleanup.promise);
+    vi.mocked(createAcpAgentHost).mockImplementationOnce(async (...args) => {
+      const host = await original(...args);
+      initialized.resolve();
+      await release.promise;
+      return host;
+    });
+    const pending = factory()(cwd, privateOverrides);
+    const settled = vi.fn();
+    void pending.then(settled, settled);
+    void pending.catch(() => {});
+    await initialized.promise;
+    guard.close();
+    release.resolve();
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+    expect(settled).not.toHaveBeenCalled();
+    cleanup.resolve();
+    await expect(pending).rejects.toThrow('no longer active');
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it.each(['kill', 'killSync', 'eof', 'generation'] as const)(
+    '%s aborts transport immediately and reports exit only after one disposal',
+    async (cause) => {
+      const cleanup = deferred<void>();
+      dispose.mockReturnValueOnce(cleanup.promise);
+      const channel = await factory()(cwd, privateOverrides);
+      const exit = vi.fn();
+      void channel.exited.then(exit);
+      const reader = channel.stream.readable.getReader();
+      const pendingRead = reader.read();
+      if (cause === 'kill') void channel.kill();
+      if (cause === 'killSync') channel.killSync();
+      if (cause === 'eof') closed.resolve();
+      if (cause === 'generation') guard.close();
+      await channel.transportFailed;
+      expect(await pendingRead).toMatchObject({ done: true });
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(exit).not.toHaveBeenCalled();
+      const first = channel.kill();
+      expect(channel.kill()).toBe(first);
+      cleanup.resolve();
+      await first;
+      await channel.exited;
+      expect(exit).toHaveBeenCalledOnce();
+      expect(dispose).toHaveBeenCalledOnce();
+      reader.releaseLock();
+    },
+  );
+
+  it('does not report exit when host disposal fails', async () => {
+    dispose.mockRejectedValueOnce(new Error('uncontained tool'));
+    const channel = await factory()(cwd, privateOverrides);
+    const exit = vi.fn();
+    void channel.exited.then(exit);
+    await expect(channel.kill()).rejects.toThrow('uncontained tool');
+    await channel.transportFailed;
+    await expect(channel.kill()).rejects.toThrow('uncontained tool');
+    expect(exit).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+});

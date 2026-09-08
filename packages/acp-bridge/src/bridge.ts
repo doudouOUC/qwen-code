@@ -50,7 +50,11 @@ import {
   type ShellOutputEvent,
 } from '@qwen-code/qwen-code-core';
 import type { ShellCommandResult } from './bridgeTypes.js';
-import type { AcpChannel, AcpChannelTransportGuard } from './channel.js';
+import {
+  AcpChannelTeardownError,
+  type AcpChannel,
+  type AcpChannelTransportGuard,
+} from './channel.js';
 import {
   EventBus,
   DEFAULT_RING_SIZE,
@@ -3667,6 +3671,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
   // first one's spawn so we never create two children for the same
   // daemon. Cleared in the `finally` of the creator.
   let inFlightChannelSpawn: Promise<ChannelInfo> | undefined;
+  let channelTeardownFailure: AcpChannelTeardownError | undefined;
   const byId = new Map<string, SessionEntry>();
   const forwardRunningPromptCancel = async (
     entry: SessionEntry,
@@ -4069,6 +4074,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
    * multiplexed sessions.
    */
   async function ensureChannel(): Promise<ChannelInfo> {
+    if (channelTeardownFailure) throw channelTeardownFailure;
     // Skip a channel that's marked dying — its underlying transport is
     // mid-SIGTERM-or-already-dead and `connection.newSession()` on it
     // would either hang or land the caller with a sessionId that
@@ -4093,6 +4099,10 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
             [PRIVATE_ACP_CAPABILITY_ENV]: privateParentCapability,
           }),
       );
+      const stopChannel = () =>
+        channel.kill().catch((error: unknown) => {
+          throw new AcpChannelTeardownError(error);
+        });
       const sessionIds = new Set<string>();
       const infoRef: { current?: ChannelInfo } = {};
       let client: BridgeClient;
@@ -4248,9 +4258,11 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
             channel.kill(),
           ]);
         } catch (teardownError) {
-          throw new AggregateError(
-            [error, teardownError],
-            'ACP channel construction and teardown failed',
+          throw new AcpChannelTeardownError(
+            new AggregateError(
+              [error, teardownError],
+              'ACP channel construction and teardown failed',
+            ),
           );
         }
         throw error;
@@ -4578,12 +4590,12 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         // newSession-failure / `shutdown`): "any channel in
         // `aliveChannels` with `isDying === true` is mid-teardown."
         info.isDying = true;
-        await channel.kill().catch(() => {});
+        await stopChannel();
         throw err;
       }
 
       if (info.isDying) {
-        await channel.kill().catch(() => {});
+        await stopChannel();
         throw new BridgeChannelClosedError('during initialize');
       }
 
@@ -4593,7 +4605,7 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       // path: mark dying + kill, let the exited handler reap.
       if (shuttingDown) {
         info.isDying = true;
-        await channel.kill().catch(() => {});
+        await stopChannel();
         throw new Error('AcpSessionBridge is shutting down');
       }
 
@@ -4638,7 +4650,12 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       }
       telemetry.metrics?.channelLifecycle('spawn');
       return info;
-    })();
+    })().catch((error: unknown) => {
+      if (error instanceof AcpChannelTeardownError) {
+        channelTeardownFailure = error;
+      }
+      throw error;
+    });
 
     inFlightChannelSpawn = promise;
     try {
@@ -13891,6 +13908,9 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         const teardownFailures = teardownResults.flatMap((result) =>
           result.status === 'rejected' ? [result.reason] : [],
         );
+        if (channelTeardownFailure) {
+          teardownFailures.push(channelTeardownFailure);
+        }
         if (teardownFailures.length === 1) throw teardownFailures[0];
         if (teardownFailures.length > 1) {
           throw new AggregateError(

@@ -2706,6 +2706,13 @@ export interface AcpAgentHost {
   dispose(reason: SessionEndReason): Promise<void>;
 }
 
+export class AcpAgentHostStartupCleanupError extends AggregateError {
+  constructor(startupError: unknown, cleanupError: unknown) {
+    super([startupError, cleanupError], 'ACP host startup failed');
+    this.name = 'AcpAgentHostStartupCleanupError';
+  }
+}
+
 // The caller owns the transport: close it before awaiting host disposal.
 export async function createAcpAgentHost(
   config: Config,
@@ -2976,10 +2983,7 @@ export async function createAcpAgentHost(
     try {
       await dispose(SessionEndReason.Other);
     } catch (cleanupError) {
-      throw new AggregateError(
-        [error, cleanupError],
-        'ACP host startup failed',
-      );
+      throw new AcpAgentHostStartupCleanupError(error, cleanupError);
     }
     throw error;
   }
@@ -3578,6 +3582,11 @@ class QwenAgent implements Agent {
     string,
     TranscriptReplayConfigCacheEntry
   >();
+  private readonly transcriptReplayConfigShutdowns = new Map<
+    Config,
+    Promise<void>
+  >();
+  private readonly transcriptReplayConfigLoads = new Set<Promise<Config>>();
   private readonly pendingConfigCleanup = new Map<string, Set<Config>>();
   private readonly initializingConfigs = new Set<Config>();
   private managedShuttingDown = false;
@@ -3806,7 +3815,11 @@ class QwenAgent implements Agent {
     }
     this.initializingConfigs.clear();
     this.pendingConfigCleanup.clear();
-    this.disposeTranscriptReplayConfigs();
+    try {
+      await this.disposeTranscriptReplayConfigs();
+    } catch (error) {
+      failures.push(error);
+    }
     if (failures.length > 0) {
       throw new AggregateError(failures, 'Managed session cleanup failed');
     }
@@ -4633,7 +4646,7 @@ class QwenAgent implements Agent {
         ]),
       ].map((config) => this.cleanupUnstoredConfig(config)),
     );
-    this.disposeTranscriptReplayConfigs();
+    await this.disposeTranscriptReplayConfigs();
   }
 
   constructor(
@@ -13219,34 +13232,57 @@ class QwenAgent implements Agent {
       deliverClientMcpMessage(this.connection, serverName, message, sessionId);
   }
 
-  private disposeTranscriptReplayConfig(config: Config): void {
-    try {
-      void Promise.resolve(config.getToolRegistry()?.stop()).catch((err) => {
-        debugLogger.debug(
-          `Transcript replay config tool registry stop failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      });
-    } catch (err) {
-      debugLogger.debug(
-        `Transcript replay config tool registry stop failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
+  private disposeTranscriptReplayConfig(config: Config): Promise<void> {
+    const pending = this.transcriptReplayConfigShutdowns.get(config);
+    if (pending) return pending;
+    const cleanup = config.shutdown({
+      shutdownTelemetry: false,
+      strictResourceCleanup: true,
+    });
+    this.transcriptReplayConfigShutdowns.set(config, cleanup);
+    void cleanup.then(
+      () => this.transcriptReplayConfigShutdowns.delete(config),
+      () => {},
+    );
+    return cleanup;
   }
 
-  private disposeTranscriptReplayConfigs(): void {
-    for (const entry of this.transcriptReplayConfigCache.values()) {
-      if (entry.config) {
-        this.disposeTranscriptReplayConfig(entry.config);
-      }
-    }
+  private async disposeTranscriptReplayConfigs(): Promise<void> {
+    const entries = [...this.transcriptReplayConfigCache.values()];
     this.transcriptReplayConfigCache.clear();
+    // A rejected creation may already have cleaned up successfully. Failed
+    // replay resource cleanup failures remain in the shutdown map below.
+    await Promise.allSettled([
+      ...this.transcriptReplayConfigLoads,
+      ...entries.map(async (entry) => {
+        const config = entry.config ?? (await entry.pending);
+        if (config) await this.disposeTranscriptReplayConfig(config);
+      }),
+    ]);
+    const results = await Promise.allSettled(
+      this.transcriptReplayConfigShutdowns.values(),
+    );
+    const failures = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Transcript replay cleanup failed');
+    }
   }
 
-  private async getTranscriptReplayConfig(
+  private getTranscriptReplayConfig(
+    cwd: string,
+    settings: LoadedSettings,
+  ): Promise<Config> {
+    this.assertManagedSessionAdmission();
+    const pending = this.loadTranscriptReplayConfig(cwd, settings);
+    this.transcriptReplayConfigLoads.add(pending);
+    const remove = () => this.transcriptReplayConfigLoads.delete(pending);
+    void pending.then(remove, remove);
+    return pending;
+  }
+
+  private async loadTranscriptReplayConfig(
     cwd: string,
     settings: LoadedSettings,
   ): Promise<Config> {
@@ -13260,7 +13296,7 @@ class QwenAgent implements Agent {
         return cached.pending;
       }
     } else if (cached?.config) {
-      this.disposeTranscriptReplayConfig(cached.config);
+      await this.disposeTranscriptReplayConfig(cached.config);
     }
 
     const entry: TranscriptReplayConfigCacheEntry = { settings };
@@ -13290,7 +13326,7 @@ class QwenAgent implements Agent {
       const config = await pending;
       const current = this.transcriptReplayConfigCache.get(key);
       if (current !== entry) {
-        this.disposeTranscriptReplayConfig(config);
+        await this.disposeTranscriptReplayConfig(config);
         if (current?.config) {
           return current.config;
         }
@@ -13555,7 +13591,9 @@ class QwenAgent implements Agent {
       }
     } catch (error) {
       return this.cleanupAfterRequestFailure(error, () =>
-        this.cleanupUnstoredConfig(config),
+        chatRecording === false
+          ? this.disposeTranscriptReplayConfig(config)
+          : this.cleanupUnstoredConfig(config),
       );
     }
     // ACP sessions run with piped stdio (non-TTY), so the default
@@ -13648,7 +13686,9 @@ class QwenAgent implements Agent {
       this.assertManagedSessionAdmission();
     } catch (error) {
       return this.cleanupAfterRequestFailure(error, () =>
-        this.cleanupUnstoredConfig(config),
+        chatRecording === false
+          ? this.disposeTranscriptReplayConfig(config)
+          : this.cleanupUnstoredConfig(config),
       );
     }
     if (!provisionalWorkspace) {

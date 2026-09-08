@@ -985,6 +985,7 @@ vi.mock('../i18n/index.js', async (importOriginal) => {
 import {
   runAcpAgent,
   createAcpAgentHost,
+  AcpAgentHostStartupCleanupError,
   type AcpAgentOptions,
   toStdioServer,
   toSseServer,
@@ -2088,6 +2089,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
   };
   type AgentLike = {
     initialize: (args: Record<string, unknown>) => Promise<unknown>;
+    stopAdmission: () => void;
     newSession: (args: Record<string, unknown>) => Promise<unknown>;
     setSessionConfigOption: (args: Record<string, unknown>) => Promise<unknown>;
     beginManagedShutdown: () => {
@@ -2863,6 +2865,19 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     expect(createStream).not.toHaveBeenCalled();
     expect(mockConfig.shutdown).toHaveBeenCalledOnce();
     expect(mockRunExitCleanup).not.toHaveBeenCalled();
+  });
+
+  it('distinguishes unconfirmed bootstrap cleanup from a clean startup failure', async () => {
+    vi.mocked(mockConfig.initialize).mockRejectedValueOnce(
+      new Error('startup failed'),
+    );
+    vi.mocked(mockConfig.shutdown).mockRejectedValueOnce(
+      new Error('cleanup failed'),
+    );
+    await expect(
+      createAcpAgentHost(mockConfig, makeSessionSettings(), mockArgv, vi.fn()),
+    ).rejects.toBeInstanceOf(AcpAgentHostStartupCleanupError);
+    expect(mockConfig.shutdown).toHaveBeenCalledOnce();
   });
 
   it('rejects a required embedded tool guard without an explicit private capability', async () => {
@@ -16569,62 +16584,89 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     await agentPromise;
   });
 
-  it('disposes a pending transcript config superseded by newer settings', async () => {
-    const oldSettings = makeCoreSettings('English');
-    const newSettings = makeCoreSettings('Japanese');
-    mockRunExitCleanup.mockResolvedValue(undefined);
-    const oldToolRegistry = { stop: vi.fn().mockResolvedValue(undefined) };
-    let releaseOldInitialize!: () => void;
-    const oldInitialize = new Promise<void>((resolve) => {
-      releaseOldInitialize = resolve;
-    });
-    const oldConfig = {
-      ...makeInnerConfig(),
-      initialize: vi.fn(() => oldInitialize),
-      getToolRegistry: vi.fn(() => oldToolRegistry),
-    } as unknown as Config;
-    const newToolRegistry = { stop: vi.fn().mockResolvedValue(undefined) };
-    const newConfig = {
-      ...makeInnerConfig(),
-      getToolRegistry: vi.fn(() => newToolRegistry),
-    } as unknown as Config;
-    vi.mocked(loadCliConfig)
-      .mockResolvedValueOnce(oldConfig)
-      .mockResolvedValueOnce(newConfig);
-    vi.mocked(SessionTranscriptReader).mockImplementation(
-      () =>
-        ({
-          readPage: vi.fn().mockResolvedValue({
-            sessionId: VALID_SESSION_ID,
-            records: [],
-            hasMore: false,
-            startTime: 'start',
-            lastUpdated: 'end',
-          }),
-        }) as unknown as InstanceType<typeof SessionTranscriptReader>,
-    );
-    mockHistoryReplayPage.mockResolvedValue({ pendingToolCalls: [] });
-    const { agent, agentPromise } = await bootCoreSettingsAgent(oldSettings);
+  it.each([false, true])(
+    'disposes a superseded transcript config, shutdown while loading=%s',
+    async (closeBeforeRelease) => {
+      const oldSettings = makeCoreSettings('English');
+      const newSettings = makeCoreSettings('Japanese');
+      mockRunExitCleanup.mockResolvedValue(undefined);
+      const oldToolRegistry = { stop: vi.fn().mockResolvedValue(undefined) };
+      let releaseOldInitialize!: () => void;
+      const oldInitialize = new Promise<void>((resolve) => {
+        releaseOldInitialize = resolve;
+      });
+      const oldConfig = {
+        ...makeInnerConfig(),
+        initialize: vi.fn(() => oldInitialize),
+        getToolRegistry: vi.fn(() => oldToolRegistry),
+        shutdown: vi.fn(() => oldToolRegistry.stop()),
+      } as unknown as Config;
+      const newToolRegistry = { stop: vi.fn().mockResolvedValue(undefined) };
+      const newConfig = {
+        ...makeInnerConfig(),
+        getToolRegistry: vi.fn(() => newToolRegistry),
+        shutdown: vi.fn(() => newToolRegistry.stop()),
+      } as unknown as Config;
+      vi.mocked(loadCliConfig)
+        .mockResolvedValueOnce(oldConfig)
+        .mockResolvedValueOnce(newConfig);
+      vi.mocked(SessionTranscriptReader).mockImplementation(
+        () =>
+          ({
+            readPage: vi.fn().mockResolvedValue({
+              sessionId: VALID_SESSION_ID,
+              records: [],
+              hasMore: false,
+              startTime: 'start',
+              lastUpdated: 'end',
+            }),
+          }) as unknown as InstanceType<typeof SessionTranscriptReader>,
+      );
+      mockHistoryReplayPage.mockResolvedValue({ pendingToolCalls: [] });
+      const { agent, agentPromise } = await bootCoreSettingsAgent(oldSettings);
 
-    const first = agent.extMethod(SERVE_STATUS_EXT_METHODS.sessionTranscript, {
-      sessionId: VALID_SESSION_ID,
-    });
-    await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledTimes(1));
+      const first = agent.extMethod(
+        SERVE_STATUS_EXT_METHODS.sessionTranscript,
+        {
+          sessionId: VALID_SESSION_ID,
+        },
+      );
+      await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledTimes(1));
 
-    vi.mocked(loadSettings).mockReturnValue(newSettings);
-    const second = agent.extMethod(SERVE_STATUS_EXT_METHODS.sessionTranscript, {
-      sessionId: VALID_SESSION_ID,
-    });
-    await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledTimes(2));
+      vi.mocked(loadSettings).mockReturnValue(newSettings);
+      const second = agent.extMethod(
+        SERVE_STATUS_EXT_METHODS.sessionTranscript,
+        {
+          sessionId: VALID_SESSION_ID,
+        },
+      );
+      await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledTimes(2));
 
-    releaseOldInitialize();
-    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
-    await vi.waitFor(() => expect(oldToolRegistry.stop).toHaveBeenCalledOnce());
-
-    mockConnectionState.resolve();
-    await agentPromise;
-    expect(newToolRegistry.stop).toHaveBeenCalledOnce();
-  });
+      if (closeBeforeRelease) {
+        await second;
+        void first.catch(() => {});
+        const ended = vi.fn();
+        void agentPromise.then(ended, ended);
+        mockConnectionState.resolve();
+        await vi.waitFor(() =>
+          expect(newConfig.shutdown).toHaveBeenCalledOnce(),
+        );
+        expect(ended).not.toHaveBeenCalled();
+        releaseOldInitialize();
+        await expect(first).rejects.toThrow(
+          'Session write ownership could not be verified.',
+        );
+        await agentPromise;
+      } else {
+        releaseOldInitialize();
+        await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+        mockConnectionState.resolve();
+        await agentPromise;
+      }
+      expect(oldToolRegistry.stop).toHaveBeenCalledOnce();
+      expect(newToolRegistry.stop).toHaveBeenCalledOnce();
+    },
+  );
 
   it('coalesces concurrent transcript config creation for the same settings', async () => {
     const settings = makeCoreSettings();
@@ -16638,6 +16680,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       ...makeInnerConfig(),
       initialize: vi.fn(() => initializeGate),
       getToolRegistry: vi.fn(() => toolRegistry),
+      shutdown: vi.fn(() => toolRegistry.stop()),
     } as unknown as Config);
     vi.mocked(SessionTranscriptReader).mockImplementation(
       () =>
@@ -16671,53 +16714,68 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     expect(toolRegistry.stop).toHaveBeenCalledOnce();
   });
 
-  it('disposes a pending transcript config that finishes after agent shutdown', async () => {
-    const settings = makeCoreSettings();
-    mockRunExitCleanup.mockResolvedValue(undefined);
-    let releaseInitialize!: () => void;
-    const initializeGate = new Promise<void>((resolve) => {
-      releaseInitialize = resolve;
-    });
-    const toolRegistry = { stop: vi.fn().mockResolvedValue(undefined) };
-    const shutdown = vi.fn(async () => {
-      await toolRegistry.stop();
-    });
-    vi.mocked(loadCliConfig).mockResolvedValue({
-      ...makeInnerConfig(),
-      initialize: vi.fn(() => initializeGate),
-      shutdown,
-      getToolRegistry: vi.fn(() => toolRegistry),
-    } as unknown as Config);
-    vi.mocked(SessionTranscriptReader).mockImplementation(
-      () =>
-        ({
-          readPage: vi.fn().mockResolvedValue({
-            sessionId: VALID_SESSION_ID,
-            records: [],
-            hasMore: false,
-            startTime: 'start',
-            lastUpdated: 'end',
-          }),
-        }) as unknown as InstanceType<typeof SessionTranscriptReader>,
-    );
-    const { agent, agentPromise } = await bootCoreSettingsAgent(settings);
+  it.each([false, true])(
+    'awaits late transcript cleanup, failure=%s',
+    async (fails) => {
+      const settings = makeCoreSettings();
+      mockRunExitCleanup.mockResolvedValue(undefined);
+      let releaseInitialize!: () => void;
+      const initializeGate = new Promise<void>((resolve) => {
+        releaseInitialize = resolve;
+      });
+      const toolRegistry = { stop: vi.fn().mockResolvedValue(undefined) };
+      const shutdown = vi.fn<Config['shutdown']>(async (options) => {
+        await toolRegistry.stop();
+        if (fails && options?.strictResourceCleanup)
+          throw new Error('replay resource still alive');
+      });
+      vi.mocked(loadCliConfig).mockResolvedValue({
+        ...makeInnerConfig(),
+        initialize: vi.fn(() => initializeGate),
+        shutdown,
+        getToolRegistry: vi.fn(() => toolRegistry),
+      } as unknown as Config);
+      vi.mocked(SessionTranscriptReader).mockImplementation(
+        () =>
+          ({
+            readPage: vi.fn().mockResolvedValue({
+              sessionId: VALID_SESSION_ID,
+              records: [],
+              hasMore: false,
+              startTime: 'start',
+              lastUpdated: 'end',
+            }),
+          }) as unknown as InstanceType<typeof SessionTranscriptReader>,
+      );
+      const { agent, agentPromise } = await bootCoreSettingsAgent(settings);
 
-    const request = agent.extMethod(
-      SERVE_STATUS_EXT_METHODS.sessionTranscript,
-      { sessionId: VALID_SESSION_ID },
-    );
-    await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledOnce());
+      const request = agent.extMethod(
+        SERVE_STATUS_EXT_METHODS.sessionTranscript,
+        { sessionId: VALID_SESSION_ID },
+      );
+      await vi.waitFor(() => expect(loadCliConfig).toHaveBeenCalledOnce());
 
-    mockConnectionState.resolve();
-    await agentPromise;
-    releaseInitialize();
+      const admissionClosed = vi.spyOn(agent, 'stopAdmission');
+      void request.catch(() => {});
+      void agentPromise.catch(() => {});
+      mockConnectionState.resolve();
+      await vi.waitFor(() => expect(admissionClosed).toHaveBeenCalled());
+      releaseInitialize();
+      if (fails)
+        await expect(agentPromise).rejects.toThrow('ACP host shutdown failed');
+      else await agentPromise;
 
-    await expect(request).rejects.toThrow(
-      'Session write ownership could not be verified.',
-    );
-    expect(shutdown).toHaveBeenCalledOnce();
-    expect(toolRegistry.stop).toHaveBeenCalledOnce();
-  });
+      await expect(request).rejects.toThrow(
+        'Session write ownership could not be verified.',
+      );
+      expect(shutdown).toHaveBeenCalledOnce();
+      expect(shutdown).toHaveBeenCalledWith({
+        shutdownTelemetry: false,
+        strictResourceCleanup: true,
+      });
+      expect(toolRegistry.stop).toHaveBeenCalledOnce();
+    },
+  );
 
   it('qwen/status/session/transcript rejects malformed cursor and limit params before reading', async () => {
     const settings = makeCoreSettings();

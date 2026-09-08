@@ -67,7 +67,7 @@ import {
   EXTERNAL_TOOL_GUARD_READY_META_KEY,
   EXTERNAL_TOOL_GUARD_REQUIRED_VALUE,
 } from './externalToolGuard.js';
-import type { ChannelFactory } from './channel.js';
+import { AcpChannelTeardownError, type ChannelFactory } from './channel.js';
 import type {
   BridgeOptions,
   BridgeFreshSessionAdmissionContext,
@@ -12257,11 +12257,12 @@ describe('createAcpSessionBridge', () => {
       .spawnOrAttach({ workspaceCwd: WS_A })
       .catch((reason: unknown) => reason);
 
-    expect(error).toBeInstanceOf(AggregateError);
-    expect((error as AggregateError).errors).toEqual([
-      constructionError,
-      teardownError,
-    ]);
+    expect(error).toBeInstanceOf(AcpChannelTeardownError);
+    expect(
+      ((error as AcpChannelTeardownError).cause as AggregateError).errors,
+    ).toEqual([constructionError, teardownError]);
+    await expect(bridge.preheat()).rejects.toBe(error);
+    await expect(bridge.shutdown()).rejects.toBe(error);
     await handle.channel.kill();
   });
 

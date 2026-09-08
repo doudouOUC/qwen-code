@@ -7765,7 +7765,7 @@ async function runQwenServeImpl(
                 try {
                   runtimeToDrain.bridge.killAllSync();
                   daemonLog.warn(
-                    'workspace bridge required forceful shutdown',
+                    'workspace bridge teardown failed; force-stop requested',
                     {
                       workspace: runtimeToDrain.workspaceCwd,
                       reason,
@@ -7781,6 +7781,9 @@ async function runQwenServeImpl(
                     'Workspace bridge shutdown could not be confirmed.',
                   );
                 }
+                // A synchronous transport abort cannot confirm host resources
+                // have stopped. Keep the failed generation contained.
+                throw shutdownError;
               }
             }
             bridgeStopped = true;
