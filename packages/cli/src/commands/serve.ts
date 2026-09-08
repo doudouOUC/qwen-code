@@ -40,6 +40,7 @@ import {
   type MemoryProjectScope,
 } from '@qwen-code/qwen-code-core';
 import { loadSettings } from '../config/settings.js';
+import { buildHostBootstrapEnvironment } from '../config/environment.js';
 import { HEADLESS_YOLO_NO_SANDBOX_WARNING } from '../utils/headlessSafetyWarnings.js';
 
 /**
@@ -784,6 +785,8 @@ export const serveCommand: CommandModule<unknown, ServeArgs> = {
       );
     }
 
+    const runtimeBaseEnvironment = buildHostBootstrapEnvironment(process.env);
+
     // Emit the headless-YOLO safety warning at daemon startup if
     // settings.json statically configures yolo + no sandbox. We can't
     // use `getHeadlessYoloSafetyWarning(config)` here because the daemon
@@ -880,6 +883,7 @@ export const serveCommand: CommandModule<unknown, ServeArgs> = {
     const { runQwenServe } = await import('../serve/run-qwen-serve.js');
     try {
       const serveOptions = {
+        runtimeBaseEnvironment,
         port: argv.port,
         hostname: argv.hostname,
         token: argv.token,

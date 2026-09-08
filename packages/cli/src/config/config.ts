@@ -102,8 +102,11 @@ import { resolveSkillSettings } from './skill-settings.js';
 
 const debugLogger = createDebugLogger('CONFIG');
 
-function resolveLocaleForExtensions(settings: Settings): string {
-  const envLang = process.env['QWEN_CODE_LANG'];
+function resolveLocaleForExtensions(
+  settings: Settings,
+  environment: Readonly<NodeJS.ProcessEnv>,
+): string {
+  const envLang = environment['QWEN_CODE_LANG'];
   if (envLang) return envLang;
   const settingsLang = settings.general?.language as string | undefined;
   if (settingsLang && settingsLang !== 'auto') return settingsLang;
@@ -1011,23 +1014,24 @@ function resolveModelFallbacks(
  */
 function resolveWebSearchSettings(
   settings: Settings,
+  environment: Readonly<NodeJS.ProcessEnv>,
 ): WebSearchSettings | undefined {
   const webSearch = settings.tools?.webSearch;
   // A set-but-empty env var is "unset", not an override: dotenv templates and
   // CI wrappers export empty values, which must not clobber a valid
   // settings.json config (same rule as WEB_SEARCH_BASE_URL below).
-  const envEnabled = process.env['ENABLE_WEB_SEARCH']?.trim() || undefined;
+  const envEnabled = environment['ENABLE_WEB_SEARCH']?.trim() || undefined;
   const enabled =
     envEnabled !== undefined ? isTruthy(envEnabled) : webSearch?.enabled;
-  const model = process.env['WEB_SEARCH_MODEL']?.trim() || webSearch?.model;
-  const envExtractor = process.env['WEB_SEARCH_EXTRACTOR']?.trim() || undefined;
+  const model = environment['WEB_SEARCH_MODEL']?.trim() || webSearch?.model;
+  const envExtractor = environment['WEB_SEARCH_EXTRACTOR']?.trim() || undefined;
   const webExtractor =
     envExtractor !== undefined
       ? isTruthy(envExtractor)
       : webSearch?.webExtractor;
-  const baseUrl = process.env['WEB_SEARCH_BASE_URL']?.trim() || undefined;
+  const baseUrl = environment['WEB_SEARCH_BASE_URL']?.trim() || undefined;
   const apiKeyEnv = baseUrl
-    ? process.env['WEB_SEARCH_API_KEY']?.trim()
+    ? environment['WEB_SEARCH_API_KEY']?.trim()
       ? 'WEB_SEARCH_API_KEY'
       : 'DASHSCOPE_API_KEY'
     : undefined;
@@ -1131,10 +1135,13 @@ function resolveMaxSubagentDepth(
   return settings.model?.maxSubagentDepth;
 }
 
-export function isDebugMode(argv: CliArgs): boolean {
+export function isDebugMode(
+  argv: CliArgs,
+  environment: Readonly<NodeJS.ProcessEnv> = process.env,
+): boolean {
   if (argv.debug) return true;
-  const debugVal = process.env['DEBUG'];
-  const debugModeVal = process.env['DEBUG_MODE'];
+  const debugVal = environment['DEBUG'];
+  const debugModeVal = environment['DEBUG_MODE'];
   return (
     debugVal === 'true' ||
     debugVal === '1' ||
@@ -1316,6 +1323,8 @@ export async function loadCliConfig(
    * construction may install the executor-boundary callback.
    */
   hostPolicy?: {
+    runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
+    processNetworkOwner?: true;
     toolInvocationGuard?: ToolInvocationGuard;
     /** Host-managed session whose exact private cwd is bound after bootstrap. */
     provisionalWorkspace?: true;
@@ -1326,20 +1335,35 @@ export async function loadCliConfig(
     };
   },
 ): Promise<Config> {
+  const runtimeEnvironment: Readonly<NodeJS.ProcessEnv> | undefined =
+    hostPolicy?.runtimeEnvironment === undefined
+      ? undefined
+      : Object.freeze({
+          ...hostPolicy.runtimeEnvironment,
+          ...(argv.insecure ? { QWEN_TLS_INSECURE: '1' } : {}),
+        });
+  const environment = runtimeEnvironment ?? process.env;
+  const processNetworkOwner =
+    runtimeEnvironment === undefined ||
+    hostPolicy?.processNetworkOwner === true;
   const provisionalWorkspace = hostPolicy?.provisionalWorkspace === true;
-  const debugMode = isDebugMode(argv);
-  if (debugMode && process.env['QWEN_DEBUG_LOG_FILE'] === undefined) {
+  const debugMode = isDebugMode(argv, environment);
+  if (
+    runtimeEnvironment === undefined &&
+    debugMode &&
+    process.env['QWEN_DEBUG_LOG_FILE'] === undefined
+  ) {
     process.env['QWEN_DEBUG_LOG_FILE'] = '1';
   }
-  const bareMode = isBareMode(argv.bare);
+  const bareMode = isBareMode(argv.bare, environment);
   const safeMode =
-    argv.safeMode !== undefined ? argv.safeMode : isSafeModeEnv();
+    argv.safeMode !== undefined ? argv.safeMode : isSafeModeEnv(environment);
 
   // Surface `--insecure` as an env var so it reaches the undici dispatcher
   // layer (which controls TLS verification) without threading a flag through
   // every content generator and the preconnect path. Resolution there ORs this
   // with QWEN_TLS_INSECURE / NODE_TLS_REJECT_UNAUTHORIZED=0.
-  if (argv.insecure) {
+  if (processNetworkOwner && argv.insecure) {
     process.env['QWEN_TLS_INSECURE'] = '1';
   }
   // When opting out of TLS verification, also set NODE_TLS_REJECT_UNAUTHORIZED
@@ -1349,7 +1373,8 @@ export async function loadCliConfig(
   // surfaces a single explicit warning. Skipped when the user already set it,
   // since Node emits its own warning in that case.
   if (
-    isTlsVerificationDisabled() &&
+    processNetworkOwner &&
+    isTlsVerificationDisabled(environment) &&
     process.env['NODE_TLS_REJECT_UNAUTHORIZED'] !== '0'
   ) {
     process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
@@ -1475,7 +1500,7 @@ export async function loadCliConfig(
   try {
     telemetrySettings = await resolveTelemetrySettings({
       argv,
-      env: process.env as unknown as Record<string, string | undefined>,
+      env: environment,
       settings: settings.telemetry,
     });
   } catch (err) {
@@ -1581,7 +1606,7 @@ export async function loadCliConfig(
       addDisabled(name);
   }
   for (const name of argv.disabledSlashCommands ?? []) addDisabled(name);
-  for (const name of (process.env['QWEN_DISABLED_SLASH_COMMANDS'] ?? '').split(
+  for (const name of (environment['QWEN_DISABLED_SLASH_COMMANDS'] ?? '').split(
     ',',
   )) {
     addDisabled(name);
@@ -1736,7 +1761,7 @@ export async function loadCliConfig(
     (argv.authType as AuthType | undefined) ||
     (bareMode ? undefined : settings.security?.auth?.selectedType) ||
     /* getAuthTypeFromEnv means no authType was explicitly provided, we infer the authType from env vars */
-    getAuthTypeFromEnv();
+    getAuthTypeFromEnv(environment);
 
   // Unified resolution of generation config with source attribution
   const resolvedCliConfig = resolveCliGenerationConfig({
@@ -1749,7 +1774,7 @@ export async function loadCliConfig(
     },
     settings,
     selectedAuthType,
-    env: process.env as Record<string, string | undefined>,
+    env: environment,
   });
 
   const { model: resolvedModel } = resolvedCliConfig;
@@ -1865,7 +1890,7 @@ export async function loadCliConfig(
       }
     }
   } else if (argv.sandboxSessionId) {
-    if (!process.env['SANDBOX']) {
+    if (!environment['SANDBOX']) {
       writeStderrLine('--sandbox-session-id is for internal sandbox use only.');
       process.exit(1);
     }
@@ -1949,6 +1974,8 @@ export async function loadCliConfig(
       : getPendingGatedMcpServers(mcpServers, cwd);
 
   const configParams: ConfigParameters = {
+    runtimeEnvironment,
+    processNetworkOwner: hostPolicy?.processNetworkOwner,
     sessionId,
     sessionData,
     sessionRestoreProjection,
@@ -2021,7 +2048,7 @@ export async function loadCliConfig(
     toolInvocationGuard: hostPolicy?.toolInvocationGuard,
     // Permission rule persistence callback (writes to settings files).
     onPersistPermissionRule: async (scope, ruleType, rule) => {
-      const currentSettings = loadSettings(cwd);
+      const currentSettings = loadSettings(cwd, { runtimeEnvironment });
       const settingScope =
         scope === 'project' ? SettingScope.Workspace : SettingScope.User;
       const key = `permissions.${ruleType}`;
@@ -2069,7 +2096,7 @@ export async function loadCliConfig(
     deferTelemetryInitialization: isAcpMode || (interactive && !question),
     outboundCorrelation: settings.outboundCorrelation,
     usageStatisticsEnabled:
-      parseBooleanEnvFlag(process.env['QWEN_USAGE_STATISTICS_ENABLED']) ??
+      parseBooleanEnvFlag(environment['QWEN_USAGE_STATISTICS_ENABLED']) ??
       settings.privacy?.usageStatisticsEnabled ??
       true,
     clearContextOnIdle: settings.context?.clearContextOnIdle,
@@ -2078,10 +2105,10 @@ export async function loadCliConfig(
     proxy:
       argv.proxy ||
       settings.proxy ||
-      process.env['HTTPS_PROXY'] ||
-      process.env['https_proxy'] ||
-      process.env['HTTP_PROXY'] ||
-      process.env['http_proxy'],
+      environment['HTTPS_PROXY'] ||
+      environment['https_proxy'] ||
+      environment['HTTP_PROXY'] ||
+      environment['http_proxy'],
     cwd,
     fileDiscoveryService: fileService,
     bugCommand: settings.advanced?.bugCommand,
@@ -2129,9 +2156,9 @@ export async function loadCliConfig(
       : undefined,
     emitToolUseSummaries: settings.experimental?.emitToolUseSummaries ?? true,
     listExtensions: argv.listExtensions || false,
-    locale: resolveLocaleForExtensions(settings),
+    locale: resolveLocaleForExtensions(settings, environment),
     overrideExtensions: overrideExtensions || argv.extensions,
-    noBrowser: !!process.env['NO_BROWSER'],
+    noBrowser: !!environment['NO_BROWSER'],
     authType: selectedAuthType,
     inputFormat,
     outputFormat,
@@ -2207,7 +2234,9 @@ export async function loadCliConfig(
     memoryAgentMaxTurns: settings.memory?.agentMaxTurns,
     fastModel: settings.fastModel || undefined,
     webSearch:
-      bareMode || safeMode ? undefined : resolveWebSearchSettings(settings),
+      bareMode || safeMode
+        ? undefined
+        : resolveWebSearchSettings(settings, environment),
     visionModel: settings.visionModel || undefined,
     compactionModel: settings.compactionModel || undefined,
     imageModel: settings.imageModel || undefined,

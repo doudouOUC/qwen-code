@@ -545,6 +545,22 @@ describe('Server Config (config.ts)', () => {
     overrideExtensions: [],
   };
 
+  it('copies and freezes a host environment without claiming process identity', async () => {
+    const environment = { MANAGED_TEST_KEY: 'first' };
+    const before = { ...process.env };
+    const config = new Config({
+      ...baseParams,
+      runtimeEnvironment: environment,
+    });
+    environment.MANAGED_TEST_KEY = 'changed';
+    expect(config.getRuntimeEnvironment()).toEqual({
+      MANAGED_TEST_KEY: 'first',
+    });
+    expect(Object.isFrozen(config.getRuntimeEnvironment())).toBe(true);
+    expect(process.env).toEqual(before);
+    await config.shutdown({ shutdownTelemetry: false });
+  });
+
   beforeEach(() => {
     // Reset mocks if necessary
     vi.clearAllMocks();

@@ -113,7 +113,7 @@ describe('ContentGenerationPipeline', () => {
     } as unknown as ErrorHandler;
 
     // Mock configs
-    mockCliConfig = {} as Config;
+    mockCliConfig = { getRuntimeEnvironment: () => process.env } as Config;
     mockContentGeneratorConfig = {
       model: 'test-model',
       authType: 'openai' as AuthType,
@@ -1024,6 +1024,7 @@ describe('ContentGenerationPipeline', () => {
         mockContentGeneratorConfig,
         {
           getContentGeneratorConfig: () => ({ enableCacheControl: false }),
+          getRuntimeEnvironment: () => process.env,
         } as unknown as Config,
       );
       (mockProvider.buildRequest as Mock).mockImplementation((req) =>
@@ -1096,6 +1097,7 @@ describe('ContentGenerationPipeline', () => {
         mockContentGeneratorConfig,
         {
           getContentGeneratorConfig: () => ({ enableCacheControl: false }),
+          getRuntimeEnvironment: () => process.env,
         } as unknown as Config,
       );
       (mockProvider.buildRequest as Mock).mockImplementation((req) =>
@@ -1153,6 +1155,7 @@ describe('ContentGenerationPipeline', () => {
         mockContentGeneratorConfig,
         {
           getContentGeneratorConfig: () => ({ enableCacheControl: false }),
+          getRuntimeEnvironment: () => process.env,
         } as unknown as Config,
       );
       (mockProvider.buildRequest as Mock).mockImplementation((req) =>
@@ -1210,6 +1213,7 @@ describe('ContentGenerationPipeline', () => {
         mockContentGeneratorConfig,
         {
           getContentGeneratorConfig: () => ({ enableCacheControl: false }),
+          getRuntimeEnvironment: () => process.env,
         } as unknown as Config,
       );
       (mockProvider.buildRequest as Mock).mockImplementation((req) =>
@@ -5116,6 +5120,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.baseUrl = 'https://api.openai.com/v1';
       mockContentGeneratorConfig.model = 'gpt-5.5';
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -5155,6 +5160,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.baseUrl = 'https://api.openai.com/v1';
       mockContentGeneratorConfig.model = 'gpt-5.6';
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -5194,6 +5200,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.baseUrl = 'https://api.openai.com/v1';
       mockContentGeneratorConfig.model = 'gpt-5.6';
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -5235,6 +5242,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.baseUrl = 'https://api.openai.com/v1';
       mockContentGeneratorConfig.model = 'gpt-5.6';
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -5278,6 +5286,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.model = 'gpt-5.6';
       mockContentGeneratorConfig.enableCacheControl = false;
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -5312,6 +5321,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.baseUrl = 'https://api.deepseek.com/v1';
       mockContentGeneratorConfig.model = 'gpt-5.6';
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -5355,6 +5365,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.baseUrl = 'https://api.openai.com/v1';
       mockContentGeneratorConfig.model = 'gpt-5.6';
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -5405,6 +5416,7 @@ describe('ContentGenerationPipeline', () => {
       mockContentGeneratorConfig.baseUrl = undefined;
       mockContentGeneratorConfig.model = 'gpt-5.6';
       mockCliConfig = {
+        getRuntimeEnvironment: () => process.env,
         getSessionId: vi.fn().mockReturnValue('session-123'),
       } as unknown as Config;
       mockConfig.cliConfig = mockCliConfig;
@@ -6468,29 +6480,37 @@ describe('ContentGenerationPipeline', () => {
       expect(gated.wasReturned()).toBe(true);
     });
 
-    it('honors QWEN_STREAM_IDLE_TIMEOUT_MS when no explicit config is set', async () => {
-      vi.stubEnv(QWEN_STREAM_IDLE_TIMEOUT_MS_ENV, '3000');
-      const gated = gatedStream(); // silent
-      (mockClient.chat.completions.create as Mock).mockResolvedValue(
-        gated.stream,
-      );
-      const p = buildPipeline(); // no explicit streamIdleTimeoutMs → env applies
-      const gen = await p.executeStream(
-        streamingRequest(new AbortController().signal),
-        'id',
-      );
-      let settled = false;
-      const consume = (async () => {
-        for await (const _ of gen) {
-          /* drain */
+    it.each([false, true])(
+      'honors QWEN_STREAM_IDLE_TIMEOUT_MS when no explicit config is set (snapshot=%s)',
+      async (snapshot) => {
+        vi.stubEnv(QWEN_STREAM_IDLE_TIMEOUT_MS_ENV, snapshot ? '1000' : '3000');
+        if (snapshot) {
+          mockCliConfig.getRuntimeEnvironment = () => ({
+            [QWEN_STREAM_IDLE_TIMEOUT_MS_ENV]: '3000',
+          });
         }
-      })().catch(() => (settled = true));
-      await vi.advanceTimersByTimeAsync(2999);
-      expect(settled).toBe(false); // not yet at the env value
-      await vi.advanceTimersByTimeAsync(1);
-      await consume;
-      expect(settled).toBe(true); // tripped at 3000ms from the env
-    });
+        const gated = gatedStream(); // silent
+        (mockClient.chat.completions.create as Mock).mockResolvedValue(
+          gated.stream,
+        );
+        const p = buildPipeline(); // no explicit streamIdleTimeoutMs → env applies
+        const gen = await p.executeStream(
+          streamingRequest(new AbortController().signal),
+          'id',
+        );
+        let settled = false;
+        const consume = (async () => {
+          for await (const _ of gen) {
+            /* drain */
+          }
+        })().catch(() => (settled = true));
+        await vi.advanceTimersByTimeAsync(2999);
+        expect(settled).toBe(false); // not yet at the env value
+        await vi.advanceTimersByTimeAsync(1);
+        await consume;
+        expect(settled).toBe(true); // tripped at 3000ms from the env
+      },
+    );
 
     it('lets an explicit streamIdleTimeoutMs config take precedence over the env', async () => {
       vi.stubEnv(QWEN_STREAM_IDLE_TIMEOUT_MS_ENV, '1000');
@@ -6829,34 +6849,42 @@ describe('ContentGenerationPipeline', () => {
       expect(done).toBe(true);
     });
 
-    it('honours QWEN_STREAM_MAX_LIFETIME_MS when no explicit config is set', async () => {
-      vi.stubEnv(QWEN_STREAM_MAX_LIFETIME_MS_ENV, '4000');
-      const gated = gatedStream(); // drip-fed, never ends
-      (mockClient.chat.completions.create as Mock).mockResolvedValue(
-        gated.stream,
-      );
-      const p = buildPipeline(1000); // idle 1s; lifetime from the env
-      const gen = await p.executeStream(
-        streamingRequest(new AbortController().signal),
-        'id',
-      );
-      let error: unknown;
-      const consume = (async () => {
-        for await (const _ of gen) {
-          /* drain */
+    it.each([false, true])(
+      'honours QWEN_STREAM_MAX_LIFETIME_MS when no explicit config is set (snapshot=%s)',
+      async (snapshot) => {
+        vi.stubEnv(QWEN_STREAM_MAX_LIFETIME_MS_ENV, snapshot ? '1000' : '4000');
+        if (snapshot) {
+          mockCliConfig.getRuntimeEnvironment = () => ({
+            [QWEN_STREAM_MAX_LIFETIME_MS_ENV]: '4000',
+          });
         }
-      })().catch((e: unknown) => {
-        error = e;
-      });
-      for (let i = 0; i < 7; i++) {
-        gated.push(chunk('x'));
-        await vi.advanceTimersByTimeAsync(500);
-      }
-      await vi.advanceTimersByTimeAsync(1000); // t=4500 — past the 4s env cap
-      await consume;
-      expect(error).toBeInstanceOf(StreamLifetimeExceededError);
-      expect((error as StreamLifetimeExceededError).maxLifetimeMs).toBe(4000);
-    });
+        const gated = gatedStream(); // drip-fed, never ends
+        (mockClient.chat.completions.create as Mock).mockResolvedValue(
+          gated.stream,
+        );
+        const p = buildPipeline(1000); // idle 1s; lifetime from the env
+        const gen = await p.executeStream(
+          streamingRequest(new AbortController().signal),
+          'id',
+        );
+        let error: unknown;
+        const consume = (async () => {
+          for await (const _ of gen) {
+            /* drain */
+          }
+        })().catch((e: unknown) => {
+          error = e;
+        });
+        for (let i = 0; i < 7; i++) {
+          gated.push(chunk('x'));
+          await vi.advanceTimersByTimeAsync(500);
+        }
+        await vi.advanceTimersByTimeAsync(1000); // t=4500 — past the 4s env cap
+        await consume;
+        expect(error).toBeInstanceOf(StreamLifetimeExceededError);
+        expect((error as StreamLifetimeExceededError).maxLifetimeMs).toBe(4000);
+      },
+    );
 
     it('lets an explicit streamMaxLifetimeMs config take precedence over the env', async () => {
       vi.stubEnv(QWEN_STREAM_MAX_LIFETIME_MS_ENV, '1000');
@@ -7057,34 +7085,45 @@ describe('ContentGenerationPipeline', () => {
       await consume;
     });
 
-    it('disables both guards when both env knobs are 0', async () => {
-      // The env-`0` twin of the test above: a `0` on either deployment knob
-      // must reach the guard, not fall through to the default.
-      vi.stubEnv(QWEN_STREAM_IDLE_TIMEOUT_MS_ENV, '0');
-      vi.stubEnv(QWEN_STREAM_MAX_LIFETIME_MS_ENV, '0');
-      const gated = gatedStream(); // silent
-      (mockClient.chat.completions.create as Mock).mockResolvedValue(
-        gated.stream,
-      );
-      const p = buildPipeline(); // no config; both env knobs 0 → both off
-      const gen = await p.executeStream(
-        streamingRequest(new AbortController().signal),
-        'id',
-      );
-      let settled = false;
-      const consume = (async () => {
-        for await (const _ of gen) {
-          /* drain */
+    it.each([false, true])(
+      'disables both guards when both env knobs are 0 (snapshot=%s)',
+      async (snapshot) => {
+        // The env-`0` twin of the test above: a `0` on either deployment knob
+        // must reach the guard, not fall through to the default.
+        vi.stubEnv(QWEN_STREAM_IDLE_TIMEOUT_MS_ENV, snapshot ? '1000' : '0');
+        vi.stubEnv(QWEN_STREAM_MAX_LIFETIME_MS_ENV, snapshot ? '1000' : '0');
+        if (snapshot) {
+          mockCliConfig.getRuntimeEnvironment = () => ({
+            [QWEN_STREAM_IDLE_TIMEOUT_MS_ENV]: '0',
+            [QWEN_STREAM_MAX_LIFETIME_MS_ENV]: '0',
+          });
         }
-      })().then(
-        () => (settled = true),
-        () => (settled = true),
-      );
-      await vi.advanceTimersByTimeAsync(DEFAULT_STREAM_MAX_LIFETIME_MS + 60000);
-      expect(settled).toBe(false);
-      gated.end();
-      await consume;
-    });
+        const gated = gatedStream(); // silent
+        (mockClient.chat.completions.create as Mock).mockResolvedValue(
+          gated.stream,
+        );
+        const p = buildPipeline(); // no config; both env knobs 0 → both off
+        const gen = await p.executeStream(
+          streamingRequest(new AbortController().signal),
+          'id',
+        );
+        let settled = false;
+        const consume = (async () => {
+          for await (const _ of gen) {
+            /* drain */
+          }
+        })().then(
+          () => (settled = true),
+          () => (settled = true),
+        );
+        await vi.advanceTimersByTimeAsync(
+          DEFAULT_STREAM_MAX_LIFETIME_MS + 60000,
+        );
+        expect(settled).toBe(false);
+        gated.end();
+        await consume;
+      },
+    );
 
     it('does not cap a buffered, already-complete stream for a slow consumer — consumer time is not upstream wait', async () => {
       // The lifetime cap charges only the time the loop is BLOCKED on

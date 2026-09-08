@@ -13,6 +13,7 @@ import type {
   ThinkingLevel,
   Content,
   Part,
+  GoogleGenAIOptions,
 } from '@google/genai';
 import { GoogleGenAI } from '@google/genai';
 import type {
@@ -66,11 +67,7 @@ export class LlmContentGenerator implements ContentGenerator {
   private effortClampWarned = false;
 
   constructor(
-    options: {
-      apiKey?: string;
-      vertexai?: boolean;
-      httpOptions?: { headers: Record<string, string> };
-    },
+    options: GoogleGenAIOptions,
     contentGeneratorConfig?: ContentGeneratorConfig,
   ) {
     const customHeaders = contentGeneratorConfig?.customHeaders;

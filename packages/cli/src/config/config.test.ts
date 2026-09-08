@@ -1190,6 +1190,40 @@ describe('loadCliConfig', () => {
     expect(process.env['QWEN_DEBUG_LOG_FILE']).toBe('1');
   });
 
+  it('resolves host model configuration from its frozen environment', async () => {
+    vi.stubEnv('OPENAI_API_KEY', 'ambient-key');
+    vi.stubEnv('OPENAI_MODEL', 'ambient-model');
+    vi.stubEnv('OPENAI_BASE_URL', 'https://ambient.invalid');
+    process.argv = ['node', 'script.js'];
+    const argv = await parseArguments();
+    const runtimeEnvironment = {
+      OPENAI_API_KEY: 'workspace-key',
+      OPENAI_MODEL: 'workspace-model',
+      OPENAI_BASE_URL: 'https://workspace.invalid',
+    };
+    const config = await loadCliConfig(
+      {},
+      argv,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false,
+      { runtimeEnvironment },
+    );
+    const generation = config.getModelsConfig().getGenerationConfig();
+    expect(generation.apiKey).toBe('workspace-key');
+    expect(generation.model).toBe('workspace-model');
+    expect(generation.baseUrl).toBe('https://workspace.invalid');
+    runtimeEnvironment.OPENAI_API_KEY = 'changed';
+    expect(config.getRuntimeEnvironment()['OPENAI_API_KEY']).toBe(
+      'workspace-key',
+    );
+    expect(process.env['OPENAI_API_KEY']).toBe('ambient-key');
+  });
+
   it('maps --restore-ask-user-question only in ACP mode', async () => {
     process.argv = [
       'node',
@@ -1433,6 +1467,38 @@ describe('loadCliConfig', () => {
       expect(process.env['NODE_TLS_REJECT_UNAUTHORIZED']).toBeUndefined();
       expect(errorSpy).not.toHaveBeenCalled();
     });
+
+    it.each([false, true])(
+      'limits process TLS changes to the network owner (%s)',
+      async (processNetworkOwner) => {
+        process.argv = ['node', 'script.js', '--insecure'];
+        const argv = await parseArguments();
+        const config = await loadCliConfig(
+          {},
+          argv,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          false,
+          {
+            runtimeEnvironment: {},
+            ...(processNetworkOwner
+              ? { processNetworkOwner: true as const }
+              : {}),
+          },
+        );
+        expect(config.getRuntimeEnvironment()['QWEN_TLS_INSECURE']).toBe('1');
+        expect(process.env['QWEN_TLS_INSECURE']).toBe(
+          processNetworkOwner ? '1' : undefined,
+        );
+        expect(process.env['NODE_TLS_REJECT_UNAUTHORIZED']).toBe(
+          processNetworkOwner ? '0' : undefined,
+        );
+      },
+    );
 
     it('propagates a pre-set QWEN_TLS_INSECURE to NODE_TLS_REJECT_UNAUTHORIZED=0', async () => {
       process.env['QWEN_TLS_INSECURE'] = '1';

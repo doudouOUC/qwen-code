@@ -194,6 +194,7 @@ import { FatalConfigError, getErrorMessage } from '../utils/errors.js';
 import { normalizeProxyUrl } from '../utils/proxyUtils.js';
 import {
   loadUndici,
+  isTlsVerificationDisabled,
   setResolvedProxyUrlForRuntimeFetch,
   redactProxyError,
 } from '../utils/runtimeFetchOptions.js';
@@ -841,6 +842,10 @@ export interface AgentsCollabSettings {
 }
 
 export interface ConfigParameters {
+  /** Explicit host environment. Omission preserves the standalone CLI environment. */
+  runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
+  /** The single process host may configure transport shared by OAuth and Google. */
+  processNetworkOwner?: true;
   sessionId?: string;
   sessionData?: ResumedSessionData;
   sessionRestoreProjection?: SessionRestoreProjection;
@@ -2391,8 +2396,13 @@ export class Config {
   // other instance updates it. Per-session publishing is not gated on it.
   private readonly ownsModelEnvSlot: boolean = false;
   private readonly settingsWatcher?: { stopWatching(): void };
+  private readonly runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
 
   constructor(params: ConfigParameters) {
+    this.runtimeEnvironment =
+      params.runtimeEnvironment === undefined
+        ? undefined
+        : Object.freeze({ ...params.runtimeEnvironment });
     this.sessionRuntimeBaseDir = Storage.getRuntimeBaseDir();
     this.provisionalWorkspace = params.provisionalWorkspace === true;
     this.sessionId = params.sessionId ?? randomUUID();
@@ -2402,7 +2412,11 @@ export class Config {
     // rather than checking env existence — otherwise a nested qwen-code
     // launched from within a session would inherit the parent's ID and
     // never claim its own.
-    if (!sessionEnvClaimed && process.env) {
+    if (
+      this.runtimeEnvironment === undefined &&
+      !sessionEnvClaimed &&
+      process.env
+    ) {
       process.env['QWEN_CODE_SESSION_ID'] = this.sessionId;
       sessionEnvClaimed = true;
     }
@@ -2698,7 +2712,11 @@ export class Config {
     // booted first, and every later session would hand its subprocesses another
     // session's directory. The env var is still set for the single-session CLI,
     // where it is the only consumer and there is nothing to collide with.
-    if (!projectDirEnvClaimed && process.env) {
+    if (
+      this.runtimeEnvironment === undefined &&
+      !projectDirEnvClaimed &&
+      process.env
+    ) {
       process.env['QWEN_CODE_PROJECT_DIR'] = this.storage.getProjectDir();
       projectDirEnvClaimed = true;
     }
@@ -2731,6 +2749,10 @@ export class Config {
     // - params.authType preserves undefined (user hasn't selected yet)
     // - generationConfig.authType may have a default value from resolvers
     this.modelsConfig = new ModelsConfig({
+      getEnvironment:
+        this.runtimeEnvironment === undefined
+          ? undefined
+          : () => this.getRuntimeEnvironment(),
       initialAuthType: params.authType ?? params.generationConfig?.authType,
       modelProvidersConfig: this.modelProvidersConfig,
       providerProtocolConfig: this.providerProtocolConfig,
@@ -2752,7 +2774,11 @@ export class Config {
     // never clobbers the live session's global value. Done here rather than
     // alongside the session ID because the value comes from the ModelsConfig
     // just constructed.
-    if (!modelEnvClaimed && process.env) {
+    if (
+      this.runtimeEnvironment === undefined &&
+      !modelEnvClaimed &&
+      process.env
+    ) {
       modelEnvClaimed = true;
       this.ownsModelEnvSlot = true;
     }
@@ -2773,7 +2799,10 @@ export class Config {
     }
 
     const proxyUrl = this.getProxy();
-    if (proxyUrl) {
+    if (
+      proxyUrl &&
+      (this.runtimeEnvironment === undefined || params.processNetworkOwner)
+    ) {
       // Use EnvHttpProxyAgent (not a bare ProxyAgent) so `NO_PROXY` is
       // honored. A bare ProxyAgent tunnels EVERY request — including local
       // MCP servers reached over `http://localhost:...` — through the proxy,
@@ -2790,10 +2819,24 @@ export class Config {
       // the dispatcher is installed before any network activity.
       this.proxyDispatcherReady = loadUndici()
         .then(({ EnvHttpProxyAgent, setGlobalDispatcher }) => {
+          const rejectUnauthorized = !isTlsVerificationDisabled(
+            this.getRuntimeEnvironment(),
+          );
           setGlobalDispatcher(
             new EnvHttpProxyAgent({
               httpProxy: proxyUrl,
               httpsProxy: proxyUrl,
+              ...(this.runtimeEnvironment === undefined
+                ? {}
+                : {
+                    noProxy:
+                      this.runtimeEnvironment['no_proxy'] ??
+                      this.runtimeEnvironment['NO_PROXY'] ??
+                      '',
+                    connect: { rejectUnauthorized },
+                    requestTls: { rejectUnauthorized },
+                    proxyTls: { rejectUnauthorized },
+                  }),
             }),
           );
           // Paths that pin their own dispatcher off the global one (the MCP
@@ -4067,6 +4110,10 @@ export class Config {
     return this.modelsConfig;
   }
 
+  getRuntimeEnvironment(): Readonly<NodeJS.ProcessEnv> {
+    return this.runtimeEnvironment ?? process.env;
+  }
+
   /**
    * Updates the credentials in the generation config.
    * Exclusive for `OpenAIKeyPrompt` to update credentials via `/auth`
@@ -4107,6 +4154,7 @@ export class Config {
    * Refresh authentication and rebuild ContentGenerator.
    */
   async refreshAuth(authMethod: AuthType, isInitialAuth?: boolean) {
+    await this.proxyDispatcherReady;
     // The global reasoning effort (settings.model.reasoningEffort, seeded into
     // the generation config by the CLI) is NOT a provider field, but
     // syncAfterAuthRefresh → applyResolvedModelDefaults overwrites every

@@ -10,6 +10,7 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildRuntimeEnvironment,
+  buildHostBootstrapEnvironment,
   loadEnvironment,
   reloadEnvironment,
   resetEnvironmentTrackingForTesting,
@@ -145,7 +146,71 @@ afterEach(() => {
   tmpDirs = [];
 });
 
+describe('buildHostBootstrapEnvironment', () => {
+  it('preserves host startup keys without freezing model settings or loader keys', () => {
+    const home = os.homedir();
+    fs.mkdirSync(path.join(home, '.qwen'));
+    fs.writeFileSync(
+      path.join(home, '.qwen', '.env'),
+      [
+        'QWEN_TLS_INSECURE=1',
+        'NODE_EXTRA_CA_CERTS=/host/cert.pem',
+        'QWEN_SERVER_TOKEN=host-token',
+        'OPENAI_API_KEY=home-key',
+        'NODE_OPTIONS=--import=untrusted-loader',
+      ].join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(home, '.env'),
+      'QWEN_SERVER_TOKEN=lower-priority',
+    );
+    const workspace = makeWorkspace();
+    fs.mkdirSync(path.join(workspace, '.qwen'));
+    fs.writeFileSync(
+      path.join(workspace, '.qwen', '.env'),
+      [
+        'OPENAI_API_KEY=workspace-key',
+        'QWEN_TLS_INSECURE=0',
+        'NODE_EXTRA_CA_CERTS=/workspace/cert.pem',
+      ].join('\n'),
+    );
+    const host = buildHostBootstrapEnvironment({});
+    expect(host).toEqual({
+      QWEN_TLS_INSECURE: '1',
+      NODE_EXTRA_CA_CERTS: '/host/cert.pem',
+      QWEN_SERVER_TOKEN: 'host-token',
+    });
+    const runtime = buildRuntimeEnvironment({}, workspace, host, true);
+    expect(runtime.effectiveEnv).toMatchObject({
+      OPENAI_API_KEY: 'workspace-key',
+      QWEN_TLS_INSECURE: '1',
+      NODE_EXTRA_CA_CERTS: '/host/cert.pem',
+    });
+    expect(
+      buildHostBootstrapEnvironment({ QWEN_SERVER_TOKEN: 'shell-token' })[
+        'QWEN_SERVER_TOKEN'
+      ],
+    ).toBe('shell-token');
+    expect(process.env['QWEN_SERVER_TOKEN']).toBeUndefined();
+  });
+});
+
 describe('buildRuntimeEnvironment', () => {
+  it('stops at a symlinked home directory instead of loading its parent environment', () => {
+    const root = makeWorkspace();
+    const home = path.join(root, 'home');
+    const homeLink = path.join(root, 'home-link');
+    fs.mkdirSync(home);
+    fs.symlinkSync(home, homeLink, 'junction');
+    process.env['HOME'] = homeLink;
+    process.env['USERPROFILE'] = homeLink;
+    fs.writeFileSync(path.join(root, '.env'), 'RUNTIME_PARENT=unexpected\n');
+    fs.writeFileSync(path.join(home, '.env'), 'RUNTIME_DOTENV=home\n');
+    const snapshot = buildRuntimeEnvironment({}, homeLink, {}, false);
+    expect(snapshot.effectiveEnv['RUNTIME_PARENT']).toBeUndefined();
+    expect(snapshot.effectiveEnv['RUNTIME_DOTENV']).toBe('home');
+  });
+
   it('computes a runtime overlay without mutating process.env or base env', () => {
     const workspace = makeWorkspace();
     fs.writeFileSync(

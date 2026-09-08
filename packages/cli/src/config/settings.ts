@@ -474,6 +474,7 @@ export class LoadedSettings {
     corruptedPath: string | undefined = undefined,
     wasRecovered: boolean = false,
     workspaceSettingsActive: boolean = true,
+    runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>,
   ) {
     this.system = system;
     this.systemDefaults = systemDefaults;
@@ -485,6 +486,10 @@ export class LoadedSettings {
     this.corruptedPath = corruptedPath;
     this.wasRecovered = wasRecovered;
     this.workspaceSettingsActive = workspaceSettingsActive;
+    this.runtimeEnvironment =
+      runtimeEnvironment === undefined
+        ? undefined
+        : Object.freeze({ ...runtimeEnvironment });
     this._merged = this.computeMergedSettings();
   }
 
@@ -501,6 +506,7 @@ export class LoadedSettings {
   corruptionDialogDismissed: boolean = false;
 
   private _merged: Settings;
+  private readonly runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
 
   get merged(): Settings {
     return this._merged;
@@ -630,7 +636,10 @@ export class LoadedSettings {
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         const resolved = resolveEnvVarsInObject(
           parsed as Settings,
-          getHomeEnvFallbackVars((message) => debugLogger.warn(message)),
+          this.runtimeEnvironment === undefined
+            ? getHomeEnvFallbackVars((message) => debugLogger.warn(message))
+            : undefined,
+          this.runtimeEnvironment,
         );
         file.settings = resolved;
         file.originalSettings = structuredClone(parsed) as Settings;
@@ -766,6 +775,7 @@ export const CORRUPTED_SUFFIX = '.corrupted';
  * System Defaults → User (~/.qwen/settings.json) → Workspace → System.
  */
 export interface LoadSettingsOptions {
+  runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
   consumeCorruptionEnvVars?: boolean;
   skipLoadEnvironment?: boolean;
   skipWorkspaceSettings?: boolean;
@@ -784,10 +794,12 @@ export function loadSettings(
   // BEFORE any code reads a path derived from them. After this call, the
   // lazy `getUserSettingsPath()` / `Storage.getGlobalQwenDir()` getters
   // return the post-bootstrap value.
-  preResolveHomeEnvOverrides();
+  if (opts.runtimeEnvironment === undefined) preResolveHomeEnvOverrides();
   const userSettingsPath = getUserSettingsPath();
   const qwenHomeRedirectWarning =
-    detectQwenHomeRedirectWithoutMigration(userSettingsPath);
+    opts.runtimeEnvironment === undefined
+      ? detectQwenHomeRedirectWithoutMigration(userSettingsPath)
+      : undefined;
 
   let systemSettings: Settings = {};
   let systemDefaultSettings: Settings = {};
@@ -898,6 +910,7 @@ export function loadSettings(
         // don't re-trigger this path.
         const envCorruptedPath = process.env[ENV_CORRUPTED_PATH];
         if (
+          opts.runtimeEnvironment === undefined &&
           (opts.consumeCorruptionEnvVars ?? true) &&
           envCorruptedPath &&
           envCorruptedPath === corruptedPath &&
@@ -1046,21 +1059,29 @@ export function loadSettings(
   // effective precedence is: process.env > home .env > unresolved placeholder.
   // The resolver checks customEnv before process.env, but since customEnv
   // never contains a process.env key, process.env always wins.
-  const homeEnvFallback = getHomeEnvFallbackVars((message) =>
-    debugLogger.warn(message),
-  );
+  const homeEnvFallback =
+    opts.runtimeEnvironment === undefined
+      ? getHomeEnvFallbackVars((message) => debugLogger.warn(message))
+      : undefined;
   systemSettings = resolveEnvVarsInObject(
     systemResult.settings,
     homeEnvFallback,
+    opts.runtimeEnvironment,
   );
   systemDefaultSettings = resolveEnvVarsInObject(
     systemDefaultsResult.settings,
     homeEnvFallback,
+    opts.runtimeEnvironment,
   );
-  userSettings = resolveEnvVarsInObject(userResult.settings, homeEnvFallback);
+  userSettings = resolveEnvVarsInObject(
+    userResult.settings,
+    homeEnvFallback,
+    opts.runtimeEnvironment,
+  );
   workspaceSettings = resolveEnvVarsInObject(
     workspaceResult.settings,
     homeEnvFallback,
+    opts.runtimeEnvironment,
   );
 
   // Support legacy theme names
@@ -1102,7 +1123,7 @@ export function loadSettings(
 
   // loadEnvironment depends on settings so we have to create a temp version of
   // the settings to avoid a cycle
-  if (!opts.skipLoadEnvironment) {
+  if (!opts.skipLoadEnvironment && opts.runtimeEnvironment === undefined) {
     loadEnvironment(tempMergedSettings, workspaceDir);
   }
 
@@ -1157,6 +1178,7 @@ export function loadSettings(
     userResult.corruptedPath,
     userResult.wasRecovered ?? false,
     workspaceSettingsActive,
+    opts.runtimeEnvironment,
   );
 }
 

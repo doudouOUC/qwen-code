@@ -117,6 +117,7 @@ describe('createContentGenerator', () => {
 
   it('should defer Gemini content generator creation until first use', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => true,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -147,8 +148,11 @@ describe('createContentGenerator', () => {
 
     expect(GoogleGenAI).toHaveBeenCalledWith({
       apiKey: 'test-api-key',
-      vertexai: undefined,
+      vertexai: false,
+      project: '',
+      location: '',
       httpOptions: {
+        baseUrl: 'https://generativelanguage.googleapis.com/',
         headers: {
           'User-Agent': expect.any(String),
           'x-gemini-api-privileged-user-id': expect.any(String),
@@ -159,6 +163,7 @@ describe('createContentGenerator', () => {
 
   it('should create a Gemini content generator with client install id logging disabled', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -186,8 +191,11 @@ describe('createContentGenerator', () => {
     });
     expect(GoogleGenAI).toHaveBeenCalledWith({
       apiKey: 'test-api-key',
-      vertexai: undefined,
+      vertexai: false,
+      project: '',
+      location: '',
       httpOptions: {
+        baseUrl: 'https://generativelanguage.googleapis.com/',
         headers: {
           'User-Agent': expect.any(String),
         },
@@ -197,6 +205,7 @@ describe('createContentGenerator', () => {
 
   it('loads a provider once across concurrent first calls', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -236,6 +245,7 @@ describe('createContentGenerator', () => {
 
   it('loads a provider once across concurrent preload and first use', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -261,6 +271,7 @@ describe('createContentGenerator', () => {
 
   it('discards an unused preload after session configuration changes', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -288,6 +299,7 @@ describe('createContentGenerator', () => {
 
   it('does not discard a generator that has already been used', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -325,6 +337,7 @@ describe('createContentGenerator', () => {
       }),
     ];
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -368,6 +381,7 @@ describe('createContentGenerator', () => {
     ];
     openaiMockState.deferredErrors = [preloadError];
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -413,6 +427,7 @@ describe('createContentGenerator', () => {
       authType: AuthType.QWEN_OAUTH,
     };
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => generatorConfig,
       getCliVersion: () => '1.0.0',
@@ -438,6 +453,7 @@ describe('createContentGenerator', () => {
   it('rebuilds OpenAI logging with the relocated working directory', async () => {
     let workingDir = '/workspace/before';
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -472,6 +488,7 @@ describe('createContentGenerator', () => {
 
   it('memoizes preload rejection for the first use', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -506,6 +523,7 @@ describe('createContentGenerator', () => {
 
   it('checks Qwen credentials before deferring provider creation', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -529,6 +547,7 @@ describe('createContentGenerator', () => {
 
   it('rejects Qwen credential failures before returning a lazy generator', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => false,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -553,6 +572,7 @@ describe('createContentGenerator', () => {
 
   it('should throw when the config has no authType', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => true,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -572,6 +592,7 @@ describe('createContentGenerator', () => {
 
   it('should throw on an unsupported authType', async () => {
     const mockConfig = {
+      getRuntimeEnvironment: () => process.env,
       getUsageStatisticsEnabled: () => true,
       getContentGeneratorConfig: () => ({}),
       getCliVersion: () => '1.0.0',
@@ -594,6 +615,7 @@ describe('createContentGenerator', () => {
 
 describe('createContentGenerator - ERR_MODULE_NOT_FOUND handling', () => {
   const mockConfig = {
+    getRuntimeEnvironment: () => process.env,
     getUsageStatisticsEnabled: () => true,
     getContentGeneratorConfig: () => ({}),
     getCliVersion: () => '1.0.0',
@@ -693,6 +715,7 @@ describe('createContentGenerator - ERR_MODULE_NOT_FOUND handling', () => {
 describe('createContentGeneratorConfig', () => {
   const mockConfig = {
     getProxy: () => undefined,
+    getRuntimeEnvironment: () => process.env,
   } as unknown as Config;
 
   it('should preserve provided fields and set authType for QWEN_OAUTH', () => {
@@ -740,6 +763,16 @@ describe('validateModelConfig - Vertex AI Application Default Credentials', () =
     expect(validateModelConfig(vertexConfig, true).valid).toBe(true);
   });
 
+  it('uses only the supplied project when validating ADC', () => {
+    vi.stubEnv('GOOGLE_CLOUD_PROJECT', 'ambient-project');
+    expect(validateModelConfig(vertexConfig, false, {}).valid).toBe(false);
+    expect(
+      validateModelConfig(vertexConfig, true, {
+        GOOGLE_CLOUD_PROJECT: 'workspace-project',
+      }).valid,
+    ).toBe(true);
+  });
+
   it('still requires credentials for Vertex when no project is configured', () => {
     const result = validateModelConfig(vertexConfig);
 
@@ -766,6 +799,7 @@ describe('validateModelConfig - Vertex AI Application Default Credentials', () =
     const generator = await createContentGenerator(
       { model: 'gemini-2.5-pro', authType: AuthType.USE_VERTEX_AI },
       {
+        getRuntimeEnvironment: () => process.env,
         getUsageStatisticsEnabled: () => false,
         getContentGeneratorConfig: () => ({}),
         getCliVersion: () => '1.0.0',

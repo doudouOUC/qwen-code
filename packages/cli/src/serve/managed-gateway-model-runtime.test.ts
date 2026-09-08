@@ -44,7 +44,17 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('../config/settings.js', () => ({
-  loadSettings: () => ({ merged: {} }),
+  loadSettings: vi.fn().mockImplementation(() => ({ merged: {} })),
+}));
+
+vi.mock('../config/environment.js', () => ({
+  buildHostBootstrapEnvironment: (env: Readonly<NodeJS.ProcessEnv>) => env,
+  buildRuntimeEnvironment: vi
+    .fn()
+    .mockImplementation((_settings, _cwd, baseEnvironment) => ({
+      effectiveEnv: Object.freeze({ ...baseEnvironment }),
+      envFileReadFailed: false,
+    })),
 }));
 
 vi.mock('../config/config.js', () => ({
@@ -52,6 +62,9 @@ vi.mock('../config/config.js', () => ({
 }));
 
 import { ResidentManagedGatewayModelRunner } from './managed-gateway-model-runtime.js';
+import { loadCliConfig } from '../config/config.js';
+import { loadSettings } from '../config/settings.js';
+import { buildRuntimeEnvironment } from '../config/environment.js';
 
 function toolManifest(tools: FunctionDeclaration[]) {
   return {
@@ -96,15 +109,53 @@ describe('ResidentManagedGatewayModelRunner', () => {
   const roots: string[] = [];
 
   beforeEach(() => {
+    vi.mocked(loadCliConfig).mockClear();
+    vi.mocked(loadSettings).mockClear();
+    vi.mocked(buildRuntimeEnvironment).mockClear();
     mocks.generateContentStream.mockReset();
     mocks.initialize.mockClear();
     mocks.shutdown.mockClear();
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await Promise.all(
       roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
     );
+  });
+
+  it('keeps the captured host environment when ambient and caller values change', async () => {
+    const stateDir = await mkdtemp(
+      path.join(os.tmpdir(), 'qwen-managed-environment-'),
+    );
+    roots.push(stateDir);
+    const baseEnvironment = { MANAGED_HOST_KEY: 'host-value' };
+    const runner = new ResidentManagedGatewayModelRunner(
+      '/primary/project',
+      stateDir,
+      baseEnvironment,
+    );
+    baseEnvironment.MANAGED_HOST_KEY = 'later-value';
+    vi.stubEnv('MANAGED_HOST_KEY', 'ambient-value');
+    try {
+      await runner.start();
+      const runtimeEnvironment =
+        vi.mocked(loadCliConfig).mock.calls[0]?.[9]?.runtimeEnvironment;
+      expect(runtimeEnvironment).toEqual({ MANAGED_HOST_KEY: 'host-value' });
+      expect(Object.isFrozen(runtimeEnvironment)).toBe(true);
+      for (const call of vi.mocked(buildRuntimeEnvironment).mock.calls) {
+        expect(call[1]).toBe(os.homedir());
+      }
+      expect(loadSettings).toHaveBeenLastCalledWith('/primary/project', {
+        consumeCorruptionEnvVars: false,
+        skipWorkspaceSettings: true,
+        workspaceTrusted: false,
+        runtimeEnvironment,
+      });
+      expect(process.env['MANAGED_HOST_KEY']).toBe('ambient-value');
+    } finally {
+      await runner.dispose();
+    }
   });
 
   it('owns the model loop, feeds Runtime Tool results back, and restores history', async () => {

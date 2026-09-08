@@ -455,6 +455,7 @@ type RunQwenServeOptions = Omit<ServeOptions, 'token' | 'workspace'> & {
   token?: string;
   workspace?: string | string[];
   requireWebShell?: boolean;
+  runtimeBaseEnvironment?: Readonly<NodeJS.ProcessEnv>;
 };
 type WorkspaceSettingsWrite =
   import('./workspace-service/types.js').WorkspaceSettingsWrite;
@@ -3273,7 +3274,10 @@ async function runQwenServeImpl(
     );
   }
   preResolveServeFastPathHomeEnvOverrides();
-  const baseEnv: NodeJS.ProcessEnv = { ...process.env };
+  const baseEnv: NodeJS.ProcessEnv = {
+    ...(optsIn.runtimeBaseEnvironment ?? process.env),
+  };
+  delete baseEnv[EXTERNAL_TOOL_GUARD_TOKEN_ENV];
   const launchMemoryProjectScopeValue =
     baseEnv['QWEN_CODE_MEMORY_PROJECT_SCOPE'];
   const launchMemoryProjectScope = launchMemoryProjectScopeValue?.trim()
@@ -3302,7 +3306,7 @@ async function runQwenServeImpl(
   // child, channel daemon workers) spawn with, and a loader var that
   // reaches them runs during Node bootstrap — before the child's own
   // post-boot scrub could ever remove it.
-  if (process.env['DEV'] !== 'true') {
+  if (baseEnv['DEV'] !== 'true') {
     scrubInheritedLoaderEnv(baseEnv);
   }
   const daemonRuntimeBaseEnv: Readonly<NodeJS.ProcessEnv> =
@@ -6539,6 +6543,7 @@ async function runQwenServeImpl(
           managedGatewayModelRunner = new ResidentManagedGatewayModelRunner(
             boundWorkspace,
             managedAgentsStateDir,
+            daemonRuntimeBaseEnv,
           );
           ownsManagedGatewayModelRunner = true;
         }
@@ -7924,6 +7929,7 @@ async function runQwenServeImpl(
       primaryWorkspaceTrusted: trustedWorkspace,
       primaryRuntimeEnv,
       daemonEnv: daemonRuntimeBaseEnv,
+      acpHttpEnabled: resolveAcpHttpEnabled(),
       runtimePlatform: deps.runtimePlatform,
       daemonLog,
       ...(opts.experimentalManagedAgents === true && managedPromptService

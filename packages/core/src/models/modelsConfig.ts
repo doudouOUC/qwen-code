@@ -54,6 +54,7 @@ export type OnModelChangeCallback = (
  * Options for creating ModelsConfig
  */
 export interface ModelsConfigOptions {
+  getEnvironment?: () => Readonly<NodeJS.ProcessEnv>;
   /** Initial authType from settings */
   initialAuthType?: AuthType;
   /** Model providers configuration */
@@ -82,6 +83,8 @@ export interface ModelsConfigOptions {
  * Config uses this as a thin entry point for all model-related operations.
  */
 export class ModelsConfig {
+  private readonly getEnvironment: () => Readonly<NodeJS.ProcessEnv>;
+  private readonly hasExplicitEnvironment: boolean;
   private readonly modelRegistry: ModelRegistry;
 
   // Current selection state
@@ -156,6 +159,8 @@ export class ModelsConfig {
   }
 
   constructor(options: ModelsConfigOptions = {}) {
+    this.getEnvironment = options.getEnvironment ?? (() => process.env);
+    this.hasExplicitEnvironment = options.getEnvironment !== undefined;
     this.modelRegistry = new ModelRegistry(
       options.modelProvidersConfig,
       options.providerProtocolConfig,
@@ -872,7 +877,7 @@ export class ModelsConfig {
 
     // Read API key from environment variable if envKey is specified
     if (model.envKey !== undefined) {
-      const apiKey = process.env[model.envKey];
+      const apiKey = this.getEnvironment()[model.envKey];
       if (apiKey) {
         this._generationConfig.apiKey = apiKey;
         this.generationConfigSources['apiKey'] = {
@@ -888,7 +893,7 @@ export class ModelsConfig {
       } else {
         debugLogger.debug(
           `No API key found for model "${model.id}": ` +
-            `process.env["${model.envKey}"] is ${apiKey === '' ? 'empty string' : 'not set'}. ` +
+            `Environment variable "${model.envKey}" is ${apiKey === '' ? 'empty string' : 'not set'}. ` +
             `Run /auth or set ${model.envKey} in your environment.`,
         );
       }
@@ -1053,7 +1058,7 @@ export class ModelsConfig {
       // When authType and modelId haven't changed (startup/restart scenario),
       // the current apiKey was already correctly resolved by
       // resolveCliGenerationConfig. Save it so we can restore it if
-      // applyResolvedModelDefaults clears it (i.e. process.env[envKey] is
+      // applyResolvedModelDefaults clears it (i.e. the configured envKey is
       // absent). For cross-provider switches (different modelId), we must
       // NOT preserve the previous key — it may belong to a different
       // service. Also detect hot-reload scenarios where the provider
@@ -1101,8 +1106,14 @@ export class ModelsConfig {
 
       // Restore the previously-resolved apiKey if applyResolvedModelDefaults
       // cleared it (env var not found) and this is the same model.
-      if (isUnchanged && !this._generationConfig.apiKey && savedApiKey) {
-        this._generationConfig.apiKey = savedApiKey;
+      const currentSavedApiKey =
+        this.hasExplicitEnvironment && savedApiKeySource?.kind === 'env'
+          ? savedApiKeySource.envKey
+            ? this.getEnvironment()[savedApiKeySource.envKey]
+            : undefined
+          : savedApiKey;
+      if (isUnchanged && !this._generationConfig.apiKey && currentSavedApiKey) {
+        this._generationConfig.apiKey = currentSavedApiKey;
         if (savedApiKeySource) {
           this.generationConfigSources['apiKey'] = savedApiKeySource;
         }

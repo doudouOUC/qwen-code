@@ -6,6 +6,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { homedir } from 'node:os';
 import type {
   Content,
   FunctionCall,
@@ -396,11 +397,15 @@ export class ResidentManagedGatewayModelRunner
     | Promise<ManagedGatewayAgentDefinition>
     | undefined;
   private disposed = false;
+  private readonly baseEnvironment: Readonly<NodeJS.ProcessEnv>;
 
   constructor(
     private readonly gatewayWorkspace: string,
     private readonly stateDir: string,
-  ) {}
+    baseEnvironment: Readonly<NodeJS.ProcessEnv> = process.env,
+  ) {
+    this.baseEnvironment = Object.freeze({ ...baseEnvironment });
+  }
 
   async start(): Promise<void> {
     await Promise.all([
@@ -644,14 +649,51 @@ export class ResidentManagedGatewayModelRunner
   }
 
   private async initializeConfig(): Promise<Config> {
-    const [{ loadSettings }, { loadCliConfig }] = await Promise.all([
+    const [
+      { loadSettings },
+      { loadCliConfig },
+      { buildRuntimeEnvironment, buildHostBootstrapEnvironment },
+    ] = await Promise.all([
       import('../config/settings.js'),
       import('../config/config.js'),
+      import('../config/environment.js'),
     ]);
-    const settings = loadSettings(this.gatewayWorkspace, {
+    const hostEnvironment = buildHostBootstrapEnvironment(this.baseEnvironment);
+    const settingsOptions = {
       consumeCorruptionEnvVars: false,
       skipWorkspaceSettings: true,
       workspaceTrusted: false,
+      runtimeEnvironment: hostEnvironment,
+    };
+    const initialSettings = loadSettings(
+      this.gatewayWorkspace,
+      settingsOptions,
+    );
+    const homeEnvironment = buildRuntimeEnvironment(
+      { ...initialSettings.merged, env: undefined },
+      homedir(),
+      hostEnvironment,
+      false,
+    );
+    if (homeEnvironment.envFileReadFailed) {
+      throw new Error('Managed Gateway could not read its host environment.');
+    }
+    const homeSettings = loadSettings(this.gatewayWorkspace, {
+      ...settingsOptions,
+      runtimeEnvironment: homeEnvironment.effectiveEnv,
+    });
+    const snapshot = buildRuntimeEnvironment(
+      homeSettings.merged,
+      homedir(),
+      hostEnvironment,
+      false,
+    );
+    if (snapshot.envFileReadFailed) {
+      throw new Error('Managed Gateway could not read its host environment.');
+    }
+    const settings = loadSettings(this.gatewayWorkspace, {
+      ...settingsOptions,
+      runtimeEnvironment: snapshot.effectiveEnv,
     });
     const config = await loadCliConfig(
       settings.merged,
@@ -722,7 +764,10 @@ export class ResidentManagedGatewayModelRunner
       undefined,
       undefined,
       true,
-      undefined,
+      {
+        runtimeEnvironment: snapshot.effectiveEnv,
+        processNetworkOwner: true,
+      },
     );
     const authType = config.getModelsConfig().getCurrentAuthType();
     if (!authType) {

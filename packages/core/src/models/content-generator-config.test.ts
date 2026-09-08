@@ -29,6 +29,7 @@ function createMockConfig(
   resolvedModel?: ResolvedModelConfig,
 ) {
   return {
+    getRuntimeEnvironment: () => process.env,
     getContentGeneratorConfig: () => parentConfig,
     getModelsConfig: () => ({
       getResolvedModel: vi.fn().mockReturnValue(resolvedModel),
@@ -231,6 +232,7 @@ describe('buildAgentContentGeneratorConfig', () => {
     it('should use explicit baseUrl when looking up a registry model', () => {
       const getResolvedModel = vi.fn().mockReturnValue(resolvedModel);
       const config = {
+        getRuntimeEnvironment: () => process.env,
         getContentGeneratorConfig: () => parentConfig,
         getModelsConfig: () => ({ getResolvedModel }),
       } as unknown as Config;

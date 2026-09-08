@@ -66,6 +66,7 @@ function createMockConfig() {
     getTargetDir: vi.fn().mockReturnValue('/tmp'),
     createToolRegistry: vi.fn().mockResolvedValue(createMockToolRegistry()),
     getContentGenerator: vi.fn().mockReturnValue(mockContentGenerator),
+    getRuntimeEnvironment: () => process.env,
     getContentGeneratorConfig: vi.fn().mockReturnValue({
       model: 'test-model',
       authType: 'openai',

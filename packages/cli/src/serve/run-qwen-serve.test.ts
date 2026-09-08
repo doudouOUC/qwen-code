@@ -13204,6 +13204,56 @@ describe('runQwenServe channel worker supervisor', () => {
     }
   });
 
+  it('keeps runtime credentials separate from daemon startup policy', async () => {
+    tmpDir = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'qws-clean-runtime-env-')),
+    );
+    vi.stubEnv('OPENAI_API_KEY', 'primary-key');
+    vi.stubEnv('QWEN_SERVER_TOKEN', 'startup-token');
+    vi.stubEnv('QWEN_SERVE_ACP_HTTP', '0');
+    const runtimeBaseEnvironment = { ...process.env };
+    delete runtimeBaseEnvironment['OPENAI_API_KEY'];
+    delete runtimeBaseEnvironment['QWEN_SERVER_TOKEN'];
+    delete runtimeBaseEnvironment['QWEN_SERVE_ACP_HTTP'];
+    runtimeBaseEnvironment['QWEN_CODE_EXTERNAL_TOOL_GUARD_TOKEN'] =
+      'private-guard';
+    let capturedDeps: Parameters<typeof serverModule.createServeApp>[2];
+    const originalCreateServeApp = serverModule.createServeApp;
+    vi.spyOn(serverModule, 'createServeApp').mockImplementation((...args) => {
+      capturedDeps = args[2];
+      return originalCreateServeApp(...args);
+    });
+    let handle: RunHandle | undefined;
+    try {
+      handle = await runQwenServe(
+        {
+          port: 0,
+          hostname: '127.0.0.1',
+          mode: 'http-bridge',
+          workspace: tmpDir,
+          serveWebShell: false,
+          runtimeBaseEnvironment,
+        },
+        { bridge: makeFakeBridge() },
+      );
+      expect(handle.resolvedToken).toBe('startup-token');
+      expect(capturedDeps?.daemonEnv?.['OPENAI_API_KEY']).toBeUndefined();
+      expect(capturedDeps?.daemonEnv?.['QWEN_SERVER_TOKEN']).toBeUndefined();
+      expect(
+        capturedDeps?.daemonEnv?.['QWEN_CODE_EXTERNAL_TOOL_GUARD_TOKEN'],
+      ).toBeUndefined();
+      expect(capturedDeps?.acpHttpEnabled).toBe(false);
+      const response = await fetch(new URL('/acp', handle.url), {
+        method: 'POST',
+        headers: { Authorization: 'Bearer startup-token' },
+      });
+      expect(response.status).toBe(404);
+    } finally {
+      await handle?.close();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('starts a TLS channel worker after the daemon runtime is ready', async () => {
     tmpDir = fs.realpathSync(
       fs.mkdtempSync(path.join(os.tmpdir(), 'qws-channel-tls-lazy-')),

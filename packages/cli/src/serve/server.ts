@@ -642,6 +642,7 @@ export interface ServeAppDeps {
   primaryWorkspaceTrusted?: boolean;
   primaryRuntimeEnv?: WorkspaceRuntimeEnvMetadata;
   daemonEnv?: Readonly<NodeJS.ProcessEnv>;
+  acpHttpEnabled?: boolean;
   runtimePlatform?: NodeJS.Platform;
   voiceTranscriber?: WorkspaceVoiceRouteDeps['transcribe'];
   voiceCoordinator?: WorkspaceVoiceCoordinator;
@@ -940,7 +941,8 @@ export function createServeApp(
   webTerminalLocals.releaseWebTerminalsForWorkspace = (workspaceCwd) =>
     webTerminalRegistry.releaseWorkspace(workspaceCwd);
   const acpHttpEnabledAtBoot =
-    !deps.ownedManagedRuntime && resolveAcpHttpEnabled(daemonEnvAtBoot);
+    !deps.ownedManagedRuntime &&
+    (deps.acpHttpEnabled ?? resolveAcpHttpEnabled(daemonEnvAtBoot));
   const runtimePlatform = deps.runtimePlatform ?? process.platform;
   const liveVoiceSurfaceAvailable =
     runtimePlatform === 'darwin' &&

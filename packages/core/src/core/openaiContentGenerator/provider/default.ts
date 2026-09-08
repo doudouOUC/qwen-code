@@ -106,6 +106,7 @@ export class DefaultOpenAICompatibleProvider
   }
 
   buildClient(): OpenAI {
+    const environment = this.cliConfig.getRuntimeEnvironment();
     const {
       apiKey,
       baseUrl,
@@ -119,10 +120,13 @@ export class DefaultOpenAICompatibleProvider
     const runtimeOptions = buildRuntimeFetchOptions(
       'openai',
       this.cliConfig.getProxy(),
+      this.cliConfig.getRuntimeEnvironment(),
     );
     return new OpenAI({
-      apiKey,
-      baseURL: baseUrl,
+      apiKey: apiKey ?? '',
+      baseURL: baseUrl ?? environment['OPENAI_BASE_URL']?.trim() ?? null,
+      organization: environment['OPENAI_ORG_ID']?.trim() ?? null,
+      project: environment['OPENAI_PROJECT_ID']?.trim() ?? null,
       timeout,
       maxRetries,
       defaultHeaders,
@@ -296,7 +300,7 @@ export class DefaultOpenAICompatibleProvider
       // limits must not request the whole window; users who need more set
       // max_tokens explicitly).
       const envMaxTokens = parsePositiveIntegerEnvValue(
-        process.env['QWEN_CODE_MAX_OUTPUT_TOKENS'],
+        this.cliConfig.getRuntimeEnvironment()['QWEN_CODE_MAX_OUTPUT_TOKENS'],
       );
       if (envMaxTokens !== undefined) {
         effectiveMaxTokens = isKnownModel

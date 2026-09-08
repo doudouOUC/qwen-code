@@ -331,6 +331,7 @@ export class AnthropicContentGenerator implements ContentGenerator {
     const runtimeOptions = buildRuntimeFetchOptions(
       'anthropic',
       this.cliConfig.getProxy(),
+      this.cliConfig.getRuntimeEnvironment(),
     );
 
     // IdeaLab-style Anthropic proxies expect `Authorization: Bearer <token>`
@@ -370,9 +371,11 @@ export class AnthropicContentGenerator implements ContentGenerator {
 
     this.streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(
       contentGeneratorConfig,
+      cliConfig.getRuntimeEnvironment(),
     );
     this.streamMaxLifetimeMs = resolveStreamMaxLifetimeMs(
       contentGeneratorConfig,
+      cliConfig.getRuntimeEnvironment(),
     );
   }
 
@@ -892,7 +895,7 @@ export class AnthropicContentGenerator implements ContentGenerator {
       // No explicit user config — check env var, then use the model limit
       // clipped to the flat output ceiling.
       const envMaxTokens = parsePositiveIntegerEnvValue(
-        process.env['QWEN_CODE_MAX_OUTPUT_TOKENS'],
+        this.cliConfig.getRuntimeEnvironment()['QWEN_CODE_MAX_OUTPUT_TOKENS'],
       );
       if (envMaxTokens !== undefined) {
         maxTokens = isKnownModel
