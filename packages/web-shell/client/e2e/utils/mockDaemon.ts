@@ -8,6 +8,7 @@ import {
   type DaemonChannelTypeCatalog,
   type DaemonPersistedBranchedSession,
   type DaemonEvent,
+  type DaemonManagedSessionEvent,
   type DaemonRestoredSession,
   type DaemonSession,
   type DaemonSessionArtifact,
@@ -117,7 +118,7 @@ export interface WebShellDaemonScenario {
 
 export interface MockDaemonController {
   scenario: WebShellDaemonScenario;
-  sse: SseTransport<DaemonEvent>;
+  sse: SseTransport<DaemonEvent | DaemonManagedSessionEvent>;
   requests: readonly DaemonRequestRecord[];
   sendEvent(event: DaemonEvent): Promise<void>;
   burstEvents(events: readonly DaemonEvent[]): Promise<void>;
@@ -442,7 +443,9 @@ export async function installMockDaemon(
   const baseURL = options.baseURL ?? getPlaywrightBaseURL();
   const baseOrigin = new URL(baseURL).origin;
   const requests: DaemonRequestRecord[] = [];
-  const sse = await installSseTransport<DaemonEvent>(page, { baseURL });
+  const sse = await installSseTransport<
+    DaemonEvent | DaemonManagedSessionEvent
+  >(page, { baseURL });
 
   await page.route(`${baseOrigin}/**`, async (route) => {
     const request = route.request();
