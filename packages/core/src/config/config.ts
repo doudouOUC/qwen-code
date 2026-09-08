@@ -5275,6 +5275,13 @@ export class Config {
    * @returns The bridge model selection, or `undefined`.
    */
   getDefaultVisionBridgeModel(): VisionBridgeModelSelection | undefined {
+    // Tool-only sessions return workspace data; the Gateway owns inference.
+    if (
+      this.sessionSourceType === 'managed-gateway' &&
+      this.sessionSourceId === this.getSessionId()
+    ) {
+      return undefined;
+    }
     const explicit = this.resolveVisionModelSelection();
     if (explicit) return explicit;
     const contentGeneratorConfig = this.getContentGeneratorConfig();

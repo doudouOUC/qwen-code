@@ -171,6 +171,73 @@ describe('sessionCloseDrainBudgetMs', () => {
 });
 
 describe('managed runtime tool bridge', () => {
+  it('binds every v2 operation to the issued Runtime client and live Session instance', async () => {
+    const calls: Array<{ method: string; params: Record<string, unknown> }> =
+      [];
+    const handle = makeChannel({
+      extMethodImpl: async (method, params) => {
+        calls.push({ method, params });
+        return {};
+      },
+    });
+    const bridge = makeBridge({ channelFactory: async () => handle.channel });
+    try {
+      const session = await bridge.spawnOrAttach({
+        workspaceCwd: WS_A,
+        sourceType: 'managed-gateway',
+        sourceId: SESS_A,
+      });
+      expect(() =>
+        bridge.getManagedToolV2Client(session.sessionId, {}),
+      ).toThrow(InvalidClientIdError);
+      expect(() =>
+        bridge.getManagedToolV2Client(session.sessionId, {
+          clientId: 'foreign',
+        }),
+      ).toThrow(InvalidClientIdError);
+      const client = bridge.getManagedToolV2Client(session.sessionId, {
+        clientId: session.clientId,
+      });
+      const identity = {
+        sessionId: session.sessionId,
+        promptId: 'prompt-1',
+        callId: 'call-1',
+        capabilityDigest: 'a'.repeat(64),
+        policyRevision: 'revision-1',
+      };
+      const reference = {
+        ...identity,
+        invocationId: 'invocation-1',
+        argsDigest: 'b'.repeat(64),
+      };
+      await client.manifest();
+      await client.beginTurn(identity);
+      await client.prepare(identity, 'write_file', {
+        file_path: '/scratch/proof',
+        content: 'proof',
+      });
+      await client.preflight(reference);
+      await client.execute(reference);
+      await client.status(reference, 4);
+      await client.cancel(reference);
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Execute,
+        params: { sessionId: session.sessionId, reference },
+      });
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Status,
+        params: { sessionId: session.sessionId, reference, afterSeq: 4 },
+      });
+      expect(handle.agent.promptCalls).toHaveLength(0);
+      await bridge.closeSession(session.sessionId, {
+        clientId: session.clientId,
+      });
+      expect(() => client.execute(reference)).toThrow(SessionNotFoundError);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   it('hides a Managed Runtime Session from the generic Prompt surface', async () => {
     const handle = makeChannel();
     const bridge = makeBridge({ channelFactory: async () => handle.channel });

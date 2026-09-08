@@ -12153,6 +12153,75 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
       return queue;
     },
 
+    getManagedToolV2Client(sessionId, context) {
+      const owner = byId.get(sessionId);
+      if (!owner) throw new SessionNotFoundError(sessionId);
+      const assertOwner = () => {
+        if (byId.get(sessionId) !== owner)
+          throw new SessionNotFoundError(sessionId);
+        assertManagedRuntimeToolSession(owner);
+        if (!context?.clientId) throw new InvalidClientIdError(sessionId, '');
+        resolveTrustedClientId(owner, context.clientId);
+      };
+      assertOwner();
+      const call = <T>(
+        method: string,
+        params: Record<string, unknown> = {},
+      ): Promise<T> => {
+        assertOwner();
+        return requestSessionStatus<T>(
+          sessionId,
+          method,
+          params,
+          MANAGED_RUNTIME_TOOL_TIMEOUT_MS,
+        );
+      };
+      return {
+        manifest: () =>
+          call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Manifest),
+        beginTurn: async (identity) => {
+          await call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BeginTurn, {
+            identity,
+          });
+        },
+        prepare: (identity, toolName, input) =>
+          call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Prepare, {
+            identity,
+            toolName,
+            input,
+          }),
+        confirmation: (reference) =>
+          call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Confirmation, {
+            reference,
+          }),
+        confirm: async (reference, outcome, payload, phase) => {
+          await call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Confirm, {
+            reference,
+            outcome,
+            ...(payload === undefined ? {} : { payload }),
+            ...(phase === undefined ? {} : { phase }),
+          });
+        },
+        preflight: (reference) =>
+          call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Preflight, {
+            reference,
+          }),
+        execute: (reference) =>
+          call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Execute, {
+            reference,
+          }),
+        status: (reference, afterSeq) =>
+          call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Status, {
+            reference,
+            ...(afterSeq === undefined ? {} : { afterSeq }),
+          }),
+        cancel: (reference) =>
+          call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Cancel, {
+            reference,
+          }),
+      };
+    },
+
     async getManagedRuntimeToolManifest(sessionId, context) {
       const entry = byId.get(sessionId);
       if (!entry) throw new SessionNotFoundError(sessionId);

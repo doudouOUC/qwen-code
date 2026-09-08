@@ -484,6 +484,9 @@ export interface ToolArtifact {
 }
 
 export interface ToolResult {
+  /** Physical outcome when error presence alone cannot describe execution (e.g. Shell cancellation). */
+  executionStatus?: 'not_started' | 'success' | 'error' | 'cancelled';
+
   /**
    * Content meant to be included in LLM history.
    * This should represent the factual outcome of the tool execution.

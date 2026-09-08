@@ -12,6 +12,7 @@ import type { AddressInfo } from 'node:net';
 import express from 'express';
 import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ManagedToolV2Client } from '@qwen-code/acp-bridge/bridgeTypes';
 import type { AcpSessionBridge } from './acp-session-bridge.js';
 import {
   LocalManagedRuntimeProvider,
@@ -146,6 +147,208 @@ describe('Managed Runtime providers', () => {
 
   afterEach(async () => {
     await Promise.all(servers.splice(0).map((server) => close(server)));
+  });
+
+  function toolV2Client() {
+    return {
+      manifest: vi.fn(async () => manifest),
+      beginTurn: vi.fn(async () => {}),
+      prepare: vi.fn(async () => ({})),
+      confirmation: vi.fn(async () => ({})),
+      confirm: vi.fn(async () => {}),
+      preflight: vi.fn(async () => ({})),
+      execute: vi.fn(async () => ({ executionStatus: 'success' })),
+      status: vi.fn(async () => ({ state: 'executing' })),
+      cancel: vi.fn(async () => ({ state: 'cancel_requested' })),
+    };
+  }
+
+  const invocation = {
+    sessionId: prepareRequest.sessionId,
+    promptId: 'prompt-1',
+    callId: 'call-1',
+    capabilityDigest: 'a'.repeat(64),
+    policyRevision: 'revision',
+    invocationId: 'invocation',
+    argsDigest: 'b'.repeat(64),
+  };
+
+  it('revokes issued v2 clients when the provider is disposed or its workspace is replaced', async () => {
+    for (const revoke of ['dispose', 'replace'] as const) {
+      const runtime = fakeRuntime();
+      const downstream = toolV2Client();
+      runtime.bridge.getManagedToolV2Client = vi.fn(
+        () => downstream as unknown as ManagedToolV2Client,
+      );
+      const local = new LocalManagedRuntimeProvider(runtime.registry);
+      const client = await local.getToolV2Client(prepareRequest);
+      if (revoke === 'dispose') local.dispose();
+      else
+        vi.mocked(runtime.registry.getByWorkspaceId).mockReturnValue({
+          ...runtime.registry.getByWorkspaceId(workspaceId)!,
+        });
+      await expect(client.execute(invocation)).rejects.toThrow();
+      await expect(client.status(invocation)).rejects.toThrow();
+      expect(downstream.execute).not.toHaveBeenCalled();
+      expect(downstream.status).not.toHaveBeenCalled();
+      local.dispose();
+    }
+  });
+
+  it('retains a failed release for retry, blocks admission and permits only drain queries', async () => {
+    const runtime = fakeRuntime();
+    const downstream = toolV2Client();
+    runtime.bridge.getManagedToolV2Client = vi.fn(
+      () => downstream as unknown as ManagedToolV2Client,
+    );
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const client = await local.getToolV2Client(prepareRequest);
+    let failClose!: (error: Error) => void;
+    runtime.close.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          failClose = reject;
+        }),
+    );
+    const release = local.release(prepareRequest.sessionId, prepareRequest);
+    const concurrent = local.release(prepareRequest.sessionId, prepareRequest);
+    const firstResult = release.catch((error: unknown) => error);
+    const secondResult = concurrent.catch((error: unknown) => error);
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    await expect(client.execute(invocation)).rejects.toThrow();
+    const drain = await local.getToolV2Client(prepareRequest);
+    await expect(drain.status(invocation)).resolves.toEqual({
+      state: 'executing',
+    });
+    await expect(drain.cancel(invocation)).resolves.toEqual({
+      state: 'cancel_requested',
+    });
+    await expect(drain.manifest()).rejects.toThrow();
+    expect(runtime.close).toHaveBeenCalledTimes(1);
+    const failure = new Error('close did not drain');
+    failClose(failure);
+    expect(await firstResult).toBe(failure);
+    expect(await secondResult).toBe(failure);
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).resolves.toBe(true);
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
+    await expect(client.status(invocation)).rejects.toThrow();
+    local.dispose();
+  });
+
+  it('exposes v2 only on an owned listener and forwards strictly bound calls to the issued client', async () => {
+    const runtime = fakeRuntime();
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const execute = vi.fn(async () => ({
+      executionStatus: 'success' as const,
+      result: { llmContent: 'proof', returnDisplay: 'proof' },
+    }));
+    const client = {
+      manifest: vi.fn(async () => ({
+        ...manifest,
+        policyRevision: 'generation',
+      })),
+      execute,
+      beginTurn: vi.fn(async () => {}),
+      confirm: vi.fn(async () => {}),
+    } as unknown as ManagedToolV2Client;
+    runtime.bridge.getManagedToolV2Client = vi.fn(() => client);
+    const outer = { ...prepareRequest, protocolVersion: 2 };
+    await request(workerApp(local))
+      .post('/internal/managed-runtime/v2/manifest')
+      .set('Authorization', `Bearer ${token}`)
+      .send(outer)
+      .expect(404);
+    const app = express();
+    app.use(express.json());
+    registerManagedRuntimeWorkerRoutes(app, {
+      provider: local,
+      owned: {
+        type: 'boot',
+        version: 1,
+        gatewayIncarnation: 'gateway',
+        leaseId: 'lease',
+        epoch: 2,
+        ...prepareRequest,
+        token,
+        outputRoot: '/tmp/owned',
+        cliEntry: '/tmp/cli.js',
+      },
+      authorize: (req, res, next) => {
+        if (req.headers.authorization !== `Bearer ${token}`)
+          res.sendStatus(401);
+        else next();
+      },
+    });
+    const post = (operation: string, fields: Record<string, unknown> = {}) =>
+      request(app)
+        .post(`/internal/managed-runtime/v2/${operation}`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('X-Qwen-Managed-Lease-Id', 'lease')
+        .set('X-Qwen-Managed-Lease-Epoch', '2')
+        .send({ ...outer, ...fields });
+    for (const operation of [
+      'manifest',
+      'begin-turn',
+      'prepare',
+      'confirmation',
+      'confirm',
+      'preflight',
+      'execute',
+      'status',
+      'cancel',
+    ]) {
+      await request(app)
+        .post(`/internal/managed-runtime/v2/${operation}`)
+        .send(outer)
+        .expect(401);
+      await request(app)
+        .post(`/internal/managed-runtime/v2/${operation}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send(outer)
+        .expect(409);
+      await post(operation, { tenantId: 'foreign' }).expect(409);
+    }
+    expect(runtime.bridge.getManagedToolV2Client).not.toHaveBeenCalled();
+    await post('manifest').expect(200);
+    expect(runtime.bridge.getManagedToolV2Client).toHaveBeenCalledWith(
+      prepareRequest.sessionId,
+      { clientId: 'runtime-client-p8' },
+    );
+    const identity = {
+      sessionId: prepareRequest.sessionId,
+      promptId: 'prompt-1',
+      callId: 'call-1',
+      capabilityDigest: manifest.capabilityDigest,
+      policyRevision: 'generation',
+    };
+    const reference = {
+      ...identity,
+      invocationId: 'invocation-1',
+      argsDigest: 'b'.repeat(64),
+    };
+    await post('execute', { protocolVersion: 1, reference }).expect(400);
+    await post('execute', { reference, authorized: true }).expect(400);
+    await post('execute', {
+      reference: {
+        ...reference,
+        sessionId: '550e8400-e29b-41d4-a716-446655440109',
+      },
+    }).expect(400);
+    expect(execute).not.toHaveBeenCalled();
+    const beginning = await post('begin-turn', { identity }).expect(200);
+    expect(beginning.body).toEqual({ protocolVersion: 2, result: null });
+    const result = await post('execute', { reference }).expect(200);
+    expect(result.body).toMatchObject({
+      protocolVersion: 2,
+      result: { executionStatus: 'success' },
+    });
+    expect(execute).toHaveBeenCalledExactlyOnceWith(reference);
+    expect(runtime.execute).not.toHaveBeenCalled();
+    local.dispose();
   });
 
   it('requires the immutable owned lease and scope on all private operations', async () => {
@@ -469,12 +672,143 @@ describe('Managed Runtime providers', () => {
     await expect(ready).resolves.toMatchObject({
       message: 'Managed Runtime Session released.',
     });
-    await expect(release).resolves.toBe(true);
+    await expect(release).resolves.toBe(false);
     expect(runtime.close).not.toHaveBeenCalled();
     expect(runtime.bridge.detachClient).toHaveBeenCalledWith(
       prepareRequest.sessionId,
       'foreign-client-p8',
     );
+    local.dispose();
+  });
+
+  it('retains a Session created during warmup until its failed close is retried', async () => {
+    const runtime = fakeRuntime();
+    let finishSpawn!: (
+      session: Awaited<ReturnType<AcpSessionBridge['spawnOrAttach']>>,
+    ) => void;
+    vi.mocked(runtime.bridge.spawnOrAttach).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishSpawn = resolve;
+      }),
+    );
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const ready = local
+      .prepare(prepareRequest)
+      .ready.catch((error: unknown) => error);
+    const failure = new Error('close failed after spawn');
+    runtime.close.mockRejectedValueOnce(failure);
+    const releasing = local
+      .release(prepareRequest.sessionId, prepareRequest)
+      .catch((error: unknown) => error);
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    expect(runtime.close).not.toHaveBeenCalled();
+    finishSpawn({
+      sessionId: prepareRequest.sessionId,
+      workspaceCwd,
+      attached: false,
+      clientId: 'late-client',
+      sourceType: 'managed-gateway',
+      sourceId: prepareRequest.sessionId,
+      hasActivePrompt: false,
+      sourcePersisted: true,
+    });
+    await expect(ready).resolves.toMatchObject({
+      message: 'Managed Runtime Session released.',
+    });
+    expect(await releasing).toBe(failure);
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).resolves.toBe(true);
+    expect(runtime.close).toHaveBeenCalledTimes(2);
+    expect(runtime.close).toHaveBeenLastCalledWith(prepareRequest.sessionId, {
+      clientId: 'late-client',
+    });
+    expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
+    expect(runtime.bridge.resumeSession).not.toHaveBeenCalled();
+    local.dispose();
+  });
+
+  it('does not treat a vanished Session after failed close as proof of release', async () => {
+    const runtime = fakeRuntime();
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    await local.prepare(prepareRequest).ready;
+    runtime.close
+      .mockRejectedValueOnce(new Error('transport lost'))
+      .mockRejectedValueOnce(
+        Object.assign(new Error('not found'), { code: 'session_not_found' }),
+      );
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).rejects.toThrow('transport lost');
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).rejects.toThrow('not found');
+    expect(() => local.prepare(prepareRequest)).toThrow('closing');
+    expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
+    local.dispose();
+  });
+
+  it('retains a failed cleanup of a colliding warmup attachment for retry', async () => {
+    const runtime = fakeRuntime();
+    vi.mocked(runtime.bridge.spawnOrAttach).mockResolvedValueOnce({
+      sessionId: prepareRequest.sessionId,
+      workspaceCwd,
+      attached: true,
+      clientId: 'foreign-client',
+      sourceType: 'managed-gateway',
+      sourceId: 'foreign-owner',
+    });
+    vi.mocked(runtime.bridge.detachClient).mockRejectedValueOnce(
+      new Error('detach failed'),
+    );
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    await expect(local.prepare(prepareRequest).ready).rejects.toThrow(
+      'cleanup failed',
+    );
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).rejects.toThrow('cleanup failed');
+    expect(() => local.prepare(prepareRequest)).toThrow('closing');
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).resolves.toBe(false);
+    expect(runtime.bridge.detachClient).toHaveBeenCalledTimes(2);
+    expect(runtime.close).not.toHaveBeenCalled();
+    expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
+    local.dispose();
+  });
+
+  it('retries the same attachment cleanup when restoring an untracked release', async () => {
+    const runtime = fakeRuntime();
+    vi.mocked(runtime.bridge.resumeSession).mockResolvedValueOnce({
+      sessionId: prepareRequest.sessionId,
+      workspaceCwd,
+      attached: true,
+      clientId: 'foreign-restored-client',
+      sourceType: 'managed-gateway',
+      sourceId: 'foreign-owner',
+      state: {},
+    });
+    vi.mocked(runtime.bridge.detachClient).mockRejectedValueOnce(
+      new Error('detach failed'),
+    );
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).rejects.toThrow('cleanup failed');
+    expect(() => local.prepare(prepareRequest)).toThrow('closing');
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).resolves.toBe(false);
+    expect(runtime.bridge.detachClient).toHaveBeenCalledTimes(2);
+    expect(runtime.bridge.detachClient).toHaveBeenLastCalledWith(
+      prepareRequest.sessionId,
+      'foreign-restored-client',
+    );
+    expect(runtime.bridge.resumeSession).toHaveBeenCalledTimes(1);
+    expect(runtime.bridge.spawnOrAttach).not.toHaveBeenCalled();
+    expect(runtime.close).not.toHaveBeenCalled();
     local.dispose();
   });
 

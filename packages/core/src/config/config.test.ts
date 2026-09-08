@@ -1316,6 +1316,43 @@ describe('Server Config (config.ts)', () => {
       );
     };
 
+    it.each([undefined, 'openai:vl-same-provider'])(
+      'keeps vision inference out of a Tool-only Runtime (visionModel=%s)',
+      (visionModel) => {
+        const config = new Config({ ...baseParams, visionModel });
+        stubProvider(config, [
+          {
+            id: 'vl-same-provider',
+            authType: AuthType.USE_OPENAI,
+            baseUrl: 'https://primary.example.com',
+            isVision: true,
+          },
+        ]);
+        config.setSessionSource('managed-gateway', config.getSessionId());
+
+        expect(config.getDefaultVisionBridgeModel()).toBeUndefined();
+        expect(config.getAllConfiguredModels).not.toHaveBeenCalled();
+      },
+    );
+
+    it('preserves vision selection for an Agent with a different source session', () => {
+      const config = new Config({ ...baseParams });
+      stubProvider(config, [
+        {
+          id: 'vl-same-provider',
+          authType: AuthType.USE_OPENAI,
+          baseUrl: 'https://primary.example.com',
+          isVision: true,
+        },
+      ]);
+      config.setSessionSource('managed-gateway', 'other-session');
+
+      expect(config.getDefaultVisionBridgeModel()).toEqual({
+        id: 'openai:vl-same-provider',
+        baseUrl: 'https://primary.example.com',
+      });
+    });
+
     it('keeps a bare cross-provider namesake on its exact agent route', () => {
       const config = new Config({ ...baseParams, visionModel: 'text-primary' });
       stubProvider(config, [

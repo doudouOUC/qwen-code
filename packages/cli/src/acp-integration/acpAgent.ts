@@ -148,6 +148,7 @@ import {
   listWorkflowSnapshots,
   type TurnResultRecordPayload,
   sessionIdContext,
+  type ManagedToolRuntime,
 } from '@qwen-code/qwen-code-core';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
@@ -198,6 +199,13 @@ import {
   pickAuthMethodsForAuthRequired,
 } from './authMethods.js';
 import { AcpFileSystemService } from './service/filesystem.js';
+import {
+  createManagedToolRuntimeSession,
+  dispatchManagedToolRuntimeRequest,
+  isManagedToolRuntimeDrainMethod,
+  isManagedToolRuntimeMethod,
+  parseManagedToolRuntimeSessionId,
+} from './managed-tool-runtime-session.js';
 import { bindAcpConnectionLifetime } from './acp-connection-lifetime.js';
 import { ndJsonStream } from '@qwen-code/acp-bridge/ndJsonStream';
 import {
@@ -331,6 +339,8 @@ import {
   ACP_PREFLIGHT_KINDS,
   STATUS_SCHEMA_VERSION,
   SERVE_CONTROL_EXT_METHODS,
+  PRIVATE_MANAGED_TOOL_RUNTIME_ENV,
+  PRIVATE_MANAGED_TOOL_RUNTIME_VALUE,
   SERVE_STATUS_EXT_METHODS,
   mapDomainErrorToErrorKind,
   type AcpPreflightKind,
@@ -2690,6 +2700,7 @@ export interface AcpAgentOptions {
   privateParentCapability?: string;
   externalToolGuardRequired?: boolean;
   externalToolGuardProviderAttached?: boolean;
+  ownedToolRuntime?: boolean;
 }
 
 interface AcpWorkspaceBinding {
@@ -2747,6 +2758,12 @@ export async function createAcpAgentHost(
       ? config.isSessionWriterLeaseEnabled()
       : settings.merged.experimental?.sessionWriterLease === true;
   const privateParentCapability = options.privateParentCapability;
+  const ownedToolRuntime = options.ownedToolRuntime === true;
+  if (ownedToolRuntime && privateParentCapability === undefined) {
+    throw new Error(
+      'Owned Tool Runtime requires a private managed ACP parent.',
+    );
+  }
   const externalToolGuardRequired = options?.externalToolGuardRequired === true;
   const externalToolGuardProviderAttached =
     options?.externalToolGuardProviderAttached === true;
@@ -2967,6 +2984,7 @@ export async function createAcpAgentHost(
             managedToolInvocationGuard,
             externalToolGuardProviderAttached,
             workspaceBinding,
+            ownedToolRuntime,
           );
           return agentInstance;
         }, createStream()),
@@ -2999,6 +3017,12 @@ export async function runAcpAgent(
     options === undefined
       ? process.env[PRIVATE_ACP_CAPABILITY_ENV]
       : options.privateParentCapability;
+  const ownedToolRuntime =
+    options === undefined
+      ? process.env[PRIVATE_MANAGED_TOOL_RUNTIME_ENV] ===
+        PRIVATE_MANAGED_TOOL_RUNTIME_VALUE
+      : options.ownedToolRuntime === true;
+  delete process.env[PRIVATE_MANAGED_TOOL_RUNTIME_ENV];
   delete process.env[PRIVATE_ACP_CAPABILITY_ENV];
   delete process.env[PRIVATE_EXTERNAL_TOOL_GUARD_ENV];
   delete process.env[PRIVATE_EXTERNAL_TOOL_GUARD_PROVIDER_ENV];
@@ -3110,7 +3134,7 @@ export async function runAcpAgent(
         });
         return stream;
       },
-      { ...options, privateParentCapability },
+      { ...options, privateParentCapability, ownedToolRuntime },
     );
     markAcpStartup('transportSetupEnd');
   } catch (error) {
@@ -3538,6 +3562,14 @@ async function assertManagedConversationDirectoryIdentity(
 
 class QwenAgent implements Agent {
   private sessions: Map<string, Session> = new Map();
+  private readonly managedToolRuntimes = new Map<
+    Config,
+    {
+      runtime?: ManagedToolRuntime;
+      pending: Promise<ManagedToolRuntime>;
+    }
+  >();
+  private readonly sealedManagedToolConfigs = new WeakSet<Config>();
   private readonly managedRuntimeToolExecutions = new Map<
     string,
     { sessionId: string; controller: AbortController }
@@ -3652,6 +3684,9 @@ class QwenAgent implements Agent {
 
   stopAdmission(): void {
     this.managedShuttingDown = true;
+    for (const config of this.managedToolRuntimes.keys()) {
+      this.sealManagedToolRuntime(config);
+    }
     this.activeWorkReporter?.dispose();
     this.activeWorkReporter = undefined;
     this.childHeapProbe?.stop();
@@ -3669,6 +3704,130 @@ class QwenAgent implements Agent {
     }
     if (this.managedShuttingDown) {
       throw new SessionWriterUnavailableError();
+    }
+  }
+
+  private sealManagedToolRuntime(config: Config): void {
+    this.sealedManagedToolConfigs.add(config);
+    this.managedToolRuntimes.get(config)?.runtime?.seal();
+  }
+
+  private async disposeManagedToolRuntime(config: Config): Promise<void> {
+    this.sealManagedToolRuntime(config);
+    const entry = this.managedToolRuntimes.get(config);
+    if (!entry) return;
+    let runtime: ManagedToolRuntime;
+    try {
+      runtime = await entry.pending;
+    } catch (error) {
+      this.managedToolRuntimes.delete(config);
+      throw error;
+    }
+    await runtime.dispose();
+    this.managedToolRuntimes.delete(config);
+  }
+
+  private collectSessionActiveWorkHolds(session: Session): ActiveWorkHoldV1[] {
+    const holds = [...session.collectActiveWorkHolds()];
+    const entry = this.managedToolRuntimes.get(session.getConfig());
+    if (entry && (!entry.runtime || entry.runtime.hasActiveWork())) {
+      holds.push({
+        category: 'tool',
+        id: `managed-runtime-tools:${session.getId()}`,
+      });
+    }
+    return holds;
+  }
+
+  private async dispatchManagedToolRuntime(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (!this.ownedToolRuntime || !this.isTrustedManagedParent()) {
+      throw RequestError.invalidParams(
+        undefined,
+        'Managed Tool v2 requires an owned Runtime and trusted private parent.',
+      );
+    }
+    const sessionId = parseManagedToolRuntimeSessionId(method, params);
+    const session = this.sessions.get(sessionId);
+    if (!session)
+      throw RequestError.invalidParams(
+        undefined,
+        'Managed Runtime Session not found.',
+      );
+    const config = session.getConfig();
+    assertManagedRuntimeSession(config, sessionId);
+    const draining = isManagedToolRuntimeDrainMethod(method);
+    const assertAdmission = () => {
+      this.assertManagedSessionAdmission();
+      if (
+        this.sessions.get(sessionId) !== session ||
+        this.sealedManagedToolConfigs.has(config) ||
+        !config.isTrustedFolder()
+      ) {
+        throw RequestError.invalidParams(
+          undefined,
+          'Managed Runtime Session is unavailable.',
+        );
+      }
+    };
+    if (!draining) {
+      assertAdmission();
+      await session.assertCanStartTurn();
+      assertAdmission();
+    }
+    let entry = this.managedToolRuntimes.get(config);
+    if (!entry) {
+      if (draining)
+        throw RequestError.invalidParams(
+          undefined,
+          'Managed Runtime invocation not found.',
+        );
+      const created: {
+        runtime?: ManagedToolRuntime;
+        pending: Promise<ManagedToolRuntime>;
+      } = {
+        pending: createManagedToolRuntimeSession(config)
+          .then((runtime) => {
+            created.runtime = runtime;
+            if (
+              this.sealedManagedToolConfigs.has(config) ||
+              this.managedShuttingDown
+            )
+              runtime.seal();
+            return runtime;
+          })
+          .catch((error: unknown) => {
+            this.managedToolRuntimes.delete(config);
+            throw error;
+          }),
+      };
+      this.managedToolRuntimes.set(config, created);
+      entry = created;
+    }
+    this.activeWorkReporter?.notifyChanged();
+    try {
+      const runtime = await entry.pending;
+      if (this.sessions.get(sessionId) !== session)
+        throw RequestError.invalidParams(
+          undefined,
+          'Managed Runtime Session was replaced.',
+        );
+      if (!draining) {
+        assertAdmission();
+        await session.assertCanStartTurn();
+        assertAdmission();
+      }
+      const pending = dispatchManagedToolRuntimeRequest(
+        runtime,
+        method,
+        params,
+      );
+      this.activeWorkReporter?.notifyChanged();
+      return await pending;
+    } finally {
+      await this.activeWorkReporter?.flush();
     }
   }
 
@@ -3770,27 +3929,46 @@ class QwenAgent implements Agent {
     }
 
     const configList = [...configs];
-    const writerTerminals: Array<Promise<void>> = [];
-    for (const config of configList) {
-      try {
-        writerTerminals.push(config.closeSessionWriter({ handoff: true }));
-      } catch (error) {
-        writerTerminals.push(Promise.reject(error));
+    const closeWriters = (runtimeFailures: unknown[] = []) => {
+      const writerTerminals: Array<Promise<void>> = [];
+      for (const config of configList) {
+        if (this.managedToolRuntimes.has(config)) continue;
+        try {
+          writerTerminals.push(config.closeSessionWriter({ handoff: true }));
+        } catch (error) {
+          writerTerminals.push(Promise.reject(error));
+        }
       }
-    }
-    const writerShutdown = Promise.allSettled(writerTerminals).then(
-      (results) => {
-        const failures = results.flatMap((result) =>
-          result.status === 'rejected' ? [result.reason] : [],
-        );
+      return Promise.allSettled(writerTerminals).then((results) => {
+        const failures = [
+          ...runtimeFailures,
+          ...results.flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+          ),
+        ];
         if (failures.length > 0) {
           throw new AggregateError(
             failures,
             'Managed session writer shutdown failed',
           );
         }
-      },
-    );
+      });
+    };
+    const runtimeConfigs = [...this.managedToolRuntimes.keys()];
+    const writerShutdown =
+      runtimeConfigs.length === 0
+        ? closeWriters()
+        : Promise.allSettled(
+            runtimeConfigs.map((config) =>
+              this.disposeManagedToolRuntime(config),
+            ),
+          ).then((results) =>
+            closeWriters(
+              results.flatMap((result) =>
+                result.status === 'rejected' ? [result.reason] : [],
+              ),
+            ),
+          );
     return { configs: configList, writerShutdown };
   }
 
@@ -3802,13 +3980,15 @@ class QwenAgent implements Agent {
       });
     }
     const results = await Promise.allSettled(
-      configs.map((config) =>
-        config.shutdown({
-          shutdownTelemetry: false,
-          skipSessionWriter: true,
-          strictResourceCleanup: true,
-        }),
-      ),
+      configs
+        .filter((config) => !this.managedToolRuntimes.has(config))
+        .map((config) =>
+          config.shutdown({
+            shutdownTelemetry: false,
+            skipSessionWriter: true,
+            strictResourceCleanup: true,
+          }),
+        ),
     );
     for (const result of results) {
       if (result.status === 'rejected') failures.push(result.reason);
@@ -4251,6 +4431,12 @@ class QwenAgent implements Agent {
     options: { shutdownConfig?: boolean } = {},
   ): Promise<void> {
     if (this.sessions.get(sessionId) !== session) return;
+    try {
+      await this.disposeManagedToolRuntime(session.getConfig());
+    } catch (error) {
+      cleanupErrors.push(error);
+      if (this.managedToolRuntimes.has(session.getConfig())) return;
+    }
     for (const [executionId, execution] of this.managedRuntimeToolExecutions) {
       if (execution.sessionId !== sessionId) continue;
       this.managedRuntimeToolExecutions.delete(executionId);
@@ -4481,7 +4667,7 @@ class QwenAgent implements Agent {
     // into a new hold while the drain below is in progress, so this early read
     // is an optimization rather than the final authorization.
     if (opts?.onlyIfUnheld) {
-      const holds = session.collectActiveWorkHolds();
+      const holds = this.collectSessionActiveWorkHolds(session);
       if (holds.length > 0) {
         cancelClose();
         return { closed: false, holds };
@@ -4498,7 +4684,7 @@ class QwenAgent implements Agent {
           drainTimeoutMs,
           'close',
         );
-        const holds = session.collectActiveWorkHolds();
+        const holds = this.collectSessionActiveWorkHolds(session);
         if (holds.length > 0) {
           return { closed: false, holds };
         }
@@ -4545,12 +4731,13 @@ class QwenAgent implements Agent {
           // every active turn has settled, while both the close gate and the
           // history-mutation gate still block destructive races.
           if (opts?.onlyIfUnheld) {
-            const holds = session.collectActiveWorkHolds();
+            const holds = this.collectSessionActiveWorkHolds(session);
             if (holds.length > 0) {
               return { closed: false, holds };
             }
           }
 
+          await this.disposeManagedToolRuntime(session.getConfig());
           recorder?.finalize();
           let flushError: unknown;
           try {
@@ -4659,6 +4846,7 @@ class QwenAgent implements Agent {
     private readonly managedToolInvocationGuard?: ToolInvocationGuard,
     private readonly externalToolGuardProviderAttached = false,
     private readonly workspaceBinding?: AcpWorkspaceBinding,
+    private readonly ownedToolRuntime = false,
   ) {
     const environment = workspaceBinding?.environment ?? process.env;
     // Pool kill switch via env var so operators can A/B compare or
@@ -4962,7 +5150,12 @@ class QwenAgent implements Agent {
       this.activeWorkReporter?.dispose();
       this.activeWorkReporter = new ActiveWorkReporter(
         (method, params) => this.connection.extNotification(method, params),
-        () => this.sessions.values(),
+        () =>
+          [...this.sessions.values()].map((session) => ({
+            sessionId: session.getId(),
+            collectActiveWorkHolds: () =>
+              this.collectSessionActiveWorkHolds(session),
+          })),
         activeWorkIntervalMs,
         activeWorkCategories ?? [],
       );
@@ -8462,6 +8655,9 @@ class QwenAgent implements Agent {
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    if (isManagedToolRuntimeMethod(method)) {
+      return this.dispatchManagedToolRuntime(method, params);
+    }
     const requestedCwd =
       typeof params['cwd'] === 'string' ? params['cwd'] : undefined;
     const cwd = await this.resolveRequestCwd(requestedCwd);
@@ -13749,6 +13945,7 @@ class QwenAgent implements Agent {
   }
 
   private setupFileSystem(config: Config): void {
+    if (this.ownedToolRuntime && isManagedRuntimeToolSession(config)) return;
     if (!this.clientCapabilities?.fs) return;
 
     const acpFileSystemService = new AcpFileSystemService(

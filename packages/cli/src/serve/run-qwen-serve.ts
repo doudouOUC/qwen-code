@@ -51,6 +51,10 @@ import {
   normalizeMaxJournalEvents,
   type JournalGrowthSessionLimit,
 } from '@qwen-code/acp-bridge/replayWindowLimits';
+import {
+  PRIVATE_MANAGED_TOOL_RUNTIME_ENV,
+  PRIVATE_MANAGED_TOOL_RUNTIME_VALUE,
+} from '@qwen-code/acp-bridge/status';
 import type { BridgeEvent } from '@qwen-code/acp-bridge/eventBus';
 import { resolveSessionRestoreTimeoutMs } from '@qwen-code/acp-bridge/sessionRestoreTimeout';
 import type { NdJsonMessageObservation } from '@qwen-code/acp-bridge/ndJsonStream';
@@ -4269,6 +4273,9 @@ async function runQwenServeImpl(
     externalToolGuardHandler,
   );
   const childEnvOverrides: Record<string, string | undefined> = {
+    [PRIVATE_MANAGED_TOOL_RUNTIME_ENV]: deps.ownedManagedRuntime
+      ? PRIVATE_MANAGED_TOOL_RUNTIME_VALUE
+      : undefined,
     QWEN_SERVE_MCP_CLIENT_BUDGET:
       opts.mcpClientBudget !== undefined
         ? String(opts.mcpClientBudget)
@@ -10014,7 +10021,7 @@ async function runQwenServeImpl(
             if (
               deps.ownedManagedRuntime &&
               (req.method !== 'POST' ||
-                !/^\/internal\/managed-runtime\/v1\/(prepare|manifest|execute|cancel|release)$/.test(
+                !/^\/internal\/managed-runtime\/(v1\/(prepare|manifest|execute|cancel|release)|v2\/(manifest|begin-turn|prepare|confirmation|confirm|preflight|execute|status|cancel))$/.test(
                   req.url ?? '',
                 ))
             ) {

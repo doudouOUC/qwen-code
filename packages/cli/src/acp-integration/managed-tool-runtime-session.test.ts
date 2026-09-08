@@ -1,0 +1,230 @@
+/**
+ * @license
+ * Copyright 2026 Qwen Team
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { describe, expect, it, vi } from 'vitest';
+import {
+  ToolConfirmationOutcome,
+  type ManagedToolCallIdentity,
+  type ManagedToolInvocationReference,
+} from '@qwen-code/qwen-code-core';
+import type { ManagedToolV2Client } from '@qwen-code/acp-bridge/bridgeTypes';
+import { SERVE_CONTROL_EXT_METHODS as methods } from '@qwen-code/acp-bridge/status';
+import {
+  dispatchManagedToolRuntimeRequest,
+  parseManagedToolRuntimeSessionId,
+} from './managed-tool-runtime-session.js';
+
+const sessionId = '01a05708-a79d-4a02-8b79-02c4120eb054';
+const identity: ManagedToolCallIdentity = {
+  sessionId,
+  promptId: 'prompt-1',
+  callId: 'call-1',
+  capabilityDigest: 'a'.repeat(64),
+  policyRevision: 'policy-1',
+};
+const reference: ManagedToolInvocationReference = {
+  ...identity,
+  invocationId: 'invocation-1',
+  argsDigest: 'b'.repeat(64),
+};
+
+function makeClient() {
+  const status = {
+    state: 'prepared' as const,
+    cancelRequested: false,
+    lastSeq: 0,
+    firstAvailableSeq: 1,
+    progressGap: false,
+    progress: [],
+  };
+  return {
+    manifest: vi.fn<ManagedToolV2Client['manifest']>().mockResolvedValue({
+      tools: [],
+      capabilityDigest: identity.capabilityDigest,
+      policyRevision: identity.policyRevision,
+    }),
+    beginTurn: vi
+      .fn<ManagedToolV2Client['beginTurn']>()
+      .mockResolvedValue(undefined),
+    prepare: vi.fn<ManagedToolV2Client['prepare']>().mockResolvedValue({
+      ...reference,
+      params: { command: 'pwd' },
+      description: 'pwd',
+      locations: [],
+      defaultPermission: 'ask',
+      requiresUserInteraction: false,
+    }),
+    confirmation: vi
+      .fn<ManagedToolV2Client['confirmation']>()
+      .mockResolvedValue({
+        type: 'exec',
+        title: 'Run command',
+        command: 'pwd',
+        rootCommand: 'pwd',
+      }),
+    confirm: vi
+      .fn<ManagedToolV2Client['confirm']>()
+      .mockResolvedValue(undefined),
+    preflight: vi
+      .fn<ManagedToolV2Client['preflight']>()
+      .mockResolvedValue({ shouldProceed: true }),
+    execute: vi
+      .fn<ManagedToolV2Client['execute']>()
+      .mockResolvedValue({ executionStatus: 'success' }),
+    status: vi.fn<ManagedToolV2Client['status']>().mockResolvedValue(status),
+    cancel: vi
+      .fn<ManagedToolV2Client['cancel']>()
+      .mockResolvedValue({ ...status, cancelRequested: true }),
+  };
+}
+
+describe('managed tool Runtime ACP request dispatch', () => {
+  it('awaits asynchronous clients and preserves all nine operation results', async () => {
+    const client = makeClient();
+    const dispatch = (method: string, fields = {}) =>
+      dispatchManagedToolRuntimeRequest(client, method, {
+        sessionId,
+        ...fields,
+      });
+    await expect(
+      dispatch(methods.sessionManagedToolV2Manifest),
+    ).resolves.toMatchObject({ policyRevision: 'policy-1' });
+    await expect(
+      dispatch(methods.sessionManagedToolV2BeginTurn, { identity }),
+    ).resolves.toEqual({ started: true });
+    await expect(
+      dispatch(methods.sessionManagedToolV2Prepare, {
+        identity,
+        toolName: 'run_shell_command',
+        input: { command: 'pwd' },
+      }),
+    ).resolves.toMatchObject(reference);
+    await expect(
+      dispatch(methods.sessionManagedToolV2Confirmation, { reference }),
+    ).resolves.toMatchObject({ type: 'exec' });
+    await expect(
+      dispatch(methods.sessionManagedToolV2Confirm, {
+        reference,
+        outcome: ToolConfirmationOutcome.ProceedOnce,
+        phase: 'preflight',
+        payload: { cancelMessage: 'reason' },
+      }),
+    ).resolves.toEqual({ confirmed: true });
+    expect(client.confirm).toHaveBeenCalledWith(
+      reference,
+      ToolConfirmationOutcome.ProceedOnce,
+      { cancelMessage: 'reason' },
+      'preflight',
+    );
+    await expect(
+      dispatch(methods.sessionManagedToolV2Preflight, { reference }),
+    ).resolves.toEqual({ shouldProceed: true });
+    await expect(
+      dispatch(methods.sessionManagedToolV2Execute, { reference }),
+    ).resolves.toEqual({ executionStatus: 'success' });
+    await expect(
+      dispatch(methods.sessionManagedToolV2Status, { reference, afterSeq: 7 }),
+    ).resolves.toMatchObject({ state: 'prepared' });
+    expect(client.status).toHaveBeenCalledWith(reference, 7);
+    await expect(
+      dispatch(methods.sessionManagedToolV2Cancel, { reference }),
+    ).resolves.toMatchObject({ cancelRequested: true });
+  });
+
+  it.each([
+    [
+      methods.sessionManagedToolV2Execute,
+      {
+        reference: {
+          ...reference,
+          sessionId: '11a05708-a79d-4a02-8b79-02c4120eb054',
+        },
+      },
+    ],
+    [
+      methods.sessionManagedToolV2Execute,
+      { reference: { ...reference, extra: true } },
+    ],
+    [
+      methods.sessionManagedToolV2Prepare,
+      {
+        identity: { ...identity, extra: true },
+        toolName: 'read_file',
+        input: {},
+      },
+    ],
+    [
+      methods.sessionManagedToolV2Prepare,
+      { identity, toolName: 'read_file', input: [] },
+    ],
+    [methods.sessionManagedToolV2Confirm, { reference, outcome: 'unknown' }],
+    [
+      methods.sessionManagedToolV2Confirm,
+      { reference, outcome: ToolConfirmationOutcome.ProceedOnce, phase: null },
+    ],
+    [
+      methods.sessionManagedToolV2Confirm,
+      {
+        reference,
+        outcome: ToolConfirmationOutcome.ProceedOnce,
+        payload: { extra: true },
+      },
+    ],
+    [methods.sessionManagedToolV2Status, { reference, afterSeq: null }],
+    [methods.sessionManagedToolV2Status, { reference, afterSeq: -1 }],
+    [methods.sessionManagedToolV2Status, { reference, afterSeq: 0.1 }],
+    [methods.sessionManagedToolV2Manifest, { cwd: '/other/workspace' }],
+  ])(
+    'rejects malformed %s before calling the service',
+    async (method, fields) => {
+      const client = makeClient();
+      await expect(
+        dispatchManagedToolRuntimeRequest(client, method, {
+          sessionId,
+          ...fields,
+        }),
+      ).rejects.toThrow();
+      for (const operation of Object.values(client))
+        expect(operation).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([true, 'true', null, 0])(
+    'rejects background Shell value %s',
+    async (is_background) => {
+      const client = makeClient();
+      await expect(
+        dispatchManagedToolRuntimeRequest(
+          client,
+          methods.sessionManagedToolV2Prepare,
+          {
+            sessionId,
+            identity,
+            toolName: 'run_shell_command',
+            input: { command: 'sleep 10', is_background },
+          },
+        ),
+      ).rejects.toThrow('foreground Shell');
+      expect(client.prepare).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects noncanonical Session IDs and non-JSON data', () => {
+    expect(() =>
+      parseManagedToolRuntimeSessionId(methods.sessionManagedToolV2Manifest, {
+        sessionId: sessionId.toUpperCase(),
+      }),
+    ).toThrow();
+    expect(() =>
+      parseManagedToolRuntimeSessionId(methods.sessionManagedToolV2Prepare, {
+        sessionId,
+        identity,
+        toolName: 'read_file',
+        input: { path: undefined },
+      }),
+    ).toThrow();
+  });
+});

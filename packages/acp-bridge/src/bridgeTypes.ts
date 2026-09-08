@@ -6,6 +6,7 @@
 
 import type {
   ApprovalMode,
+  ManagedToolRuntime,
   GoalControlRequest,
   GoalSnapshotV2,
   GoalStateResponse,
@@ -129,6 +130,21 @@ export interface BridgeManagedRuntimeToolExecuteResult {
   executionStatus?: 'not_started' | 'success' | 'error' | 'cancelled';
   error?: { message: string; type?: string };
 }
+
+export type ManagedToolV2Client = {
+  [K in
+    | 'manifest'
+    | 'beginTurn'
+    | 'prepare'
+    | 'confirmation'
+    | 'confirm'
+    | 'preflight'
+    | 'execute'
+    | 'status'
+    | 'cancel']: (
+    ...args: Parameters<ManagedToolRuntime[K]>
+  ) => Promise<Awaited<ReturnType<ManagedToolRuntime[K]>>>;
+};
 
 export interface RewindRequest {
   promptId: string;
@@ -345,7 +361,8 @@ export type ActiveWorkHoldCategory =
   | 'agent'
   | 'notification'
   | 'shell'
-  | 'workflow';
+  | 'workflow'
+  | 'tool';
 
 /** Categories understood by active-work v1 before category negotiation was
  * added to the daemon's initialize request. */
@@ -357,6 +374,7 @@ export const ACTIVE_WORK_HOLD_CATEGORIES: readonly ActiveWorkHoldCategory[] = [
   'notification',
   'shell',
   'workflow',
+  'tool',
 ];
 
 export interface ActiveWorkHeartbeatCapabilityV1 {
@@ -1485,6 +1503,12 @@ export interface AcpSessionBridge extends WorkspaceEventBridge {
     signal?: AbortSignal,
     context?: BridgeClientRequestContext,
   ): Promise<PromptResponse>;
+
+  /** Private owned-worker transport; the caller must hold the Runtime client id. */
+  getManagedToolV2Client(
+    sessionId: string,
+    context: BridgeClientRequestContext,
+  ): ManagedToolV2Client;
 
   /** Read the safe Tool-only capability set pinned by a Managed Runtime. */
   getManagedRuntimeToolManifest(

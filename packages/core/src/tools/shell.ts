@@ -1805,46 +1805,27 @@ export class ShellToolInvocation extends BaseToolInvocation<
       };
     }
     return {
+      executionStatus: 'cancelled',
       llmContent: 'Command was cancelled by user before it could complete.',
       returnDisplay: 'Command cancelled by user.',
     };
   }
 
-  private waitForSedOperation<T>(
+  private async waitForSedOperation<T>(
     operation: () => Promise<T>,
     signal: AbortSignal,
   ): Promise<T> {
-    if (signal.aborted) {
-      return Promise.reject(new SedEditCancelledError());
+    if (signal.aborted) throw new SedEditCancelledError();
+    try {
+      // Filesystem reads and checkpoint writes cannot be aborted. Retain their
+      // ownership until they finish, then honor cancellation before target I/O.
+      const result = await operation();
+      if (signal.aborted) throw new SedEditCancelledError();
+      return result;
+    } catch (error) {
+      if (signal.aborted) throw new SedEditCancelledError();
+      throw error;
     }
-
-    return new Promise<T>((resolve, reject) => {
-      const onAbort = () => {
-        reject(new SedEditCancelledError());
-      };
-      const removeAbortListener = () => {
-        signal.removeEventListener('abort', onAbort);
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-      let operationPromise: Promise<T>;
-      try {
-        operationPromise = operation();
-      } catch (err) {
-        removeAbortListener();
-        reject(err);
-        return;
-      }
-      operationPromise.then(
-        (value) => {
-          removeAbortListener();
-          resolve(value);
-        },
-        (err: unknown) => {
-          removeAbortListener();
-          reject(err);
-        },
-      );
-    });
   }
 
   private async executeSedEdit(
@@ -2217,6 +2198,7 @@ export class ShellToolInvocation extends BaseToolInvocation<
 
     if (signal.aborted) {
       return {
+        executionStatus: 'not_started',
         llmContent: 'Command was cancelled by user before it could start.',
         returnDisplay: 'Command cancelled by user.',
       };
@@ -3050,6 +3032,11 @@ export class ShellToolInvocation extends BaseToolInvocation<
       returnDisplay: returnDisplayMessage,
       ...(persistedOutputFiles !== undefined ? { persistedOutputFiles } : {}),
       ...executionError,
+      ...(result.executionMethod === 'none'
+        ? { executionStatus: 'not_started' as const }
+        : result.aborted && !timeoutSummary
+          ? { executionStatus: 'cancelled' as const }
+          : {}),
     };
   }
 

@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { SERVE_CONTROL_EXT_METHODS } from '@qwen-code/acp-bridge/status';
+import { dispatchManagedToolRuntimeRequest } from '../../acp-integration/managed-tool-runtime-session.js';
 import {
   MANAGED_LEASE_ID_HEADER,
   MANAGED_LEASE_EPOCH_HEADER,
@@ -103,6 +105,72 @@ export function registerManagedRuntimeWorkerRoutes(
       }
       next();
     });
+  if (deps.owned && deps.provider.getToolV2Client) {
+    const operations = {
+      manifest: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Manifest,
+      'begin-turn': SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BeginTurn,
+      prepare: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Prepare,
+      confirmation: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Confirmation,
+      confirm: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Confirm,
+      preflight: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Preflight,
+      execute: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Execute,
+      status: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Status,
+      cancel: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Cancel,
+    };
+    for (const [operation, method] of Object.entries(operations)) {
+      app.post(
+        `/internal/managed-runtime/v2/${operation}`,
+        authorize,
+        async (req, res) => {
+          try {
+            const body: unknown = req.body;
+            if (!body || typeof body !== 'object' || Array.isArray(body))
+              throw new ManagedRuntimeProtocolError();
+            const {
+              protocolVersion,
+              tenantId,
+              workspaceId,
+              workspaceCwd,
+              sessionId,
+              turnKind,
+              ...params
+            } = body as Record<string, unknown>;
+            if (protocolVersion !== 2) throw new ManagedRuntimeProtocolError();
+            const request = parseManagedRuntimePrepareRequest({
+              protocolVersion: 1,
+              tenantId,
+              workspaceId,
+              workspaceCwd,
+              sessionId,
+              turnKind,
+            });
+            const client = await deps.provider.getToolV2Client!(request);
+            const result = await dispatchManagedToolRuntimeRequest(
+              client,
+              method,
+              { ...params, sessionId: request.sessionId },
+            );
+            res.status(200).json({
+              protocolVersion: 2,
+              result:
+                operation === 'begin-turn' || operation === 'confirm'
+                  ? null
+                  : result,
+            });
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              'code' in error &&
+              error.code === 'managed_tool_invalid_request'
+            ) {
+              sendError(res, new ManagedRuntimeProtocolError());
+            } else sendError(res, error);
+          }
+        },
+      );
+    }
+  }
+
   app.post(
     `${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`,
     authorize,

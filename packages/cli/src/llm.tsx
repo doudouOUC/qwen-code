@@ -28,6 +28,10 @@ import {
   PRIVATE_EXTERNAL_TOOL_GUARD_ENV,
   PRIVATE_EXTERNAL_TOOL_GUARD_PROVIDER_ENV,
 } from '@qwen-code/acp-bridge/externalToolGuard';
+import {
+  PRIVATE_MANAGED_TOOL_RUNTIME_ENV,
+  PRIVATE_MANAGED_TOOL_RUNTIME_VALUE,
+} from '@qwen-code/acp-bridge/status';
 import dns from 'node:dns';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -384,6 +388,10 @@ export async function main() {
       ? EXTERNAL_TOOL_GUARD_PROVIDER_ATTACHED_VALUE
       : undefined;
   delete process.env[PRIVATE_EXTERNAL_TOOL_GUARD_PROVIDER_ENV];
+  const privateOwnedToolRuntime =
+    process.env[PRIVATE_MANAGED_TOOL_RUNTIME_ENV] ===
+    PRIVATE_MANAGED_TOOL_RUNTIME_VALUE;
+  delete process.env[PRIVATE_MANAGED_TOOL_RUNTIME_ENV];
 
   if (process.argv.includes('--bare')) {
     process.env[QWEN_CODE_SIMPLE_ENV_VAR] = '1';
@@ -407,6 +415,10 @@ export async function main() {
     isAcpMode && privateAcpParentCapability !== undefined
       ? {
           [PRIVATE_ACP_CAPABILITY_ENV]: privateAcpParentCapability,
+          // Override any marker reintroduced by workspace settings before relaunch.
+          [PRIVATE_MANAGED_TOOL_RUNTIME_ENV]: privateOwnedToolRuntime
+            ? PRIVATE_MANAGED_TOOL_RUNTIME_VALUE
+            : '',
           ...(privateExternalToolGuard
             ? {
                 [PRIVATE_EXTERNAL_TOOL_GUARD_ENV]: privateExternalToolGuard,
@@ -1086,6 +1098,10 @@ export async function main() {
       markAcpStartup('acpImportEnd');
       try {
         await runAcpAgent(config, settings, argv, {
+          ownedToolRuntime:
+            isAcpMode === true &&
+            privateAcpParentCapability !== undefined &&
+            privateOwnedToolRuntime,
           privateParentCapability: isAcpMode
             ? privateAcpParentCapability
             : undefined,
