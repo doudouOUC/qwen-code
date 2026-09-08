@@ -28,6 +28,7 @@ import {
   ToolConfirmationOutcome,
 } from './tools.js';
 import { ToolErrorType } from './tool-error.js';
+import { createManagedToolEditParams } from './managed-tool-edit-params.js';
 import {
   FileEncoding,
   needsUtf8Bom,
@@ -915,15 +916,13 @@ The user has the ability to modify \`content\`. If modified, this will be stated
         _oldContent: string,
         modifiedProposedContent: string,
         originalParams: WriteFileToolParams,
-      ) => {
-        const content = originalParams.content;
-        return {
-          ...originalParams,
-          ai_proposed_content: content,
-          content: modifiedProposedContent,
-          modified_by_user: true,
-        };
-      },
+      ) =>
+        createManagedToolEditParams(
+          WriteFileTool.Name,
+          originalParams,
+          _oldContent,
+          modifiedProposedContent,
+        ),
     };
   }
 }

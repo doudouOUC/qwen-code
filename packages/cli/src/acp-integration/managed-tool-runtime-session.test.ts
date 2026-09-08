@@ -56,6 +56,7 @@ function makeClient() {
       locations: [],
       defaultPermission: 'ask',
       requiresUserInteraction: false,
+      toolUseId: 'toolu_test',
     }),
     confirmation: vi
       .fn<ManagedToolV2Client['confirmation']>()

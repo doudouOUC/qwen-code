@@ -38,6 +38,21 @@ import {
 
 export type ManagedToolConfirmationPhase = 'permission' | 'preflight';
 
+export type ManagedToolV2Client = {
+  [K in
+    | 'manifest'
+    | 'beginTurn'
+    | 'prepare'
+    | 'confirmation'
+    | 'confirm'
+    | 'preflight'
+    | 'execute'
+    | 'status'
+    | 'cancel']: (
+    ...args: Parameters<ManagedToolRuntime[K]>
+  ) => Promise<Awaited<ReturnType<ManagedToolRuntime[K]>>>;
+};
+
 export interface ManagedToolExecutionResult {
   executionStatus: 'not_started' | 'success' | 'error' | 'cancelled';
   result?: ToolResult;
@@ -128,6 +143,21 @@ export class ManagedToolRuntime {
         kind: tool.kind,
         schema: tool.schema,
         canUpdateOutput: tool.canUpdateOutput,
+        isOutputMarkdown: tool.isOutputMarkdown,
+        shouldDefer: tool.shouldDefer,
+        alwaysLoad: tool.alwaysLoad,
+        ...(tool.searchHint === undefined
+          ? {}
+          : { searchHint: tool.searchHint }),
+        ...(tool.maxOutputChars === undefined
+          ? {}
+          : {
+              maxOutputChars:
+                tool.maxOutputChars === Infinity
+                  ? ('unlimited' as const)
+                  : tool.maxOutputChars,
+            }),
+        truncateKeep: tool.truncateKeep,
       }),
     );
     return {
@@ -292,13 +322,14 @@ export class ManagedToolRuntime {
       invocationId: randomUUID(),
       argsDigest: managedToolDigest(invocation.params),
     };
+    const toolUseId = generateToolUseId();
     const entry: Entry = {
       reference,
       inputDigest,
       tool,
       invocation,
       controller: new AbortController(),
-      toolUseId: generateToolUseId(),
+      toolUseId,
       prepared: {
         ...reference,
         params: structuredClone(invocation.params) as Record<string, unknown>,
@@ -307,6 +338,7 @@ export class ManagedToolRuntime {
         defaultPermission,
         requiresUserInteraction:
           invocation.requiresUserInteraction?.() ?? false,
+        toolUseId,
       },
       decisions: new Map(),
       hookConfirmed: false,

@@ -28663,6 +28663,737 @@ describe('Session', () => {
       );
     }
 
+    describe('managed invocation lifecycle', () => {
+      function managedTool(params: Record<string, unknown> = {}) {
+        const events: string[] = [];
+        let prepared = false;
+        let authorized = false;
+        const managed = {
+          prepare: vi.fn(async () => {
+            events.push('prepare');
+            prepared = true;
+          }),
+          preflight: vi.fn(async () => {
+            events.push('preflight');
+            return { shouldProceed: true } as core.PreToolUseHookResult;
+          }),
+          confirmPreflight: vi.fn(async () => {}),
+          authorize: vi.fn(() => {
+            events.push('authorize');
+            authorized = true;
+          }),
+          cancelAndDrain: vi.fn(async () => {
+            events.push('drain');
+          }),
+          toolUseId: 'runtime-tool-use-id',
+          result: undefined as core.ManagedToolExecutionResult | undefined,
+        };
+        const onConfirm = vi.fn(
+          async (
+            _outcome: core.ToolConfirmationOutcome,
+            _payload?: core.ToolConfirmationPayload,
+          ) => {},
+        );
+        const invocation = {
+          get params() {
+            if (!prepared) throw new Error('params before prepare');
+            return params;
+          },
+          managed,
+          getDefaultPermission: vi.fn(async () => {
+            if (!prepared) throw new Error('permission before prepare');
+            events.push('permission');
+            return 'allow' as core.PermissionDecision;
+          }),
+          getConfirmationDetails: vi.fn(async () => ({
+            type: 'info' as const,
+            title: 'Remote confirmation',
+            prompt: 'Allow remote tool?',
+            onConfirm,
+          })),
+          getDescription: () => {
+            if (!prepared) throw new Error('description before prepare');
+            return 'Remote tool';
+          },
+          toolLocations: () => {
+            if (!prepared) throw new Error('locations before prepare');
+            return [{ path: '/remote/workspace/file.txt' }];
+          },
+          execute: vi.fn(async () => {
+            if (!authorized) throw new Error('execute without authorization');
+            events.push('execute');
+            managed.result ??= { executionStatus: 'success' };
+            return {
+              llmContent: 'remote output',
+              returnDisplay: 'remote output',
+            };
+          }),
+        };
+        const tool = {
+          name: 'remote_tool',
+          kind: core.Kind.Read,
+          description: 'Remote tool',
+          displayName: 'Remote tool',
+          build: vi.fn(() => invocation),
+          canUpdateOutput: false,
+          isOutputMarkdown: false,
+        };
+        return { tool, invocation, managed, events, onConfirm };
+      }
+
+      beforeEach(() => {
+        mockConfig.getApprovalMode = vi.fn().mockReturnValue(ApprovalMode.YOLO);
+        mockConfig.getDisableAllHooks = vi.fn().mockReturnValue(true);
+        mockConfig.getPermissionManager = vi.fn().mockReturnValue(null);
+      });
+
+      const run = (signal = new AbortController().signal) =>
+        (session as unknown as ToolCallInternals).runToolCalls(
+          signal,
+          'managed-prompt',
+          [{ id: 'managed-call', name: 'remote_tool', args: {} }],
+        );
+
+      it('prepares before permission, runs preflight before guard and authorizes execution', async () => {
+        const remote = managedTool({ path: '/normalized/remote.txt' });
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        mockConfig.getToolInvocationGuard = vi.fn().mockReturnValue(
+          vi.fn(async () => {
+            remote.events.push('guard');
+            return { allowed: true };
+          }),
+        );
+        const result = await run();
+        expect(remote.managed.prepare).toHaveBeenCalledWith(
+          expect.any(AbortSignal),
+          { callId: 'managed-call', promptId: 'managed-prompt' },
+        );
+        expect(remote.events).toEqual([
+          'prepare',
+          'permission',
+          'preflight',
+          'guard',
+          'authorize',
+          'execute',
+          'drain',
+        ]);
+        expect(result.parts[0].functionResponse?.response).toEqual({
+          output: 'remote output',
+        });
+        expect(remote.tool.build).toHaveBeenCalledTimes(1);
+        expect(mockClient.sessionUpdate).toHaveBeenCalledWith(
+          expect.objectContaining({
+            update: expect.objectContaining({
+              title: 'Remote tool: Remote tool',
+              locations: [{ path: '/remote/workspace/file.txt', line: null }],
+            }),
+          }),
+        );
+      });
+
+      it.each([undefined, { answer: 'accepted' }])(
+        'sends a strict JSON confirmation payload for allow_once with answers %j',
+        async (answers) => {
+          const remote = managedTool();
+          remote.invocation.getDefaultPermission.mockResolvedValue('ask');
+          remote.onConfirm.mockImplementation(async (outcome, payload) => {
+            core.managedToolDigest({
+              outcome,
+              ...(payload === undefined ? {} : { payload }),
+            });
+          });
+          mockToolRegistry.getTool.mockReturnValue(remote.tool);
+          mockConfig.getApprovalMode = vi
+            .fn()
+            .mockReturnValue(ApprovalMode.DEFAULT);
+          vi.mocked(mockClient.requestPermission).mockImplementationOnce(
+            async ({ options }) => ({
+              outcome: {
+                outcome: 'selected',
+                optionId: options.find(
+                  (option: PermissionOption) => option.kind === 'allow_once',
+                )!.optionId,
+              },
+              ...(answers === undefined ? {} : { answers }),
+            }),
+          );
+          const result = await run();
+          expect(remote.onConfirm).toHaveBeenCalledExactlyOnceWith(
+            core.ToolConfirmationOutcome.ProceedOnce,
+            answers === undefined ? undefined : { answers },
+          );
+          expect(remote.invocation.execute).toHaveBeenCalledTimes(1);
+          expect(result.parts[0].functionResponse?.response).toEqual({
+            output: 'remote output',
+          });
+        },
+      );
+
+      it('waits for remote drain after permission denial before completing the batch', async () => {
+        const remote = managedTool();
+        remote.invocation.getDefaultPermission.mockResolvedValue('deny');
+        let finishDrain!: () => void;
+        remote.managed.cancelAndDrain.mockReturnValue(
+          new Promise<void>((resolve) => {
+            finishDrain = resolve;
+          }),
+        );
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        let settled = false;
+        const pending = run().then((result) => {
+          settled = true;
+          return result;
+        });
+        await vi.waitFor(() =>
+          expect(remote.managed.cancelAndDrain).toHaveBeenCalled(),
+        );
+        expect(settled).toBe(false);
+        expect(remote.invocation.execute).not.toHaveBeenCalled();
+        finishDrain();
+        await pending;
+      });
+
+      it('keeps a remote PreToolUse ask blocked and does not run Gateway tool hooks', async () => {
+        const remote = managedTool();
+        remote.managed.preflight.mockResolvedValue({
+          shouldProceed: false,
+          blockType: 'ask',
+        });
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const preHook = vi.spyOn(core, 'firePreToolUseHook');
+        const failureHook = vi.spyOn(core, 'firePostToolUseFailureHook');
+        mockConfig.getDisableAllHooks = vi.fn().mockReturnValue(false);
+        mockConfig.getMessageBus = vi.fn().mockReturnValue({});
+        const result = await run();
+        expect(result.parts[0].functionResponse?.response).toEqual({
+          error: 'Blocked by PreToolUse hook',
+        });
+        expect(remote.managed.authorize).not.toHaveBeenCalled();
+        expect(remote.invocation.execute).not.toHaveBeenCalled();
+        expect(preHook).not.toHaveBeenCalled();
+        expect(failureHook).not.toHaveBeenCalled();
+        expect(remote.managed.cancelAndDrain).toHaveBeenCalled();
+      });
+
+      it('preserves remote cancellation without a local abort or ToolResult error', async () => {
+        const remote = managedTool();
+        remote.managed.result = { executionStatus: 'cancelled' };
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const result = await run();
+        expect(result.parts[0].functionResponse?.response).toEqual({
+          error: 'Tool execution was cancelled.',
+        });
+        expect(mockClient.sessionUpdate).toHaveBeenCalledWith(
+          expect.objectContaining({
+            update: expect.objectContaining({
+              status: 'failed',
+              content: [
+                {
+                  type: 'content',
+                  content: {
+                    type: 'text',
+                    text: 'Tool execution was cancelled.',
+                  },
+                },
+              ],
+            }),
+          }),
+        );
+        expect(mockChatRecordingService.recordToolResult).toHaveBeenCalledWith(
+          result.parts,
+          expect.objectContaining({
+            status: 'cancelled',
+            executionStatus: 'cancelled',
+          }),
+        );
+      });
+
+      it('consumes the remote post hook response without firing it again', async () => {
+        const remote = managedTool();
+        remote.managed.result = {
+          executionStatus: 'success',
+          postHook: {
+            shouldStop: false,
+            additionalContext: 'remote hook context',
+          },
+        };
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const postHook = vi.spyOn(core, 'firePostToolUseHook');
+        const result = await run();
+        expect(result.parts).toContainEqual({ text: 'remote hook context' });
+        expect(postHook).not.toHaveBeenCalled();
+      });
+
+      it('preserves the remote post hook stop receipt and physical success', async () => {
+        const remote = managedTool();
+        const artifacts: core.ToolArtifact[] = [
+          {
+            kind: 'file',
+            title: 'Stopped hook evidence',
+            workspacePath: 'stopped-evidence.txt',
+          },
+        ];
+        remote.invocation.execute.mockImplementation(async () => {
+          remote.managed.result = {
+            executionStatus: 'success',
+            postHook: {
+              shouldStop: true,
+              stopReason: 'remote hook stopped output',
+              additionalContext: 'remote stop context',
+              artifacts,
+            },
+          };
+          return { llmContent: 'written', returnDisplay: 'written' };
+        });
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const postHook = vi.spyOn(core, 'firePostToolUseHook');
+        const failureHook = vi.spyOn(core, 'firePostToolUseFailureHook');
+        const result = await run();
+        expect(result.parts[0].functionResponse?.response).toEqual({
+          error: 'remote hook stopped output',
+        });
+        expect(result.parts).toContainEqual({ text: 'remote stop context' });
+        expect(mockClient.extNotification).toHaveBeenCalledWith(
+          'qwen/notify/session/artifact-event',
+          expect.objectContaining({
+            hookEventName: 'PostToolUse',
+            artifacts,
+          }),
+        );
+        expect(postHook).not.toHaveBeenCalled();
+        expect(failureHook).not.toHaveBeenCalled();
+        expect(mockChatRecordingService.recordToolResult).toHaveBeenCalledWith(
+          expect.arrayContaining([{ text: 'remote stop context' }]),
+          expect.objectContaining({
+            status: 'error',
+            executionStatus: 'success',
+            artifacts,
+          }),
+        );
+        expect(remote.managed.cancelAndDrain).toHaveBeenCalledTimes(1);
+      });
+
+      it('rebuilds and reevaluates permissions after a permission hook changes arguments', async () => {
+        const initial = managedTool({ path: '/original' });
+        const changed = managedTool({ path: '/changed' });
+        initial.invocation.getDefaultPermission.mockResolvedValue('ask');
+        changed.invocation.getDefaultPermission.mockResolvedValue('deny');
+        initial.tool.build
+          .mockReturnValueOnce(initial.invocation)
+          .mockReturnValueOnce(changed.invocation);
+        mockToolRegistry.getTool.mockReturnValue(initial.tool);
+        mockConfig.getApprovalMode = vi
+          .fn()
+          .mockReturnValue(ApprovalMode.DEFAULT);
+        mockConfig.getDisableAllHooks = vi.fn().mockReturnValue(false);
+        mockConfig.getMessageBus = vi.fn().mockReturnValue({});
+        vi.spyOn(core, 'firePermissionRequestHook').mockResolvedValueOnce({
+          hasDecision: true,
+          shouldAllow: true,
+          updatedInput: { path: '/changed' },
+        });
+        await run();
+        expect(initial.managed.cancelAndDrain).toHaveBeenCalled();
+        expect(initial.tool.build).toHaveBeenLastCalledWith({
+          path: '/changed',
+        });
+        expect(changed.managed.prepare).toHaveBeenCalled();
+        expect(changed.invocation.getDefaultPermission).toHaveBeenCalled();
+        expect(initial.onConfirm).not.toHaveBeenCalled();
+        expect(changed.invocation.execute).not.toHaveBeenCalled();
+      });
+
+      it('does not publish or read permissions until remote preparation finishes', async () => {
+        const remote = managedTool();
+        const prepare = remote.managed.prepare.getMockImplementation()!;
+        let finishPrepare!: () => void;
+        remote.managed.prepare.mockImplementation(async () => {
+          await new Promise<void>((resolve) => {
+            finishPrepare = resolve;
+          });
+          await prepare();
+        });
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const pending = run();
+        await vi.waitFor(() =>
+          expect(remote.managed.prepare).toHaveBeenCalled(),
+        );
+        expect(remote.invocation.getDefaultPermission).not.toHaveBeenCalled();
+        expect(mockClient.requestPermission).not.toHaveBeenCalled();
+        expect(mockClient.sessionUpdate).not.toHaveBeenCalled();
+        finishPrepare();
+        await pending;
+      });
+
+      it('does not declare completion when remote cancellation cannot prove drain', async () => {
+        const remote = managedTool();
+        remote.invocation.getDefaultPermission.mockResolvedValue('deny');
+        remote.managed.cancelAndDrain.mockRejectedValue(
+          new Error('worker termination uncertain'),
+        );
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        await expect(run()).rejects.toThrow('worker termination uncertain');
+        expect(remote.managed.cancelAndDrain).toHaveBeenCalledTimes(1);
+        expect(
+          mockChatRecordingService.recordToolResult,
+        ).not.toHaveBeenCalled();
+      });
+
+      it.each(['success', 'cancelled', 'not_started', 'error'] as const)(
+        'uses physical %s for the remote cancellation response and UI',
+        async (executionStatus) => {
+          const remote = managedTool();
+          const controller = new AbortController();
+          remote.invocation.execute.mockImplementation(async () => {
+            remote.managed.result = { executionStatus };
+            controller.abort();
+            return { llmContent: 'written', returnDisplay: 'written' };
+          });
+          mockToolRegistry.getTool.mockReturnValue(remote.tool);
+          const result = await run(controller.signal);
+          const cancelMessage =
+            executionStatus === 'success'
+              ? 'The tool had already completed; its output was discarded.'
+              : 'Tool execution was cancelled.';
+          expect(result.parts[0].functionResponse?.response).toEqual({
+            error: cancelMessage,
+          });
+          expect(mockClient.sessionUpdate).toHaveBeenCalledWith(
+            expect.objectContaining({
+              update: expect.objectContaining({
+                status: 'failed',
+                content: [
+                  {
+                    type: 'content',
+                    content: { type: 'text', text: cancelMessage },
+                  },
+                ],
+              }),
+            }),
+          );
+          expect(
+            mockChatRecordingService.recordToolResult,
+          ).toHaveBeenCalledWith(
+            result.parts,
+            expect.objectContaining({
+              status: 'cancelled',
+              executionStatus,
+              error: undefined,
+            }),
+          );
+        },
+      );
+
+      it('preserves the completed remote post hook receipt after parent cancellation', async () => {
+        const remote = managedTool();
+        const controller = new AbortController();
+        const artifacts: core.ToolArtifact[] = [
+          {
+            kind: 'file',
+            title: 'Completed hook evidence',
+            workspacePath: 'evidence.txt',
+          },
+        ];
+        remote.invocation.execute.mockImplementation(async () => {
+          remote.managed.result = {
+            executionStatus: 'success',
+            postHook: {
+              shouldStop: false,
+              additionalContext: 'completed remote hook context',
+              artifacts,
+            },
+          };
+          controller.abort();
+          return { llmContent: 'written', returnDisplay: 'written' };
+        });
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const postHook = vi.spyOn(core, 'firePostToolUseHook');
+        const failureHook = vi.spyOn(core, 'firePostToolUseFailureHook');
+        const result = await run(controller.signal);
+        expect(result.parts).toContainEqual({
+          text: 'completed remote hook context',
+        });
+        expect(mockClient.extNotification).toHaveBeenCalledWith(
+          'qwen/notify/session/artifact-event',
+          expect.objectContaining({
+            hookEventName: 'PostToolUse',
+            artifacts,
+          }),
+        );
+        expect(postHook).not.toHaveBeenCalled();
+        expect(failureHook).not.toHaveBeenCalled();
+        expect(mockChatRecordingService.recordToolResult).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            status: 'cancelled',
+            executionStatus: 'success',
+          }),
+        );
+      });
+
+      it('preserves a remotely rejected execution as not_started', async () => {
+        const remote = managedTool();
+        remote.managed.result = {
+          executionStatus: 'not_started',
+          error: { message: 'lease revoked' },
+        };
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const result = await run();
+        expect(result.parts[0].functionResponse?.response).toEqual({
+          error: 'lease revoked',
+        });
+        expect(mockChatRecordingService.recordToolResult).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            status: 'error',
+            executionStatus: 'not_started',
+          }),
+        );
+      });
+
+      it('uses the new confirmation after repeated hook output reaches stable arguments', async () => {
+        const initial = managedTool({ path: '/original' });
+        const changed = managedTool({ path: '/changed' });
+        initial.invocation.getDefaultPermission.mockResolvedValue('ask');
+        changed.invocation.getDefaultPermission.mockResolvedValue('ask');
+        initial.tool.build
+          .mockReturnValueOnce(initial.invocation)
+          .mockReturnValue(changed.invocation);
+        mockToolRegistry.getTool.mockReturnValue(initial.tool);
+        mockConfig.getApprovalMode = vi
+          .fn()
+          .mockReturnValue(ApprovalMode.DEFAULT);
+        mockConfig.getDisableAllHooks = vi.fn().mockReturnValue(false);
+        mockConfig.getMessageBus = vi.fn().mockReturnValue({});
+        vi.spyOn(core, 'firePermissionRequestHook').mockResolvedValue({
+          hasDecision: true,
+          shouldAllow: true,
+          updatedInput: { path: '/changed' },
+        });
+        await run();
+        expect(initial.tool.build).toHaveBeenCalledTimes(2);
+        expect(initial.onConfirm).not.toHaveBeenCalled();
+        expect(changed.onConfirm).toHaveBeenCalledExactlyOnceWith(
+          core.ToolConfirmationOutcome.ProceedOnce,
+        );
+        expect(initial.invocation.execute).not.toHaveBeenCalled();
+        expect(changed.invocation.execute).toHaveBeenCalledTimes(1);
+      });
+
+      it('awaits remote drain when preparation returns after cancellation', async () => {
+        const remote = managedTool();
+        const controller = new AbortController();
+        remote.managed.prepare.mockImplementation(async () => {
+          controller.abort();
+        });
+        let finishDrain!: () => void;
+        remote.managed.cancelAndDrain.mockReturnValue(
+          new Promise<void>((resolve) => {
+            finishDrain = resolve;
+          }),
+        );
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        let settled = false;
+        const pending = run(controller.signal).then(() => {
+          settled = true;
+        });
+        await vi.waitFor(() =>
+          expect(remote.managed.cancelAndDrain).toHaveBeenCalled(),
+        );
+        expect(settled).toBe(false);
+        expect(remote.invocation.getDefaultPermission).not.toHaveBeenCalled();
+        finishDrain();
+        await pending;
+        expect(remote.invocation.execute).not.toHaveBeenCalled();
+      });
+
+      it.each(['success', 'error'] as const)(
+        'consumes remote %s artifacts once even if later postprocessing throws',
+        async (executionStatus) => {
+          const remote = managedTool();
+          const receipt = {
+            shouldStop: false,
+            artifacts: [
+              {
+                kind: 'file' as const,
+                title: 'hook evidence',
+                workspacePath: 'evidence.txt',
+              },
+            ],
+          };
+          remote.managed.result = {
+            executionStatus,
+            ...(executionStatus === 'success'
+              ? { postHook: receipt }
+              : {
+                  error: { message: 'remote execution failed' },
+                  failureHook: receipt,
+                }),
+          };
+          mockToolRegistry.getTool.mockReturnValue(remote.tool);
+          const emitArtifacts = vi
+            .spyOn(
+              session as unknown as {
+                emitHookArtifactsNotification: () => Promise<void>;
+              },
+              'emitHookArtifactsNotification',
+            )
+            .mockResolvedValue();
+          bridgeToolResultImagesSpy.mockRejectedValueOnce(
+            new Error('postprocessing failed'),
+          );
+          await run();
+          expect(emitArtifacts).toHaveBeenCalledTimes(1);
+        },
+      );
+
+      it('adds the PLAN Shell directory before preparing a readonly-params proxy', async () => {
+        const initial = managedTool();
+        const normalized = managedTool({
+          command: 'pwd',
+          directory: mockConfig.getTargetDir(),
+        });
+        normalized.invocation.getDefaultPermission.mockResolvedValue('deny');
+        initial.tool.name = core.ToolNames.SHELL;
+        initial.tool.build
+          .mockReturnValueOnce(initial.invocation)
+          .mockReturnValue(normalized.invocation);
+        mockToolRegistry.getTool.mockReturnValue(initial.tool);
+        mockConfig.getApprovalMode = vi.fn().mockReturnValue(ApprovalMode.PLAN);
+        await (session as unknown as ToolCallInternals).runToolCalls(
+          new AbortController().signal,
+          'managed-plan-prompt',
+          [
+            {
+              id: 'managed-plan-call',
+              name: core.ToolNames.SHELL,
+              args: { command: 'pwd' },
+            },
+          ],
+        );
+        expect(initial.managed.prepare).not.toHaveBeenCalled();
+        expect(initial.managed.cancelAndDrain).toHaveBeenCalledTimes(1);
+        expect(initial.tool.build).toHaveBeenLastCalledWith({
+          command: 'pwd',
+          directory: mockConfig.getTargetDir(),
+        });
+        expect(normalized.managed.prepare).toHaveBeenCalledTimes(1);
+        expect(
+          normalized.invocation.getDefaultPermission,
+        ).toHaveBeenCalledTimes(1);
+      });
+
+      it('rechecks tool enablement after asynchronous preparation', async () => {
+        const remote = managedTool();
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const isToolEnabled = vi
+          .fn()
+          .mockResolvedValueOnce(true)
+          .mockResolvedValue(false);
+        mockConfig.getPermissionManager = vi
+          .fn()
+          .mockReturnValue({ isToolEnabled });
+        const result = await run();
+        expect(remote.managed.prepare).toHaveBeenCalledTimes(1);
+        expect(remote.invocation.getDefaultPermission).not.toHaveBeenCalled();
+        expect(result.parts[0].functionResponse?.response).toEqual({
+          error: 'Tool "remote_tool" is disabled.',
+        });
+        expect(remote.managed.cancelAndDrain).toHaveBeenCalledTimes(1);
+      });
+
+      it('uses the physical result and failure receipt obtained while draining a failed execute request', async () => {
+        const remote = managedTool();
+        remote.invocation.execute.mockRejectedValue(
+          new Error('execution response lost'),
+        );
+        remote.managed.cancelAndDrain.mockImplementation(async () => {
+          remote.managed.result = {
+            executionStatus: 'cancelled',
+            failureHook: { additionalContext: 'remote failure receipt' },
+          };
+        });
+        mockToolRegistry.getTool.mockReturnValue(remote.tool);
+        const localFailureHook = vi.spyOn(core, 'firePostToolUseFailureHook');
+        await run();
+        expect(remote.managed.cancelAndDrain).toHaveBeenCalledTimes(1);
+        expect(localFailureHook).not.toHaveBeenCalled();
+        expect(debugLoggerDebugSpy).toHaveBeenCalledWith(
+          expect.stringContaining('remote failure receipt'),
+        );
+        expect(mockChatRecordingService.recordToolResult).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({
+            status: 'cancelled',
+            executionStatus: 'cancelled',
+          }),
+        );
+      });
+
+      it.each(['success', 'error'] as const)(
+        'preserves the recovered %s hook receipt after an execute response is lost',
+        async (executionStatus) => {
+          const remote = managedTool();
+          const artifacts: core.ToolArtifact[] = [
+            {
+              kind: 'file',
+              title: 'Recovered evidence',
+              workspacePath: 'recovered-evidence.txt',
+            },
+          ];
+          const receipt = {
+            shouldStop: false,
+            additionalContext: 'recovered hook context',
+            artifacts,
+          };
+          remote.invocation.execute.mockRejectedValue(
+            new Error('execution response lost'),
+          );
+          remote.managed.cancelAndDrain.mockImplementation(async () => {
+            remote.managed.result = {
+              executionStatus,
+              ...(executionStatus === 'success'
+                ? { postHook: receipt }
+                : { failureHook: receipt }),
+            };
+          });
+          mockToolRegistry.getTool.mockReturnValue(remote.tool);
+          const postHook = vi.spyOn(core, 'firePostToolUseHook');
+          const failureHook = vi.spyOn(core, 'firePostToolUseFailureHook');
+          const result = await run();
+          expect(result.parts).toContainEqual({
+            text: 'recovered hook context',
+          });
+          const notifications = vi
+            .mocked(mockClient.extNotification)
+            .mock.calls.filter(
+              ([name]) => name === 'qwen/notify/session/artifact-event',
+            );
+          expect(notifications).toHaveLength(1);
+          expect(notifications[0][1]).toMatchObject({
+            hookEventName:
+              executionStatus === 'success'
+                ? 'PostToolUse'
+                : 'PostToolUseFailure',
+            artifacts,
+          });
+          expect(postHook).not.toHaveBeenCalled();
+          expect(failureHook).not.toHaveBeenCalled();
+          expect(
+            mockChatRecordingService.recordToolResult,
+          ).toHaveBeenCalledWith(
+            expect.arrayContaining([{ text: 'recovered hook context' }]),
+            expect.objectContaining({
+              status: 'error',
+              executionStatus,
+              artifacts,
+            }),
+          );
+          expect(remote.managed.cancelAndDrain).toHaveBeenCalledTimes(1);
+        },
+      );
+    });
+
     it('blocks standalone worktree actions before building the tool', async () => {
       recreateStandaloneSession();
       const builds: Array<ReturnType<typeof vi.fn>> = [];

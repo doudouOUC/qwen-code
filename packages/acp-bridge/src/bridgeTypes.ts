@@ -6,7 +6,7 @@
 
 import type {
   ApprovalMode,
-  ManagedToolRuntime,
+  ManagedToolV2Client,
   GoalControlRequest,
   GoalSnapshotV2,
   GoalStateResponse,
@@ -131,20 +131,7 @@ export interface BridgeManagedRuntimeToolExecuteResult {
   error?: { message: string; type?: string };
 }
 
-export type ManagedToolV2Client = {
-  [K in
-    | 'manifest'
-    | 'beginTurn'
-    | 'prepare'
-    | 'confirmation'
-    | 'confirm'
-    | 'preflight'
-    | 'execute'
-    | 'status'
-    | 'cancel']: (
-    ...args: Parameters<ManagedToolRuntime[K]>
-  ) => Promise<Awaited<ReturnType<ManagedToolRuntime[K]>>>;
-};
+export type { ManagedToolV2Client } from '@qwen-code/qwen-code-core';
 
 export interface RewindRequest {
   promptId: string;

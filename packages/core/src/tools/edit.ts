@@ -16,6 +16,7 @@ import type {
 import type { PermissionDecision } from '../permissions/types.js';
 import { BaseDeclarativeTool, Kind, ToolConfirmationOutcome } from './tools.js';
 import { ToolErrorType } from './tool-error.js';
+import { createManagedToolEditParams } from './managed-tool-edit-params.js';
 import { makeRelative, shortenPath, unescapePath } from '../utils/paths.js';
 import { getErrorMessage, isNodeError } from '../utils/errors.js';
 import type { Config } from '../config/config.js';
@@ -904,13 +905,13 @@ Expectation for required parameters:
         oldContent: string,
         modifiedProposedContent: string,
         originalParams: EditToolParams,
-      ): EditToolParams => ({
-        ...originalParams,
-        ai_proposed_content: oldContent,
-        old_string: oldContent,
-        new_string: modifiedProposedContent,
-        modified_by_user: true,
-      }),
+      ): EditToolParams =>
+        createManagedToolEditParams(
+          EditTool.Name,
+          originalParams,
+          oldContent,
+          modifiedProposedContent,
+        ),
     };
   }
 }

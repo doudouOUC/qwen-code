@@ -12,6 +12,24 @@ import { type AgentStatsSummary } from '../agents/runtime/agent-statistics.js';
 import type { AnsiOutput } from '../utils/terminalSerializer.js';
 import type { PermissionDecision } from '../permissions/types.js';
 import type { VisionBridgeNoticeDisplay } from '../services/visionBridge/vision-bridge-service.js';
+import type { PreToolUseHookResult } from '../core/toolHookTriggers.js';
+import type { ManagedToolExecutionResult } from './managed-tool-runtime.js';
+
+export interface ManagedToolInvocationLifecycle {
+  prepare(
+    signal: AbortSignal,
+    context: { callId: string; promptId: string },
+  ): Promise<void>;
+  preflight(): Promise<PreToolUseHookResult>;
+  confirmPreflight(
+    outcome: ToolConfirmationOutcome,
+    payload?: ToolConfirmationPayload,
+  ): Promise<void>;
+  authorize(): void;
+  cancelAndDrain(): Promise<void>;
+  readonly result: ManagedToolExecutionResult | undefined;
+  readonly toolUseId: string;
+}
 
 /**
  * Represents a validated and ready-to-execute tool call.
@@ -25,6 +43,8 @@ export interface ToolInvocation<
    * The validated parameters for this specific invocation.
    */
   params: TParams;
+
+  readonly managed?: ManagedToolInvocationLifecycle;
 
   /** Historical names accepted only when evaluating persisted permissions. */
   readonly permissionAliases?: readonly string[];

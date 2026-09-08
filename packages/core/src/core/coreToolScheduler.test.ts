@@ -23,6 +23,9 @@ import type {
   ToolRegistry,
 } from '../index.js';
 import type { PermissionDecision } from '../permissions/types.js';
+import type { ManagedToolInvocationLifecycle } from '../tools/tools.js';
+import type { ModifyContext } from '../tools/modifiable-tool.js';
+import type { ManagedToolExecutionResult } from '../tools/managed-tool-runtime.js';
 import {
   ApprovalMode,
   BaseDeclarativeTool,
@@ -161,6 +164,7 @@ vi.mock(
 const debugLoggerInfoSpy = vi.hoisted(() => vi.fn());
 const runSideQueryMock = vi.hoisted(() => vi.fn());
 const mockTelemetrySdkState = vi.hoisted(() => ({ initialized: false }));
+const modifyWithEditorCalls = vi.hoisted(() => vi.fn());
 const modifyWithEditorOverride = vi.hoisted(() => ({
   value: undefined as
     | (() => Promise<{
@@ -210,8 +214,12 @@ vi.mock('../tools/modifiable-tool.js', async (importOriginal) => {
     await importOriginal<typeof import('../tools/modifiable-tool.js')>();
   return {
     ...actual,
-    modifyWithEditor: (...args: Parameters<typeof actual.modifyWithEditor>) =>
-      modifyWithEditorOverride.value?.() ?? actual.modifyWithEditor(...args),
+    modifyWithEditor: (...args: Parameters<typeof actual.modifyWithEditor>) => {
+      modifyWithEditorCalls(...args);
+      return (
+        modifyWithEditorOverride.value?.() ?? actual.modifyWithEditor(...args)
+      );
+    },
   };
 });
 
@@ -803,6 +811,7 @@ describe('CoreToolScheduler', () => {
 
   function createSchedulerForLegacyToolTests(options: {
     toolsByName: Map<string, MockTool>;
+    toolInvocationGuard?: ToolInvocationGuard;
     approvalMode?: ApprovalMode;
     getPermissionsDeny?: () => string[] | undefined;
     messageBus?: { request: ReturnType<typeof vi.fn> };
@@ -869,6 +878,7 @@ describe('CoreToolScheduler', () => {
         getUsageStatisticsEnabled: () => true,
         getDebugMode: () => false,
         getApprovalMode: () => options.approvalMode ?? ApprovalMode.YOLO,
+        getApprovalModeRevision: () => 0,
         setApprovalMode: options.setApprovalMode ?? vi.fn(),
         getPermissionsAllow: () => [],
         getPermissionsDeny: options.getPermissionsDeny ?? (() => undefined),
@@ -906,6 +916,11 @@ describe('CoreToolScheduler', () => {
           options.toolOutputBatchBudget ?? Number.POSITIVE_INFINITY,
         getToolRegistry: () => mockToolRegistry,
         getCwd: () => '/repo',
+        getTargetDir: () => '/repo',
+        getConditionalRulesRegistry: () => undefined,
+        getSkillManager: () => undefined,
+        getIdeMode: () => false,
+        getToolInvocationGuard: () => options.toolInvocationGuard,
         getUseModelRouter: () => false,
         getLlmClient: options.getLlmClient ?? (() => null),
         getPlanFilePath:
@@ -954,6 +969,1076 @@ describe('CoreToolScheduler', () => {
       onToolCallsUpdate,
     };
   }
+
+  describe('managed invocation lifecycle', () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    }
+
+    function fixture(
+      options: {
+        prepare?: () => Promise<void>;
+        drain?: () => Promise<void>;
+        permission?: PermissionDecision;
+        name?: string;
+        params?: Record<string, unknown>;
+        edit?: boolean;
+        postHook?: ManagedToolExecutionResult['postHook'];
+        failureHook?: ManagedToolExecutionResult['failureHook'];
+        drainedResult?: ManagedToolExecutionResult;
+        execute?: (signal: AbortSignal) => Promise<ToolResult>;
+        preflight?: () => Promise<{
+          shouldProceed: boolean;
+          blockType?: 'ask';
+        }>;
+      } = {},
+    ) {
+      const order: string[] = [];
+      let prepared = false;
+      let authorized = false;
+      let cancelled = false;
+      let result: ManagedToolExecutionResult | undefined;
+      const onConfirm = vi.fn(async () => {
+        order.push('confirm');
+      });
+      const managed: ManagedToolInvocationLifecycle = {
+        prepare: vi.fn(async () => {
+          order.push('prepare');
+          await options.prepare?.();
+          prepared = true;
+        }),
+        preflight: vi.fn(async () => {
+          if (cancelled) throw new Error('Runtime invocation was cancelled');
+          order.push('preflight');
+          return options.preflight?.() ?? { shouldProceed: true };
+        }),
+        confirmPreflight: vi.fn(async () => {
+          order.push('confirmPreflight');
+        }),
+        authorize: vi.fn(() => {
+          authorized = true;
+          order.push('authorize');
+        }),
+        cancelAndDrain: vi.fn(async () => {
+          cancelled = true;
+          order.push('drain');
+          await options.drain?.();
+          if (options.drainedResult) result = options.drainedResult;
+        }),
+        get result() {
+          return result;
+        },
+        get toolUseId() {
+          if (!prepared) throw new Error('not prepared');
+          return 'remote-tool-use';
+        },
+      };
+      const invocation: ToolInvocation<Record<string, unknown>, ToolResult> = {
+        managed,
+        get params() {
+          if (!prepared) throw new Error('not prepared');
+          return options.params ?? { file_path: '/repo/remote.txt' };
+        },
+        getDescription: () => {
+          if (!prepared) throw new Error('not prepared');
+          return 'remote description';
+        },
+        toolLocations: () => [],
+        getDefaultPermission: vi.fn(async () => {
+          if (!prepared) throw new Error('not prepared');
+          order.push('permission');
+          return options.permission ?? 'allow';
+        }),
+        getConfirmationDetails: vi.fn(
+          async (): Promise<ToolCallConfirmationDetails> =>
+            options.edit
+              ? {
+                  type: 'edit',
+                  title: 'Edit remote file',
+                  fileName: 'remote.txt',
+                  filePath: '/repo/remote.txt',
+                  fileDiff: 'remote diff',
+                  originalContent: 'original',
+                  newContent: 'proposed',
+                  onConfirm,
+                }
+              : {
+                  type: 'info',
+                  title: 'remote confirm',
+                  prompt: 'confirm',
+                  onConfirm,
+                },
+        ),
+        execute: vi.fn(async (signal) => {
+          if (!authorized) throw new Error('not authorized');
+          order.push('execute');
+          const raw = (await options.execute?.(signal)) ?? {
+            llmContent: 'remote output',
+            returnDisplay: 'remote output',
+          };
+          result = {
+            executionStatus: raw.executionStatus ?? 'success',
+            result: raw,
+            postHook: options.postHook ?? {
+              shouldStop: false,
+              additionalContext: 'remote post context',
+            },
+            failureHook: options.failureHook,
+          };
+          return raw;
+        }),
+      };
+      const tool = new MockTool({ name: options.name ?? 'read_file' });
+      vi.spyOn(tool, 'build').mockReturnValue(invocation);
+      const request: ToolCallRequestInfo = {
+        callId: 'remote-call',
+        prompt_id: 'remote-prompt',
+        name: options.name ?? 'read_file',
+        args: { file_path: 'remote.txt' },
+        isClientInitiated: false,
+      };
+      return { tool, invocation, managed, request, order, onConfirm };
+    }
+
+    it('prepares before publishing invocation or evaluating permissions', async () => {
+      const ready = deferred<void>();
+      const f = fixture({ prepare: () => ready.promise });
+      const updates = vi.fn((calls: ToolCall[]) => {
+        for (const call of calls)
+          if ('invocation' in call && call.invocation)
+            call.invocation.getDescription();
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+        onToolCallsUpdate: updates,
+      });
+      const pending = h.scheduler.schedule(
+        f.request,
+        new AbortController().signal,
+      );
+      await vi.waitFor(() => expect(f.managed.prepare).toHaveBeenCalledOnce());
+      expect(f.invocation.getDefaultPermission).not.toHaveBeenCalled();
+      expect(updates).not.toHaveBeenCalled();
+      ready.resolve();
+      await pending;
+      expect(f.order.slice(0, 4)).toEqual([
+        'prepare',
+        'permission',
+        'preflight',
+        'authorize',
+      ]);
+      expect(f.invocation.execute).toHaveBeenCalledOnce();
+    });
+
+    it.each(['prepare failure', 'permission denial'])(
+      'drains before batch completion on %s',
+      async (reason) => {
+        const drain = deferred<void>();
+        const f = fixture({
+          drain: () => drain.promise,
+          permission: 'deny',
+          prepare:
+            reason === 'prepare failure'
+              ? async () => {
+                  throw new Error('prepare rejected');
+                }
+              : undefined,
+        });
+        const h = createSchedulerForLegacyToolTests({
+          toolsByName: new Map([['read_file', f.tool]]),
+        });
+        const pending = h.scheduler.schedule(
+          f.request,
+          new AbortController().signal,
+        );
+        await vi.waitFor(() =>
+          expect(f.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+        );
+        expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+        drain.resolve();
+        await pending;
+        await vi.waitFor(() =>
+          expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+        );
+        expect(f.invocation.execute).not.toHaveBeenCalled();
+      },
+    );
+
+    it('runs remote preflight before the final guard and never repeats tool hooks locally', async () => {
+      const f = fixture();
+      const messageBus = {
+        request: vi.fn(async () => {
+          throw new Error('local tool hook fired');
+        }),
+      };
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+        disableHooks: false,
+        hooksEnabled: () => true,
+        messageBus,
+        toolInvocationGuard: async () => {
+          f.order.push('guard');
+          return { allowed: true };
+        },
+      });
+      await h.scheduler.schedule(f.request, new AbortController().signal);
+      expect(f.order.slice(0, 5)).toEqual([
+        'prepare',
+        'permission',
+        'preflight',
+        'guard',
+        'authorize',
+      ]);
+      expect(
+        messageBus.request.mock.calls.filter(
+          (args) =>
+            JSON.stringify(args).includes('PreToolUse') ||
+            JSON.stringify(args).includes('PostToolUse'),
+        ),
+      ).toHaveLength(0);
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      const calls = h.onAllToolCallsComplete.mock
+        .calls[0][0] as CompletedToolCall[];
+      expect(JSON.stringify(calls[0].response.responseParts)).toContain(
+        'remote post context',
+      );
+    });
+
+    it('confirms the remote preflight ask once and then executes the same invocation', async () => {
+      const f = fixture({
+        preflight: async () => ({ shouldProceed: false, blockType: 'ask' }),
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      const signal = new AbortController().signal;
+      await h.scheduler.schedule(f.request, signal);
+      const waiting = h.onToolCallsUpdate.mock.calls.at(
+        -1,
+      )![0][0] as WaitingToolCall;
+      expect(waiting.status).toBe('awaiting_approval');
+      await waiting.confirmationDetails.onConfirm(
+        ToolConfirmationOutcome.ProceedOnce,
+      );
+      expect(f.managed.confirmPreflight).toHaveBeenCalledWith(
+        ToolConfirmationOutcome.ProceedOnce,
+        undefined,
+      );
+      expect(f.managed.preflight).toHaveBeenCalledOnce();
+      expect(f.invocation.execute).toHaveBeenCalledOnce();
+    });
+
+    it('preserves physical success when cancellation arrives during the remote write', async () => {
+      const controller = new AbortController();
+      const f = fixture({
+        execute: async () => {
+          controller.abort();
+          return {
+            llmContent: 'written',
+            returnDisplay: 'written',
+            executionStatus: 'success',
+          };
+        },
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      await h.scheduler.schedule(f.request, controller.signal);
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      const calls = h.onAllToolCallsComplete.mock
+        .calls[0][0] as CompletedToolCall[];
+      expect(calls[0].status).toBe('cancelled');
+      expect(calls[0].response.executionStatus).toBe('success');
+      expect(JSON.stringify(calls[0].response.responseParts)).toContain(
+        'remote post context',
+      );
+    });
+
+    it.each(['success', 'cancelled'] as const)(
+      'waits for actual remote %s settlement after an execution timeout',
+      async (physicalStatus) => {
+        vi.stubEnv('QWEN_CODE_TOOL_EXECUTION_TIMEOUT_MS', '10');
+        const executed = deferred<ToolResult>();
+        let executionSignal: AbortSignal | undefined;
+        const f = fixture({
+          execute: async (signal) => {
+            executionSignal = signal;
+            return executed.promise;
+          },
+        });
+        const h = createSchedulerForLegacyToolTests({
+          toolsByName: new Map([['read_file', f.tool]]),
+        });
+        try {
+          const pending = h.scheduler.schedule(
+            f.request,
+            new AbortController().signal,
+          );
+          await vi.waitFor(() => expect(executionSignal?.aborted).toBe(true));
+          expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+          executed.resolve({
+            llmContent: 'stopped',
+            returnDisplay: 'stopped',
+            executionStatus: physicalStatus,
+          });
+          await pending;
+          await vi.waitFor(() =>
+            expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+          );
+          const call = h.onAllToolCallsComplete.mock
+            .calls[0][0][0] as CompletedToolCall;
+          expect(call.status).toBe('error');
+          expect(call.response.errorType).toBe(ToolErrorType.EXECUTION_TIMEOUT);
+          expect(call.response.executionStatus).toBe(physicalStatus);
+          if (physicalStatus === 'success')
+            expect(JSON.stringify(call.response.responseParts)).toContain(
+              'remote post context',
+            );
+        } finally {
+          vi.unstubAllEnvs();
+        }
+      },
+    );
+
+    it('keeps an earlier user cancellation when the timeout fires before remote settlement', async () => {
+      vi.stubEnv('QWEN_CODE_TOOL_EXECUTION_TIMEOUT_MS', '10');
+      const executed = deferred<ToolResult>();
+      const controller = new AbortController();
+      const f = fixture({
+        execute: async () => {
+          controller.abort();
+          return executed.promise;
+        },
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      try {
+        const pending = h.scheduler.schedule(f.request, controller.signal);
+        await vi.waitFor(() =>
+          expect(f.invocation.execute).toHaveBeenCalledOnce(),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+        executed.resolve({
+          llmContent: 'stopped',
+          returnDisplay: 'stopped',
+          executionStatus: 'cancelled',
+        });
+        await pending;
+        await vi.waitFor(() =>
+          expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+        );
+        const call = h.onAllToolCallsComplete.mock
+          .calls[0][0][0] as CompletedToolCall;
+        expect(call.status).toBe('cancelled');
+        expect(call.response.errorType).not.toBe(
+          ToolErrorType.EXECUTION_TIMEOUT,
+        );
+        expect(call.response.executionStatus).toBe('cancelled');
+        expect(JSON.stringify(call.response.responseParts)).toContain(
+          'User cancelled tool execution.',
+        );
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it.each(['inline', 'editor', 'permission hook'])(
+      'reprepares %s modifications and confirms only the new reference',
+      async (source) => {
+        const oldDrain = deferred<void>();
+        const first = fixture({
+          name: ToolNames.WRITE_FILE,
+          permission: 'ask',
+          edit: true,
+          drain: () => oldDrain.promise,
+        });
+        const second = fixture({
+          name: ToolNames.WRITE_FILE,
+          permission: 'ask',
+          edit: true,
+          params: { file_path: '/repo/remote.txt', content: 'replacement' },
+        });
+        vi.mocked(first.tool.build)
+          .mockReset()
+          .mockReturnValueOnce(first.invocation)
+          .mockReturnValueOnce(second.invocation);
+        const messageBus = {
+          request: vi.fn(
+            async (request: {
+              eventName: string;
+            }): Promise<HookExecutionResponse> => ({
+              type: MessageBusType.HOOK_EXECUTION_RESPONSE,
+              correlationId: 'rewrite',
+              success: true,
+              output:
+                request.eventName === 'PermissionRequest'
+                  ? {
+                      hookSpecificOutput: {
+                        decision: {
+                          behavior: 'allow',
+                          updatedInput: {
+                            file_path: '/repo/remote.txt',
+                            content: 'replacement',
+                          },
+                        },
+                      },
+                    }
+                  : {},
+            }),
+          ),
+        };
+        const h = createSchedulerForLegacyToolTests({
+          toolsByName: new Map([[ToolNames.WRITE_FILE, first.tool]]),
+          approvalMode: ApprovalMode.DEFAULT,
+          ...(source === 'permission hook'
+            ? { disableHooks: false, messageBus }
+            : {}),
+        });
+        const request = {
+          ...first.request,
+          args: { file_path: '/repo/remote.txt', content: 'proposed' },
+        };
+        const signal = new AbortController().signal;
+        let oldConfirmation: ToolCallConfirmationDetails | undefined;
+        let pending = h.scheduler.schedule(request, signal);
+        if (source !== 'permission hook') {
+          await pending;
+          oldConfirmation = (
+            h.onToolCallsUpdate.mock.calls.at(-1)![0][0] as WaitingToolCall
+          ).confirmationDetails;
+          if (source === 'editor')
+            modifyWithEditorOverride.value = async () => ({
+              updatedParams: {
+                file_path: '/repo/remote.txt',
+                content: 'replacement',
+              },
+              updatedDiff: 'buffer diff',
+            });
+          pending = oldConfirmation.onConfirm(
+            source === 'editor'
+              ? ToolConfirmationOutcome.ModifyWithEditor
+              : ToolConfirmationOutcome.ProceedOnce,
+            source === 'inline' ? { newContent: 'replacement' } : undefined,
+          );
+        }
+        await vi.waitFor(() =>
+          expect(first.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+        );
+        expect(second.managed.prepare).not.toHaveBeenCalled();
+        oldDrain.resolve();
+        await pending;
+        if (source === 'editor') {
+          const context = modifyWithEditorCalls.mock.calls.at(
+            -1,
+          )![1] as ModifyContext<Record<string, unknown>>;
+          expect(context.getFilePath(request.args)).toBe('/repo/remote.txt');
+          await expect(context.getCurrentContent(request.args)).resolves.toBe(
+            'original',
+          );
+          await expect(context.getProposedContent(request.args)).resolves.toBe(
+            'proposed',
+          );
+        }
+        expect(second.managed.prepare).toHaveBeenCalledOnce();
+        expect(second.invocation.getDefaultPermission).toHaveBeenCalledOnce();
+        expect(first.onConfirm).not.toHaveBeenCalled();
+        expect(first.invocation.execute).not.toHaveBeenCalled();
+        expect(second.invocation.execute).not.toHaveBeenCalled();
+        const current = h.onToolCallsUpdate.mock.calls.at(
+          -1,
+        )![0][0] as WaitingToolCall;
+        expect(current.status).toBe('awaiting_approval');
+        expect(current.request.args['content']).toBe('replacement');
+        await oldConfirmation?.onConfirm(ToolConfirmationOutcome.ProceedOnce);
+        expect(second.invocation.execute).not.toHaveBeenCalled();
+        await current.confirmationDetails.onConfirm(
+          ToolConfirmationOutcome.ProceedOnce,
+        );
+        await vi.waitFor(() =>
+          expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+        );
+        expect(second.onConfirm).toHaveBeenCalledOnce();
+        expect(second.invocation.execute).toHaveBeenCalledOnce();
+        modifyWithEditorOverride.value = undefined;
+      },
+    );
+
+    it.each(
+      ['permission hook', 'inline', 'inline content', 'editor'].flatMap(
+        (source) => ['raw', 'effective'].map((params) => ({ source, params })),
+      ),
+    )(
+      'retains the reference for unchanged $source $params input',
+      async ({ source, params }) => {
+        const rawArgs = { file_path: 'remote.txt', content: 'proposed' };
+        const effectiveArgs = {
+          file_path: '/repo/remote.txt',
+          content: 'proposed',
+        };
+        const updatedInput = params === 'raw' ? rawArgs : effectiveArgs;
+        const f = fixture({
+          name: ToolNames.WRITE_FILE,
+          permission: 'ask',
+          edit: true,
+          params: effectiveArgs,
+        });
+        const messageBus = {
+          request: vi.fn(
+            async (): Promise<HookExecutionResponse> => ({
+              type: MessageBusType.HOOK_EXECUTION_RESPONSE,
+              correlationId: 'unchanged',
+              success: true,
+              output: {
+                hookSpecificOutput: {
+                  decision: { behavior: 'allow', updatedInput },
+                },
+              },
+            }),
+          ),
+        };
+        const h = createSchedulerForLegacyToolTests({
+          toolsByName: new Map([[ToolNames.WRITE_FILE, f.tool]]),
+          approvalMode: ApprovalMode.DEFAULT,
+          ...(source === 'permission hook'
+            ? { disableHooks: false, messageBus }
+            : {}),
+        });
+        await h.scheduler.schedule(
+          { ...f.request, args: rawArgs },
+          new AbortController().signal,
+        );
+        if (source !== 'permission hook') {
+          const waiting = h.onToolCallsUpdate.mock.calls.at(
+            -1,
+          )![0][0] as WaitingToolCall;
+          if (source === 'editor')
+            modifyWithEditorOverride.value = async () => ({
+              updatedParams: updatedInput,
+              updatedDiff: 'unchanged',
+            });
+          await waiting.confirmationDetails.onConfirm(
+            source === 'editor'
+              ? ToolConfirmationOutcome.ModifyWithEditor
+              : ToolConfirmationOutcome.ProceedOnce,
+            source === 'inline'
+              ? { updatedInput }
+              : source === 'inline content'
+                ? { newContent: 'proposed' }
+                : undefined,
+          );
+          if (source === 'editor') {
+            const current = h.onToolCallsUpdate.mock.calls.at(
+              -1,
+            )![0][0] as WaitingToolCall;
+            expect(current.status).toBe('awaiting_approval');
+            expect(f.onConfirm).not.toHaveBeenCalled();
+            expect(f.managed.cancelAndDrain).not.toHaveBeenCalled();
+            await current.confirmationDetails.onConfirm(
+              ToolConfirmationOutcome.ProceedOnce,
+            );
+          }
+        }
+        await vi.waitFor(() =>
+          expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+        );
+        expect(f.tool.build).toHaveBeenCalledOnce();
+        expect(f.managed.prepare).toHaveBeenCalledOnce();
+        expect(f.onConfirm).toHaveBeenCalledOnce();
+        expect(f.onConfirm.mock.calls[0]?.at(0)).toBe(
+          ToolConfirmationOutcome.ProceedOnce,
+        );
+        expect(
+          f.onConfirm.mock.calls[0]
+            ?.slice(1)
+            .every((value) => value === undefined),
+        ).toBe(true);
+        expect(f.invocation.execute).toHaveBeenCalledOnce();
+        expect(
+          (h.onAllToolCallsComplete.mock.calls[0][0][0] as CompletedToolCall)
+            .status,
+        ).toBe('success');
+      },
+    );
+
+    it('retains the original input identity through a remote PreToolUse ask bounce', async () => {
+      const f = fixture({
+        params: { file_path: '/repo/file name.txt' },
+        preflight: async () => ({ shouldProceed: false, blockType: 'ask' }),
+      });
+      const rawArgs = { file_path: 'file\\ name.txt' };
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      await h.scheduler.schedule(
+        { ...f.request, args: rawArgs },
+        new AbortController().signal,
+      );
+      const waiting = h.onToolCallsUpdate.mock.calls.at(
+        -1,
+      )![0][0] as WaitingToolCall;
+      expect(waiting.request.args).toEqual(rawArgs);
+      await waiting.confirmationDetails.onConfirm(
+        ToolConfirmationOutcome.ProceedOnce,
+        { updatedInput: rawArgs },
+      );
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      expect(f.tool.build).toHaveBeenCalledOnce();
+      expect(f.managed.confirmPreflight).toHaveBeenCalledWith(
+        ToolConfirmationOutcome.ProceedOnce,
+        undefined,
+      );
+      expect(f.invocation.execute).toHaveBeenCalledOnce();
+    });
+
+    it('rejects a rewritten invocation whose new intrinsic permission is deny', async () => {
+      const first = fixture({
+        name: ToolNames.WRITE_FILE,
+        permission: 'ask',
+        edit: true,
+      });
+      const second = fixture({
+        name: ToolNames.WRITE_FILE,
+        permission: 'deny',
+        edit: true,
+      });
+      vi.mocked(first.tool.build)
+        .mockReset()
+        .mockReturnValueOnce(first.invocation)
+        .mockReturnValueOnce(second.invocation);
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([[ToolNames.WRITE_FILE, first.tool]]),
+        approvalMode: ApprovalMode.DEFAULT,
+      });
+      await h.scheduler.schedule(first.request, new AbortController().signal);
+      const waiting = h.onToolCallsUpdate.mock.calls.at(
+        -1,
+      )![0][0] as WaitingToolCall;
+      await waiting.confirmationDetails.onConfirm(
+        ToolConfirmationOutcome.ProceedOnce,
+        { newContent: '' },
+      );
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      expect(second.invocation.getDefaultPermission).toHaveBeenCalledOnce();
+      expect(second.invocation.execute).not.toHaveBeenCalled();
+      expect(first.onConfirm).not.toHaveBeenCalled();
+      expect(second.managed.cancelAndDrain).toHaveBeenCalledOnce();
+    });
+
+    it('retains a failed cleanup and rejects subsequent scheduling', async () => {
+      const f = fixture({
+        permission: 'deny',
+        drain: async () => {
+          throw new Error('containment unknown');
+        },
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      await h.scheduler.schedule(f.request, new AbortController().signal);
+      await vi.waitFor(() =>
+        expect(f.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+      );
+      expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+      await expect(
+        h.scheduler.schedule(
+          { ...f.request, callId: 'next-call' },
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow('containment unknown');
+    });
+
+    it('keeps prepare owned across an abort and drains its late completion', async () => {
+      const preparing = deferred<void>();
+      const draining = deferred<void>();
+      const f = fixture({
+        prepare: () => preparing.promise,
+        drain: () => draining.promise,
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      const controller = new AbortController();
+      const pending = h.scheduler.schedule(f.request, controller.signal);
+      await vi.waitFor(() => expect(f.managed.prepare).toHaveBeenCalledOnce());
+      controller.abort();
+      expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+      preparing.resolve();
+      await vi.waitFor(() =>
+        expect(f.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+      );
+      expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+      draining.resolve();
+      await pending;
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      expect(f.invocation.execute).not.toHaveBeenCalled();
+    });
+
+    it('preserves physical success when the remote PostToolUse hook stops output', async () => {
+      const f = fixture({
+        postHook: {
+          shouldStop: true,
+          stopReason: 'remote stop',
+          additionalContext: 'remote stop context',
+          artifacts: [
+            {
+              kind: 'file',
+              title: 'Hook report',
+              workspacePath: 'reports/hook.html',
+            },
+          ],
+        },
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      await h.scheduler.schedule(f.request, new AbortController().signal);
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      const call = h.onAllToolCallsComplete.mock
+        .calls[0][0][0] as CompletedToolCall;
+      expect(call.status).toBe('error');
+      expect(call.response.executionStatus).toBe('success');
+      expect(call.response.error?.message).toBe('remote stop');
+      expect(JSON.stringify(call.response.responseParts)).toContain(
+        'remote stop context',
+      );
+      expect(call.response.artifacts).toEqual([
+        {
+          kind: 'file',
+          title: 'Hook report',
+          workspacePath: 'reports/hook.html',
+        },
+      ]);
+    });
+
+    it.each(['not_started', 'error'] as const)(
+      'never displays remote %s as success when the payload lacks an error',
+      async (executionStatus) => {
+        const f = fixture({
+          execute: async () => ({
+            executionStatus,
+            llmContent: 'no error envelope',
+            returnDisplay: 'no error envelope',
+          }),
+        });
+        const h = createSchedulerForLegacyToolTests({
+          toolsByName: new Map([['read_file', f.tool]]),
+        });
+        await h.scheduler.schedule(f.request, new AbortController().signal);
+        await vi.waitFor(() =>
+          expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+        );
+        const call = h.onAllToolCallsComplete.mock
+          .calls[0][0][0] as CompletedToolCall;
+        expect(call.status).toBe('error');
+        expect(call.response.executionStatus).toBe(executionStatus);
+      },
+    );
+
+    it.each(['final guard', 'confirmation cancel', 'waiting abort'])(
+      'drains on %s before publishing a completed batch',
+      async (source) => {
+        const drain = deferred<void>();
+        const f = fixture({
+          permission: source === 'final guard' ? 'allow' : 'ask',
+          drain: () => drain.promise,
+        });
+        const h = createSchedulerForLegacyToolTests({
+          toolsByName: new Map([['read_file', f.tool]]),
+          approvalMode: ApprovalMode.DEFAULT,
+          toolInvocationGuard: async () => ({
+            allowed: false,
+            reason: 'policy denied',
+          }),
+        });
+        const controller = new AbortController();
+        let pending = h.scheduler.schedule(f.request, controller.signal);
+        if (source !== 'final guard') {
+          await pending;
+          const call = h.onToolCallsUpdate.mock.calls.at(
+            -1,
+          )![0][0] as WaitingToolCall;
+          if (source === 'confirmation cancel')
+            pending = call.confirmationDetails.onConfirm(
+              ToolConfirmationOutcome.Cancel,
+            );
+          else controller.abort();
+        }
+        await vi.waitFor(() =>
+          expect(f.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+        );
+        expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+        expect(f.managed.authorize).not.toHaveBeenCalled();
+        expect(f.invocation.execute).not.toHaveBeenCalled();
+        drain.resolve();
+        await pending;
+        await vi.waitFor(() =>
+          expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+        );
+      },
+    );
+
+    it.each(
+      [false, true].flatMap((abort) =>
+        (['success', 'cancelled'] as const).map((physicalStatus) => ({
+          abort,
+          physicalStatus,
+        })),
+      ),
+    )(
+      'waits for recovered physical $physicalStatus after a lost execution receipt (aborted=$abort)',
+      async ({ abort, physicalStatus }) => {
+        const drain = deferred<void>();
+        const controller = new AbortController();
+        const f = fixture({
+          drain: () => drain.promise,
+          execute: async () => {
+            if (abort) controller.abort();
+            throw new Error('Execution receipt unavailable');
+          },
+          drainedResult: {
+            executionStatus: physicalStatus,
+            result: { llmContent: 'written', returnDisplay: 'written' },
+            postHook: {
+              shouldStop: false,
+              additionalContext: 'recovered post context',
+            },
+            failureHook: { additionalContext: 'recovered failure context' },
+          },
+        });
+        const h = createSchedulerForLegacyToolTests({
+          toolsByName: new Map([['read_file', f.tool]]),
+        });
+        const pending = h.scheduler.schedule(f.request, controller.signal);
+        await vi.waitFor(() =>
+          expect(f.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+        );
+        expect(h.onToolCallsUpdate.mock.calls.at(-1)![0][0].status).toBe(
+          'executing',
+        );
+        expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+        drain.resolve();
+        await pending;
+        await vi.waitFor(() =>
+          expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+        );
+        const call = h.onAllToolCallsComplete.mock
+          .calls[0][0][0] as CompletedToolCall;
+        expect(call.response.executionStatus).toBe(physicalStatus);
+        expect(JSON.stringify(call.response.responseParts)).toContain(
+          physicalStatus === 'success'
+            ? 'recovered post context'
+            : 'recovered failure context',
+        );
+        if (abort)
+          expect(JSON.stringify(call.response.responseParts)).toContain(
+            physicalStatus === 'success'
+              ? 'The tool had already completed; its output was discarded.'
+              : 'User cancelled tool execution.',
+          );
+      },
+    );
+
+    it('rejects unknown execution containment without publishing a physical terminal result', async () => {
+      const f = fixture({
+        execute: async () => {
+          throw new Error('Execution receipt unavailable');
+        },
+        drain: async () => {
+          throw new Error('Runtime containment unknown');
+        },
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+      });
+      await expect(
+        h.scheduler.schedule(f.request, new AbortController().signal),
+      ).rejects.toThrow('Runtime containment unknown');
+      expect(h.onToolCallsUpdate.mock.calls.at(-1)![0][0].status).toBe(
+        'executing',
+      );
+      expect(h.onAllToolCallsComplete).not.toHaveBeenCalled();
+      await expect(
+        h.scheduler.schedule(
+          { ...f.request, callId: 'next' },
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow('Runtime containment unknown');
+    });
+
+    it('uses Runtime failure metadata without firing a second failure hook', async () => {
+      const f = fixture({
+        execute: async () => ({
+          llmContent: 'failed',
+          returnDisplay: 'failed',
+          executionStatus: 'error',
+          error: {
+            message: 'physical failure',
+            type: ToolErrorType.EXECUTION_FAILED,
+          },
+        }),
+        failureHook: { additionalContext: 'runtime failure context' },
+      });
+      const messageBus = {
+        request: vi.fn(
+          async (request: {
+            eventName: string;
+          }): Promise<HookExecutionResponse> => ({
+            type: MessageBusType.HOOK_EXECUTION_RESPONSE,
+            correlationId: request.eventName,
+            success: true,
+            output: {},
+          }),
+        ),
+      };
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([['read_file', f.tool]]),
+        disableHooks: false,
+        messageBus,
+      });
+      await h.scheduler.schedule(f.request, new AbortController().signal);
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      const call = h.onAllToolCallsComplete.mock
+        .calls[0][0][0] as CompletedToolCall;
+      expect(call.status).toBe('error');
+      expect(call.response.executionStatus).toBe('error');
+      expect(call.response.error?.message).toContain('runtime failure context');
+      expect(
+        messageBus.request.mock.calls.some(
+          ([request]) => request.eventName === 'PostToolUseFailure',
+        ),
+      ).toBe(false);
+    });
+
+    it('does not prepare a replacement when the turn aborts while the old reference drains', async () => {
+      const drain = deferred<void>();
+      const first = fixture({
+        name: ToolNames.WRITE_FILE,
+        permission: 'ask',
+        edit: true,
+        drain: () => drain.promise,
+      });
+      const second = fixture({
+        name: ToolNames.WRITE_FILE,
+        permission: 'ask',
+        edit: true,
+      });
+      vi.mocked(first.tool.build)
+        .mockReset()
+        .mockReturnValueOnce(first.invocation)
+        .mockReturnValueOnce(second.invocation);
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([[ToolNames.WRITE_FILE, first.tool]]),
+        approvalMode: ApprovalMode.DEFAULT,
+      });
+      const controller = new AbortController();
+      await h.scheduler.schedule(first.request, controller.signal);
+      const waiting = h.onToolCallsUpdate.mock.calls.at(
+        -1,
+      )![0][0] as WaitingToolCall;
+      const modifying = waiting.confirmationDetails.onConfirm(
+        ToolConfirmationOutcome.ProceedOnce,
+        { newContent: 'replacement' },
+      );
+      await vi.waitFor(() =>
+        expect(first.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+      );
+      controller.abort();
+      drain.resolve();
+      await modifying;
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      expect(first.tool.build).toHaveBeenCalledOnce();
+      expect(second.managed.prepare).not.toHaveBeenCalled();
+    });
+
+    it('cancels edited confirmation payloads without constructing another invocation', async () => {
+      const f = fixture({
+        name: ToolNames.WRITE_FILE,
+        permission: 'ask',
+        edit: true,
+      });
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([[ToolNames.WRITE_FILE, f.tool]]),
+        approvalMode: ApprovalMode.DEFAULT,
+      });
+      await h.scheduler.schedule(f.request, new AbortController().signal);
+      const waiting = h.onToolCallsUpdate.mock.calls.at(
+        -1,
+      )![0][0] as WaitingToolCall;
+      await waiting.confirmationDetails.onConfirm(
+        ToolConfirmationOutcome.Cancel,
+        { newContent: 'discarded', cancelMessage: 'cancel editing' },
+      );
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      expect(f.tool.build).toHaveBeenCalledOnce();
+      expect(f.onConfirm).toHaveBeenCalledWith(ToolConfirmationOutcome.Cancel, {
+        cancelMessage: 'cancel editing',
+      });
+      expect(
+        (h.onAllToolCallsComplete.mock.calls[0][0][0] as CompletedToolCall)
+          .status,
+      ).toBe('cancelled');
+    });
+
+    it('binds the Plan Shell directory before remote preparation without preparing the discarded proxy', async () => {
+      const first = fixture({ name: ToolNames.SHELL });
+      const second = fixture({
+        name: ToolNames.SHELL,
+        params: { command: 'pwd', directory: '/repo' },
+      });
+      vi.mocked(first.tool.build)
+        .mockReset()
+        .mockReturnValueOnce(first.invocation)
+        .mockReturnValueOnce(second.invocation);
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([[ToolNames.SHELL, first.tool]]),
+        approvalMode: ApprovalMode.PLAN,
+      });
+      await h.scheduler.schedule(
+        { ...first.request, args: { command: 'pwd' } },
+        new AbortController().signal,
+      );
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      expect(first.managed.prepare).not.toHaveBeenCalled();
+      expect(first.managed.cancelAndDrain).toHaveBeenCalledOnce();
+      expect(first.tool.build).toHaveBeenNthCalledWith(2, {
+        command: 'pwd',
+        directory: '/repo',
+      });
+      expect(second.managed.prepare).toHaveBeenCalledOnce();
+      expect(second.invocation.getDefaultPermission).toHaveBeenCalledOnce();
+      expect(
+        (h.onAllToolCallsComplete.mock.calls[0][0][0] as CompletedToolCall)
+          .response.error,
+      ).toBeUndefined();
+      expect(second.invocation.execute).toHaveBeenCalledOnce();
+    });
+  });
 
   it('restores the invocation context when a delayed confirmation executes', async () => {
     const invocationContext: InvocationContextV1 = {

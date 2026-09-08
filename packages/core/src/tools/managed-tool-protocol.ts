@@ -49,6 +49,12 @@ export interface ManagedToolDescriptor {
   readonly schema: FunctionDeclaration;
   readonly permissionAliases?: readonly string[];
   readonly canUpdateOutput: boolean;
+  readonly isOutputMarkdown?: boolean;
+  readonly shouldDefer?: boolean;
+  readonly alwaysLoad?: boolean;
+  readonly searchHint?: string;
+  readonly maxOutputChars?: number | 'unlimited';
+  readonly truncateKeep?: 'head' | 'tail' | 'both';
   readonly isMcp?: boolean;
   readonly mcpServerName?: string;
   readonly mcpToolName?: string;
@@ -61,6 +67,7 @@ export interface ManagedToolPrepareResponse
   readonly locations: ToolLocation[];
   readonly defaultPermission: PermissionDecision;
   readonly requiresUserInteraction: boolean;
+  readonly toolUseId: string;
 }
 
 type WorkspaceConfirmation = Extract<
