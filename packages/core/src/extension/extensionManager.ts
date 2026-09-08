@@ -2267,6 +2267,7 @@ export class ExtensionManager {
           previousSettings = await getEnvContents(
             previousExtensionConfig,
             extensionId,
+            currentDir,
           );
         }
         stagingPath = await this.extensionStore.createStagingDirectory();

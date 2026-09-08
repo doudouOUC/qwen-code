@@ -811,7 +811,10 @@ function defaultAcpOnlyLocalReadRoots(): string[] {
   return process.platform === 'win32' ? [] : [POSIX_TMP_LOCAL_READ_ROOT];
 }
 
-function buildAcpLocalReadRoots(config: Config): string[] {
+function buildAcpLocalReadRoots(
+  config: Config,
+  environment: Readonly<NodeJS.ProcessEnv> = process.env,
+): string[] {
   return [
     // SYNC: The first group mirrors ReadFileTool's default allowed local roots,
     // including auto-memory roots. The ACP-only additions below expand only
@@ -827,7 +830,9 @@ function buildAcpLocalReadRoots(config: Config): string[] {
     // plans dir must be readable without a confirmation prompt).
     config.getPlansDir(),
     ...defaultAcpOnlyLocalReadRoots(),
-    ...parseAcpLocalReadRootsEnv(),
+    ...parseAcpLocalReadRootsEnv(
+      environment[QWEN_ACP_LOCAL_READ_ROOTS_ENV] ?? '',
+    ),
   ];
 }
 
@@ -2681,9 +2686,17 @@ async function addRuntimeMcpServer(
 }
 
 export interface AcpAgentOptions {
+  runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
   privateParentCapability?: string;
   externalToolGuardRequired?: boolean;
   externalToolGuardProviderAttached?: boolean;
+}
+
+interface AcpWorkspaceBinding {
+  environment: Readonly<NodeJS.ProcessEnv>;
+  cwd: string;
+  runtimeBaseDir: string;
+  trusted: boolean;
 }
 
 export interface AcpAgentHost {
@@ -2701,6 +2714,24 @@ export async function createAcpAgentHost(
   createStream: () => Stream,
   options: AcpAgentOptions = {},
 ): Promise<AcpAgentHost> {
+  const runtimeEnvironment =
+    options.runtimeEnvironment === undefined
+      ? undefined
+      : Object.freeze({ ...options.runtimeEnvironment });
+  if (
+    runtimeEnvironment !== undefined &&
+    !isDeepStrictEqual(runtimeEnvironment, config.getRuntimeEnvironment())
+  ) {
+    throw new Error('ACP host and bootstrap Config environments must match.');
+  }
+  const runtimeBaseDir =
+    runtimeEnvironment === undefined
+      ? undefined
+      : config.getSessionRuntimeBaseDir();
+  const runScoped = <T>(operation: () => T): T =>
+    runtimeBaseDir === undefined
+      ? operation()
+      : Storage.runWithResolvedRuntimeBaseDir(runtimeBaseDir, operation);
   // Freeze the restart-required writer protocol before the first await.
   // Per-request settings reloads must not mix leased and legacy writers
   // within one ACP process lifetime.
@@ -2836,7 +2867,7 @@ export async function createAcpAgentHost(
   const dispose = (reason: SessionEndReason): Promise<void> => {
     lifetime.abort();
     agentInstance?.stopAdmission();
-    disposePromise ??= (async () => {
+    disposePromise ??= runScoped(async () => {
       if (agentInstance?.isTrustedManagedParent()) {
         await shutdownManagedAgent(reason);
         return;
@@ -2862,11 +2893,29 @@ export async function createAcpAgentHost(
       if (failures.length > 0) {
         throw new AggregateError(failures, 'ACP host shutdown failed');
       }
-    })();
+    });
     return disposePromise;
   };
 
   try {
+    const workspaceBinding: AcpWorkspaceBinding | undefined =
+      runtimeEnvironment === undefined
+        ? undefined
+        : {
+            environment: runtimeEnvironment,
+            cwd: await fs.realpath(config.getTargetDir()),
+            runtimeBaseDir: runtimeBaseDir!,
+            trusted: config.isTrustedFolder() === true,
+          };
+    if (workspaceBinding) {
+      settings = runScoped(() =>
+        loadSettings(workspaceBinding.cwd, {
+          runtimeEnvironment,
+          workspaceTrusted: workspaceBinding.trusted,
+          skipWorkspaceSettings: !workspaceBinding.trusted,
+        }),
+      );
+    }
     // Reverse tool channel (issue #5626, Phase 2). Runtime-MCP-add targets the
     // BOOTSTRAP (workspace-level) config's `McpClientManager` — `this.config` in
     // the `workspaceMcpRuntimeAdd` handler — so a client-hosted MCP server's SDK
@@ -2879,36 +2928,42 @@ export async function createAcpAgentHost(
     const bootstrapClientMcpSender: SendSdkMcpMessage = (serverName, message) =>
       deliverClientMcpMessage(acpConnection, serverName, message);
 
-    await config.initialize({
-      skipLlmInitialization: true,
-      // Bootstrap skips MCP discovery — each session runs its own
-      // pool-routed discovery, so bootstrap-level spawns would be
-      // redundant subprocess leaks (W119).
-      skipMcpDiscovery: true,
-      // Bind the workspace-level manager's SDK callback so a runtime-added
-      // client-hosted MCP server (#5626) round-trips over the parent WS.
-      sendSdkMcpMessage: bootstrapClientMcpSender,
-    });
+    await runScoped(() =>
+      config.initialize({
+        skipLlmInitialization: true,
+        // Bootstrap skips MCP discovery — each session runs its own
+        // pool-routed discovery, so bootstrap-level spawns would be
+        // redundant subprocess leaks (W119).
+        skipMcpDiscovery: true,
+        // Bind the workspace-level manager's SDK callback so a runtime-added
+        // client-hosted MCP server (#5626) round-trips over the parent WS.
+        sendSdkMcpMessage: bootstrapClientMcpSender,
+      }),
+    );
     initialized = true;
-    const connection = new AgentSideConnection((conn) => {
-      acpConnection = bindAcpConnectionLifetime(conn, lifetime.signal);
-      const managedToolInvocationGuard = externalToolGuardRequired
-        ? createManagedExternalToolGuard(acpConnection, {
-            externalProviderAttached: externalToolGuardProviderAttached,
-          })
-        : undefined;
-      agentInstance = new QwenAgent(
-        config,
-        settings,
-        argv,
-        acpConnection,
-        privateParentCapability,
-        sessionWriterLeaseEnabledAtStartup,
-        managedToolInvocationGuard,
-        externalToolGuardProviderAttached,
-      );
-      return agentInstance;
-    }, createStream());
+    const connection = runScoped(
+      () =>
+        new AgentSideConnection((conn) => {
+          acpConnection = bindAcpConnectionLifetime(conn, lifetime.signal);
+          const managedToolInvocationGuard = externalToolGuardRequired
+            ? createManagedExternalToolGuard(acpConnection, {
+                externalProviderAttached: externalToolGuardProviderAttached,
+              })
+            : undefined;
+          agentInstance = new QwenAgent(
+            config,
+            settings,
+            argv,
+            acpConnection,
+            privateParentCapability,
+            sessionWriterLeaseEnabledAtStartup,
+            managedToolInvocationGuard,
+            externalToolGuardProviderAttached,
+            workspaceBinding,
+          );
+          return agentInstance;
+        }, createStream()),
+    );
     void connection.closed.then(() => lifetime.abort());
     return {
       connection: acpConnection ?? connection,
@@ -3208,9 +3263,10 @@ function parsePoolDrainMs(envValue: string | undefined): number {
  */
 export function createWorkspaceMcpBudget(
   onEvent: (event: McpBudgetEvent) => void,
+  environment: Readonly<NodeJS.ProcessEnv> = process.env,
 ): WorkspaceMcpBudget | undefined {
-  const rawBudget = process.env['QWEN_SERVE_MCP_CLIENT_BUDGET'];
-  const rawMode = process.env['QWEN_SERVE_MCP_BUDGET_MODE'];
+  const rawBudget = environment['QWEN_SERVE_MCP_CLIENT_BUDGET'];
+  const rawMode = environment['QWEN_SERVE_MCP_BUDGET_MODE'];
   // Match `McpClientManager.readBudgetFromEnv`'s parsing exactly: only plain
   // decimal digits set a budget. A loose `Number(...)` would silently accept
   // `0x10`=16, `1e2`=100, and `1.0`=1 (all pass `isInteger`); the strict
@@ -3911,6 +3967,15 @@ class QwenAgent implements Agent {
             projectHooks: settings.getProjectHooks(),
           },
           buildDisabledSkillNamesProvider(settings),
+          undefined,
+          undefined,
+          true,
+          this.workspaceBinding
+            ? {
+                runtimeEnvironment: this.workspaceBinding.environment,
+                workspaceTrusted: this.workspaceBinding.trusted,
+              }
+            : undefined,
         ),
       );
       this.workspaceMcpInitializingConfig = config;
@@ -3993,7 +4058,7 @@ class QwenAgent implements Agent {
       return { accepted: false };
     }
     return this.enqueueWorkspaceMcpDiscovery('initialization', async () => {
-      const settings = loadSettings(this.config.getTargetDir());
+      const settings = this.loadScopedSettings(this.config.getTargetDir());
       await this.createWorkspaceMcpDiscoveryConfig(settings);
     });
   }
@@ -4007,7 +4072,7 @@ class QwenAgent implements Agent {
     accepted: boolean;
   } {
     return this.enqueueWorkspaceMcpDiscovery('reload', async () => {
-      const settings = loadSettings(this.config.getTargetDir());
+      const settings = this.loadScopedSettings(this.config.getTargetDir());
       const discoveryConfig = this.workspaceMcpDiscoveryConfig;
       const liveConfigs = new Set([
         this.config,
@@ -4580,11 +4645,13 @@ class QwenAgent implements Agent {
     private readonly sessionWriterLeaseEnabledAtStartup = false,
     private readonly managedToolInvocationGuard?: ToolInvocationGuard,
     private readonly externalToolGuardProviderAttached = false,
+    private readonly workspaceBinding?: AcpWorkspaceBinding,
   ) {
+    const environment = workspaceBinding?.environment ?? process.env;
     // Pool kill switch via env var so operators can A/B compare or
     // roll back without rebuilding. `run-qwen-serve.ts` sets this when
     // `--no-mcp-pool` is passed at daemon startup.
-    if (process.env['QWEN_SERVE_NO_MCP_POOL'] === '1') {
+    if (environment['QWEN_SERVE_NO_MCP_POOL'] === '1') {
       this.mcpPool = undefined;
       this.workspaceMcpBudget = undefined;
     } else {
@@ -4593,7 +4660,7 @@ class QwenAgent implements Agent {
       // this controller's accounting REPLACES per-session copies.
       this.workspaceMcpBudget = createWorkspaceMcpBudget((event) => {
         this.broadcastBudgetEvent(event);
-      });
+      }, environment);
       this.mcpPool = new McpTransportPool(this.config, {
         workspaceContext: this.config.getWorkspaceContext(),
         debugMode: this.config.getDebugMode(),
@@ -4604,10 +4671,10 @@ class QwenAgent implements Agent {
         // wiring; pool-mode discoverAllMcpToolsViaPool delegates SDK
         // MCP to that bypass.
         pooledTransports: parsePooledTransports(
-          process.env['QWEN_SERVE_MCP_POOL_TRANSPORTS'],
+          environment['QWEN_SERVE_MCP_POOL_TRANSPORTS'],
         ),
         drainDelayMs: parsePoolDrainMs(
-          process.env['QWEN_SERVE_MCP_POOL_DRAIN_MS'],
+          environment['QWEN_SERVE_MCP_POOL_DRAIN_MS'],
         ),
         budget: this.workspaceMcpBudget,
       });
@@ -4622,7 +4689,51 @@ class QwenAgent implements Agent {
     cwd: string,
     operation: () => T,
   ): T {
+    if (this.workspaceBinding) {
+      return Storage.runWithResolvedRuntimeBaseDir(
+        this.workspaceBinding.runtimeBaseDir,
+        operation,
+      );
+    }
     return runWithAcpRuntimeOutputDir(settings, cwd, operation);
+  }
+
+  private async resolveRequestCwd(cwd?: string | null): Promise<string> {
+    if (!this.workspaceBinding) return cwd || process.cwd();
+    if (cwd) {
+      let canonicalCwd: string;
+      try {
+        canonicalCwd = await fs.realpath(cwd);
+      } catch {
+        throw RequestError.invalidParams(undefined, 'Workspace is unavailable');
+      }
+      if (!isSameConversationPath(canonicalCwd, this.workspaceBinding.cwd)) {
+        throw RequestError.invalidParams(
+          undefined,
+          'ACP host is bound to a different workspace',
+        );
+      }
+    }
+    return this.workspaceBinding.cwd;
+  }
+
+  private loadScopedSettings(cwd: string, cached = false): LoadedSettings {
+    if (!this.workspaceBinding) {
+      return cached ? loadSettingsCached(cwd) : loadSettings(cwd);
+    }
+    return loadSettings(cwd, {
+      runtimeEnvironment: this.workspaceBinding.environment,
+      workspaceTrusted: this.workspaceBinding.trusted,
+      skipWorkspaceSettings: !this.workspaceBinding.trusted,
+    });
+  }
+
+  private reloadScopedEnvironment(
+    ...args: Parameters<typeof reloadEnvironment>
+  ): ReturnType<typeof reloadEnvironment> {
+    return this.workspaceBinding
+      ? { updatedKeys: [], removedKeys: [] }
+      : reloadEnvironment(...args);
   }
 
   /**
@@ -4970,7 +5081,8 @@ class QwenAgent implements Agent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    const { cwd, mcpServers } = params;
+    const cwd = await this.resolveRequestCwd(params.cwd);
+    const { mcpServers } = params;
     const parsedSessionId = parseCallerSuppliedSessionId(
       params._meta?.[REQUESTED_SESSION_ID_META_KEY],
     );
@@ -5022,7 +5134,7 @@ class QwenAgent implements Agent {
           // persists model changes through this instance, so a mix-up writes to
           // another workspace's settings.json.
           const settings = profiler.timeSync('settings_load', () =>
-            loadSettingsCached(cwd),
+            this.loadScopedSettings(cwd, true),
           );
           this.settings = settings;
           const deferMcpDiscovery = shouldDeferMcpDiscovery(params);
@@ -5094,6 +5206,7 @@ class QwenAgent implements Agent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    params = { ...params, cwd: await this.resolveRequestCwd(params.cwd) };
     const sessionId = normalizeSessionIdForLookup(params.sessionId);
     const parentContext = extractDaemonTraceContext(params);
     return await withDaemonSpan(
@@ -5154,7 +5267,7 @@ class QwenAgent implements Agent {
     const liveSession = this.sessions.get(sessionId);
     if (liveSession) {
       const settings = profiler.timeSync('settings_load', () =>
-        loadSettingsCached(params.cwd),
+        this.loadScopedSettings(params.cwd, true),
       );
       const liveConfig = liveSession.getConfig();
       return profiler.time('live_restore', async () => {
@@ -5268,7 +5381,7 @@ class QwenAgent implements Agent {
       // Load per-request settings only after reserving a non-live id. The check
       // must resolve `advanced.runtimeOutputDir` from this request's cwd.
       const settings = profiler.timeSync('settings_load', () =>
-        loadSettingsCached(params.cwd),
+        this.loadScopedSettings(params.cwd, true),
       );
       const persistedSessionId = await profiler.time('existence_check', () =>
         this.runWithPinnedRuntimeBaseDir(settings, params.cwd, async () => {
@@ -5567,6 +5680,7 @@ class QwenAgent implements Agent {
   async unstable_resumeSession(
     params: ResumeSessionRequest,
   ): Promise<ResumeSessionResponse> {
+    params = { ...params, cwd: await this.resolveRequestCwd(params.cwd) };
     const sessionId = normalizeSessionIdForLookup(params.sessionId);
     const parentContext = extractDaemonTraceContext(params);
     return await withDaemonSpan(
@@ -5624,7 +5738,7 @@ class QwenAgent implements Agent {
     const liveSession = this.sessions.get(sessionId);
     if (liveSession) {
       const settings = profiler.timeSync('settings_load', () =>
-        loadSettingsCached(params.cwd),
+        this.loadScopedSettings(params.cwd, true),
       );
       const liveConfig = liveSession.getConfig();
       return profiler.time('live_restore', async () => {
@@ -5656,7 +5770,7 @@ class QwenAgent implements Agent {
     try {
       // Same per-request settings discipline as `loadSession`.
       const settings = profiler.timeSync('settings_load', () =>
-        loadSettingsCached(params.cwd),
+        this.loadScopedSettings(params.cwd, true),
       );
       const persistedSessionId = await profiler.time('existence_check', () =>
         this.runWithPinnedRuntimeBaseDir(settings, params.cwd, async () => {
@@ -5817,7 +5931,7 @@ class QwenAgent implements Agent {
   async unstable_listSessions(
     params: ListSessionsRequest,
   ): Promise<ListSessionsResponse> {
-    const cwd = params.cwd || process.cwd();
+    const cwd = await this.resolveRequestCwd(params.cwd);
     const numericCursor = parseAcpSessionListCursor(params.cursor);
 
     // The ACP spec's ListSessionsRequest doesn't include a page-size field,
@@ -5826,13 +5940,17 @@ class QwenAgent implements Agent {
     // (same pattern filesystem.ts uses for `_meta.bom` / `_meta.encoding`).
     const size = normalizeAcpSessionListSize(params._meta?.['size']);
 
-    const result = await runWithAcpRuntimeOutputDir(this.settings, cwd, () => {
-      const sessionService = new SessionService(cwd);
-      return sessionService.listSessions({
-        cursor: numericCursor,
-        size,
-      });
-    });
+    const result = await this.runWithPinnedRuntimeBaseDir(
+      this.settings,
+      cwd,
+      () => {
+        const sessionService = new SessionService(cwd);
+        return sessionService.listSessions({
+          cursor: numericCursor,
+          size,
+        });
+      },
+    );
 
     const sessions: SessionInfo[] = result.items.map((item) => ({
       _meta: {
@@ -6156,7 +6274,7 @@ class QwenAgent implements Agent {
   }
 
   private loadPermissionSettings(cwd: string): LoadedSettings {
-    this.settings = loadSettings(cwd);
+    this.settings = this.loadScopedSettings(cwd);
     return this.settings;
   }
 
@@ -6198,6 +6316,7 @@ class QwenAgent implements Agent {
           extension.config,
           extension.id,
           ExtensionSettingScope.WORKSPACE,
+          cwd,
         );
         const settingDefs = extension.settings ?? [];
         return {
@@ -6427,7 +6546,7 @@ class QwenAgent implements Agent {
   ): Promise<ServeWorkspaceMcpStatus> {
     try {
       const workspaceCwd = this.workspaceCwd(config);
-      const settings = loadSettings(config.getTargetDir());
+      const settings = this.loadScopedSettings(config.getTargetDir());
       const userServers = settings.user?.settings.mcpServers ?? {};
       const systemDefaultServers =
         settings.systemDefaults?.settings.mcpServers ?? {};
@@ -7362,7 +7481,7 @@ class QwenAgent implements Agent {
       }
       const apiKeyVars = AUTH_PREFLIGHT_ENV_KEYS[String(authType)] ?? [];
       const presentVar = apiKeyVars.find((name: string) =>
-        Boolean(process.env[name]),
+        Boolean((this.workspaceBinding?.environment ?? process.env)[name]),
       );
       let hasToken = Boolean(presentVar);
       if (
@@ -7383,7 +7502,9 @@ class QwenAgent implements Agent {
       if (
         !hasToken &&
         authType === AuthType.USE_VERTEX_AI &&
-        hasVertexProjectConfigured()
+        hasVertexProjectConfigured(
+          (key) => (this.workspaceBinding?.environment ?? process.env)[key],
+        )
       ) {
         return this.acpCell('auth', {
           status: 'unknown',
@@ -8330,7 +8451,7 @@ class QwenAgent implements Agent {
   ): Promise<Record<string, unknown>> {
     const requestedCwd =
       typeof params['cwd'] === 'string' ? params['cwd'] : undefined;
-    const cwd = requestedCwd || process.cwd();
+    const cwd = await this.resolveRequestCwd(requestedCwd);
     switch (method) {
       case SERVE_STATUS_EXT_METHODS.channelPing: {
         const nonce = params['nonce'];
@@ -8470,7 +8591,7 @@ class QwenAgent implements Agent {
         return setManagedSkillEnabled(this.config, params, requestedCwd);
       }
       case 'qwen/settings/getMemory': {
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         this.settings = settings;
         return {
           settings: normalizeQwenMemorySettings(settings.merged.memory),
@@ -8481,7 +8602,7 @@ class QwenAgent implements Agent {
         // Mutate a freshly loaded settings object and adopt it, mirroring the
         // other settings mutation handlers, instead of writing through the
         // possibly-stale cached `this.settings` and reading it back.
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         for (const key of QWEN_MEMORY_SETTING_KEYS) {
           if (updates[key] === undefined) continue;
           if (typeof updates[key] !== 'boolean') {
@@ -8740,60 +8861,67 @@ class QwenAgent implements Agent {
         }
 
         try {
-          const settings = loadSettingsCached(cwd);
-          return await runWithAcpRuntimeOutputDir(settings, cwd, async () => {
-            if (rawDirection === 'backward') {
-              await this.sessions
-                .get(sessionId)
-                ?.getConfig()
-                .getChatRecordingService()
-                ?.flush();
-            }
-            const reader = new SessionTranscriptReader(cwd);
-            const activePromptBeforeRead =
-              this.activePromptCalls.has(sessionId);
-            const page = await reader.readPage(sessionId, {
-              ...(typeof rawCursor === 'string' ? { cursor: rawCursor } : {}),
-              ...(typeof rawBeforeRecordId === 'string'
-                ? { beforeRecordId: rawBeforeRecordId }
-                : {}),
-              ...(rawDirection === 'backward'
-                ? { direction: rawDirection }
-                : {}),
-              ...(typeof rawLimit === 'number' ? { limit: rawLimit } : {}),
-              maxBytes: SESSION_TRANSCRIPT_MAX_PAGE_BYTES,
-            });
-            const config = await this.getTranscriptReplayConfig(cwd, settings);
-            const replay = await replayTranscriptRecordPage({
-              sessionId,
-              page,
-              config,
-              finalizeDangling:
-                !activePromptBeforeRead &&
-                !this.activePromptCalls.has(sessionId),
-              encodeCursor: (state) =>
-                encodeSessionTranscriptCursor(state, cwd),
-              logger: debugLogger,
-            });
-            return {
-              v: 1,
-              sessionId,
-              events: replay.updates.map((update) => ({
+          const settings = this.loadScopedSettings(cwd, true);
+          return await this.runWithPinnedRuntimeBaseDir(
+            settings,
+            cwd,
+            async () => {
+              if (rawDirection === 'backward') {
+                await this.sessions
+                  .get(sessionId)
+                  ?.getConfig()
+                  .getChatRecordingService()
+                  ?.flush();
+              }
+              const reader = new SessionTranscriptReader(cwd);
+              const activePromptBeforeRead =
+                this.activePromptCalls.has(sessionId);
+              const page = await reader.readPage(sessionId, {
+                ...(typeof rawCursor === 'string' ? { cursor: rawCursor } : {}),
+                ...(typeof rawBeforeRecordId === 'string'
+                  ? { beforeRecordId: rawBeforeRecordId }
+                  : {}),
+                ...(rawDirection === 'backward'
+                  ? { direction: rawDirection }
+                  : {}),
+                ...(typeof rawLimit === 'number' ? { limit: rawLimit } : {}),
+                maxBytes: SESSION_TRANSCRIPT_MAX_PAGE_BYTES,
+              });
+              const config = await this.getTranscriptReplayConfig(
+                cwd,
+                settings,
+              );
+              const replay = await replayTranscriptRecordPage({
+                sessionId,
+                page,
+                config,
+                finalizeDangling:
+                  !activePromptBeforeRead &&
+                  !this.activePromptCalls.has(sessionId),
+                encodeCursor: (state) =>
+                  encodeSessionTranscriptCursor(state, cwd),
+                logger: debugLogger,
+              });
+              return {
                 v: 1,
-                type: 'session_update',
-                data: update,
-              })),
-              ...(replay.nextCursor !== undefined
-                ? { nextCursor: replay.nextCursor }
-                : {}),
-              hasMore: replay.hasMore,
-              startTime: replay.startTime,
-              lastUpdated: replay.lastUpdated,
-              ...(replay.replayError !== undefined
-                ? { partial: true, replayError: replay.replayError }
-                : {}),
-            } as Record<string, unknown>;
-          });
+                sessionId,
+                events: replay.updates.map((update) => ({
+                  v: 1,
+                  type: 'session_update',
+                  data: update,
+                })),
+                ...(replay.nextCursor !== undefined
+                  ? { nextCursor: replay.nextCursor }
+                  : {}),
+                hasMore: replay.hasMore,
+                startTime: replay.startTime,
+                lastUpdated: replay.lastUpdated,
+                ...(replay.replayError !== undefined
+                  ? { partial: true, replayError: replay.replayError }
+                  : {}),
+              } as Record<string, unknown>;
+            },
+          );
         } catch (error) {
           if (
             error instanceof InvalidSessionTranscriptCursorError ||
@@ -9330,7 +9458,7 @@ class QwenAgent implements Agent {
         // toggles applied since this ACP child booted. Reads need the
         // union (User + System + Workspace); writes target Workspace only.
         try {
-          const fresh = loadSettings(config.getTargetDir());
+          const fresh = this.loadScopedSettings(config.getTargetDir());
           const mergedDisabled = fresh.merged.tools?.disabled;
           // Detect and stderr-log malformed `tools.disabled` before
           // clearing so a misconfigured settings file is loud.
@@ -9529,7 +9657,7 @@ class QwenAgent implements Agent {
         }
 
         if (action === 'enable') {
-          const settings = loadSettings(config.getTargetDir());
+          const settings = this.loadScopedSettings(config.getTargetDir());
           let settingsChanged = false;
           for (const scope of [SettingScope.User, SettingScope.Workspace]) {
             const scopeSettings = settings.forScope(scope).settings;
@@ -9566,7 +9694,7 @@ class QwenAgent implements Agent {
         }
 
         if (action === 'disable') {
-          const settings = loadSettings(config.getTargetDir());
+          const settings = this.loadScopedSettings(config.getTargetDir());
           const userSettings = settings.forScope(SettingScope.User).settings;
           const workspaceSettings = settings.forScope(
             SettingScope.Workspace,
@@ -10233,6 +10361,7 @@ class QwenAgent implements Agent {
             'Invalid or missing path (must be an absolute path)',
           );
         }
+        if (this.workspaceBinding) await this.resolveRequestCwd(targetPath);
         const managedRelocation = params['managedRelocation'];
         if (
           managedRelocation !== undefined &&
@@ -11720,81 +11849,85 @@ class QwenAgent implements Agent {
           );
         }
         const session = this.sessionOrThrow(sessionId);
-        const settings = loadSettingsCached(cwd);
-        return await runWithAcpRuntimeOutputDir(settings, cwd, async () => {
-          try {
-            await session.getConfig().getChatRecordingService()?.flush();
-          } catch {
-            // Read the last durable snapshot after a best-effort flush.
-          }
-          let reader: SessionTranscriptReader | undefined;
-          try {
-            reader = new SessionTranscriptReader(cwd);
-            const turnResult = await findSettledTurnResult(
-              reader,
-              sessionId,
-              typeof rawPromptId === 'string' ? rawPromptId : undefined,
-              cwd,
-            );
-            return {
-              v: 1,
-              sessionId,
-              turnResult: turnResult ?? null,
-            };
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-              // Transcript file not written yet (no settled turn
-              // persisted). Scoped to the read so an unrelated ENOENT
-              // (settings/runtime resolution) still surfaces.
-              return { v: 1, sessionId, turnResult: null };
+        const settings = this.loadScopedSettings(cwd, true);
+        return await this.runWithPinnedRuntimeBaseDir(
+          settings,
+          cwd,
+          async () => {
+            try {
+              await session.getConfig().getChatRecordingService()?.flush();
+            } catch {
+              // Read the last durable snapshot after a best-effort flush.
             }
-            if (
-              error instanceof SessionTranscriptSnapshotUnavailableError &&
-              reader
-            ) {
-              try {
-                const transcript = await fs.stat(
-                  reader.getSessionFilePath(sessionId),
-                );
-                if (transcript.size === 0) {
-                  return { v: 1, sessionId, turnResult: null };
-                }
-              } catch (statError) {
-                if ((statError as NodeJS.ErrnoException).code === 'ENOENT') {
-                  return { v: 1, sessionId, turnResult: null };
+            let reader: SessionTranscriptReader | undefined;
+            try {
+              reader = new SessionTranscriptReader(cwd);
+              const turnResult = await findSettledTurnResult(
+                reader,
+                sessionId,
+                typeof rawPromptId === 'string' ? rawPromptId : undefined,
+                cwd,
+              );
+              return {
+                v: 1,
+                sessionId,
+                turnResult: turnResult ?? null,
+              };
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                // Transcript file not written yet (no settled turn
+                // persisted). Scoped to the read so an unrelated ENOENT
+                // (settings/runtime resolution) still surfaces.
+                return { v: 1, sessionId, turnResult: null };
+              }
+              if (
+                error instanceof SessionTranscriptSnapshotUnavailableError &&
+                reader
+              ) {
+                try {
+                  const transcript = await fs.stat(
+                    reader.getSessionFilePath(sessionId),
+                  );
+                  if (transcript.size === 0) {
+                    return { v: 1, sessionId, turnResult: null };
+                  }
+                } catch (statError) {
+                  if ((statError as NodeJS.ErrnoException).code === 'ENOENT') {
+                    return { v: 1, sessionId, turnResult: null };
+                  }
                 }
               }
+              if (error instanceof InvalidSessionTranscriptCursorError) {
+                throw new RequestError(-32602, error.message, {
+                  errorKind: 'invalid_transcript_cursor',
+                });
+              }
+              if (error instanceof SessionTranscriptSnapshotUnavailableError) {
+                throw new RequestError(-32010, error.message, {
+                  errorKind: 'transcript_snapshot_unavailable',
+                  sessionId,
+                });
+              }
+              if (error instanceof SessionTranscriptTooLargeError) {
+                throw new RequestError(-32011, error.message, {
+                  errorKind: 'transcript_too_large',
+                  sessionId,
+                  snapshotSize: error.snapshotSize,
+                  maxBytes: error.maxBytes,
+                });
+              }
+              if (error instanceof SessionTranscriptPageTooLargeError) {
+                throw new RequestError(-32012, error.message, {
+                  errorKind: 'transcript_page_too_large',
+                  sessionId,
+                  pageBytes: error.pageBytes,
+                  maxBytes: error.maxBytes,
+                });
+              }
+              throw error;
             }
-            if (error instanceof InvalidSessionTranscriptCursorError) {
-              throw new RequestError(-32602, error.message, {
-                errorKind: 'invalid_transcript_cursor',
-              });
-            }
-            if (error instanceof SessionTranscriptSnapshotUnavailableError) {
-              throw new RequestError(-32010, error.message, {
-                errorKind: 'transcript_snapshot_unavailable',
-                sessionId,
-              });
-            }
-            if (error instanceof SessionTranscriptTooLargeError) {
-              throw new RequestError(-32011, error.message, {
-                errorKind: 'transcript_too_large',
-                sessionId,
-                snapshotSize: error.snapshotSize,
-                maxBytes: error.maxBytes,
-              });
-            }
-            if (error instanceof SessionTranscriptPageTooLargeError) {
-              throw new RequestError(-32012, error.message, {
-                errorKind: 'transcript_page_too_large',
-                sessionId,
-                pageBytes: error.pageBytes,
-                maxBytes: error.maxBytes,
-              });
-            }
-            throw error;
-          }
-        });
+          },
+        );
       }
       case SERVE_CONTROL_EXT_METHODS.sessionContinue: {
         const sessionId = params['sessionId'];
@@ -11983,7 +12116,7 @@ class QwenAgent implements Agent {
             'Invalid or missing sessionId',
           );
         }
-        const success = await runWithAcpRuntimeOutputDir(
+        const success = await this.runWithPinnedRuntimeBaseDir(
           this.settings,
           cwd,
           async () => {
@@ -12033,7 +12166,7 @@ class QwenAgent implements Agent {
           const ok = await liveRecording.recordCustomTitle(title, 'manual');
           return { success: ok };
         }
-        const success = await runWithAcpRuntimeOutputDir(
+        const success = await this.runWithPinnedRuntimeBaseDir(
           this.settings,
           cwd,
           async () => {
@@ -12254,7 +12387,7 @@ class QwenAgent implements Agent {
           const config = liveSession.getConfig();
           await this.assertLiveSessionScope(
             config,
-            loadSettingsCached(cwd),
+            this.loadScopedSettings(cwd, true),
             cwd,
           );
           const recording = config.getChatRecordingService();
@@ -12265,7 +12398,7 @@ class QwenAgent implements Agent {
             : await loadAuthoritative();
           replayConfig = config;
         } else {
-          const settings = loadSettingsCached(cwd);
+          const settings = this.loadScopedSettings(cwd, true);
           sessionData = await this.runWithPinnedRuntimeBaseDir(
             settings,
             cwd,
@@ -12485,7 +12618,7 @@ class QwenAgent implements Agent {
         return { newSessionId, title, displayName: title };
       }
       case 'qwen/settings/getCore': {
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         this.settings = settings;
         return this.buildCoreSettings(settings, cwd);
       }
@@ -12500,7 +12633,7 @@ class QwenAgent implements Agent {
             'Unsupported Qwen setting key',
           );
         }
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         const settingKey = key as QwenCoreSettingKey;
         const normalizedValue = normalizeCoreSettingValue(
           settingKey,
@@ -12540,7 +12673,7 @@ class QwenAgent implements Agent {
             'MCP server name is required',
           );
         }
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         const settingScope = toSettingsScope(params['scope']);
         const scope =
           settingScope === SettingScope.Workspace ? 'workspace' : 'user';
@@ -12569,7 +12702,7 @@ class QwenAgent implements Agent {
             'MCP server name is required',
           );
         }
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         const settingScope = toSettingsScope(params['scope']);
         const scope =
           settingScope === SettingScope.Workspace ? 'workspace' : 'user';
@@ -12587,7 +12720,7 @@ class QwenAgent implements Agent {
         if (!isHookEvent(event)) {
           throw RequestError.invalidParams(undefined, 'Invalid hook event');
         }
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         const settingScope = toSettingsScope(params['scope']);
         const scope =
           settingScope === SettingScope.Workspace ? 'workspace' : 'user';
@@ -12642,7 +12775,7 @@ class QwenAgent implements Agent {
         ) {
           throw RequestError.invalidParams(undefined, 'Invalid hook index');
         }
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         const settingScope = toSettingsScope(params['scope']);
         const scope =
           settingScope === SettingScope.Workspace ? 'workspace' : 'user';
@@ -12681,11 +12814,13 @@ class QwenAgent implements Agent {
         if (typeof value !== 'string') {
           throw RequestError.invalidParams(undefined, 'value must be a string');
         }
-        const settings = loadSettings(cwd);
+        const settings = this.loadScopedSettings(cwd);
         const extensionManager = new ExtensionManager({
           workspaceDir: cwd,
           isWorkspaceTrusted:
-            isWorkspaceTrusted(settings.merged).isTrusted ?? true,
+            this.workspaceBinding?.trusted ??
+            isWorkspaceTrusted(settings.merged).isTrusted ??
+            true,
           locale: getCurrentLanguage(),
         });
         await extensionManager.refreshCache();
@@ -12705,6 +12840,7 @@ class QwenAgent implements Agent {
           settingKey,
           async () => value,
           extScope,
+          cwd,
         );
         // Unlike the sibling core-setting handlers, this persists through
         // `updateSetting` (extension settings store), not `settings.setValue`,
@@ -12781,7 +12917,7 @@ class QwenAgent implements Agent {
         }
         this.modelProviderReloadRevision += 1;
         const merged = this.settings.merged;
-        reloadEnvironment(merged, cwd);
+        this.reloadScopedEnvironment(merged, cwd);
         const providerProtocol = merged.providerProtocol ?? {};
         let configsRefreshed = 0;
         let configsFailed = 0;
@@ -12827,7 +12963,7 @@ class QwenAgent implements Agent {
         this.settings.reloadScopeFromDisk(SettingScope.Workspace);
         const newMerged = this.settings.merged;
 
-        const envResult = reloadEnvironment(newMerged, cwd);
+        const envResult = this.reloadScopedEnvironment(newMerged, cwd);
 
         const changed = diffSettingsKeys(oldMerged, newMerged);
         const envChanged =
@@ -13187,6 +13323,7 @@ class QwenAgent implements Agent {
     chatRecording?: boolean,
     restoreOptions?: SelectiveSessionRestoreOptions,
   ): Promise<Config> {
+    cwd = await this.resolveRequestCwd(cwd);
     // Transcript replay is the only recording-disabled Config and must remain
     // id-less; it borrows the validated target session context from extMethod.
     const preserveIdlessSession =
@@ -13375,8 +13512,13 @@ class QwenAgent implements Agent {
       // not process.exit(1) the shared ACP child and every session on its
       // channel. newSessionConfig maps the throw to a RequestError.
       true,
-      this.managedToolInvocationGuard || restoreOptions || provisionalWorkspace
+      this.workspaceBinding ||
+        this.managedToolInvocationGuard ||
+        restoreOptions ||
+        provisionalWorkspace
         ? {
+            runtimeEnvironment: this.workspaceBinding?.environment,
+            workspaceTrusted: this.workspaceBinding?.trusted,
             ...(provisionalWorkspace
               ? { provisionalWorkspace: true as const }
               : {}),
@@ -13575,7 +13717,10 @@ class QwenAgent implements Agent {
       this.clientCapabilities.fs,
       config.getFileSystemService(),
       {
-        localReadRoots: buildAcpLocalReadRoots(config),
+        localReadRoots: buildAcpLocalReadRoots(
+          config,
+          this.workspaceBinding?.environment,
+        ),
       },
     );
     config.setFileSystemService(acpFileSystemService);
@@ -13759,7 +13904,10 @@ class QwenAgent implements Agent {
               SettingScope.Workspace,
             ]) !== false;
           if (settingsReloaded) {
-            reloadEnvironment(settings.merged, config.getTargetDir());
+            this.reloadScopedEnvironment(
+              settings.merged,
+              config.getTargetDir(),
+            );
           } else {
             debugLogger.warn(
               'Deferred session settings reload failed; keeping current environment',
@@ -13825,7 +13973,7 @@ class QwenAgent implements Agent {
           settings.merged.providerProtocol ?? {},
         );
         if (options.deferWorkspaceActivation !== true) {
-          const envReload = reloadEnvironment(
+          const envReload = this.reloadScopedEnvironment(
             settings.merged,
             config.getTargetDir(),
           );

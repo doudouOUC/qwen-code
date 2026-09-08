@@ -1224,6 +1224,36 @@ describe('loadCliConfig', () => {
     expect(process.env['OPENAI_API_KEY']).toBe('ambient-key');
   });
 
+  it.each([true, false])(
+    'uses host workspace trust %s for approval policy instead of ambient trust',
+    async (workspaceTrusted) => {
+      vi.mocked(isWorkspaceTrusted).mockReturnValue({
+        isTrusted: !workspaceTrusted,
+        source: 'file',
+      });
+      process.argv = ['node', 'script.js', '--approval-mode', 'yolo'];
+      const argv = await parseArguments();
+      const config = await loadCliConfig(
+        {},
+        argv,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        { runtimeEnvironment: {}, workspaceTrusted },
+      );
+      expect(config.isTrustedFolder()).toBe(workspaceTrusted);
+      expect(config.getApprovalMode()).toBe(
+        workspaceTrusted
+          ? ServerConfig.ApprovalMode.YOLO
+          : ServerConfig.ApprovalMode.DEFAULT,
+      );
+    },
+  );
+
   it('maps --restore-ask-user-question only in ACP mode', async () => {
     process.argv = [
       'node',

@@ -690,6 +690,10 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => ({
     getGlobalTempDir: vi.fn(() => '/tmp/qwen-global-temp'),
     getUserExtensionsDir: vi.fn(() => '/tmp/qwen-extensions'),
     getRuntimeBaseDir: vi.fn(() => '/tmp/qwen-runtime-test'),
+    runWithResolvedRuntimeBaseDir: vi.fn(
+      (await importOriginal<typeof import('@qwen-code/qwen-code-core')>())
+        .Storage.runWithResolvedRuntimeBaseDir,
+    ),
     runWithRuntimeBaseDir: vi.fn(
       (
         _runtimeBaseDir: string,
@@ -2309,6 +2313,144 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     expect(process.env['QWEN_CODE_PRIVATE_ACP_CAPABILITY']).toBe(
       'ambient-secret',
     );
+  });
+
+  it('rejects an explicit host whose bootstrap environment differs', async () => {
+    mockConfig.getRuntimeEnvironment = vi.fn().mockReturnValue({ KEY: 'boot' });
+    await expect(
+      createAcpAgentHost(
+        mockConfig,
+        makeSessionSettings(),
+        mockArgv,
+        () => {
+          throw new Error('Unexpected stream creation');
+        },
+        { runtimeEnvironment: { KEY: 'request' } },
+      ),
+    ).rejects.toThrow('host and bootstrap Config environments must match');
+    expect(mockConfig.initialize).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    'pins explicit host settings and request storage with workspace trust %s',
+    async (trusted) => {
+      const innerConfig = await setupSessionMocks('snapshot-session');
+      const canonicalCwd = await realFsPromises.realpath('/tmp');
+      const runtimeBaseDir = path.join(canonicalCwd, 'qwen-host-snapshot-unit');
+      const environment = { MODEL_KEY: 'host-key' };
+      Object.assign(mockConfig, {
+        getRuntimeEnvironment: () => ({ ...environment }),
+        getTargetDir: () => '/tmp',
+        getSessionRuntimeBaseDir: () => runtimeBaseDir,
+        isTrustedFolder: () => trusted,
+      });
+      Object.assign(innerConfig.storage, {
+        getProjectTempDir: () => runtimeBaseDir,
+        getProjectDir: () => runtimeBaseDir,
+        getUserSkillsDirs: () => [],
+      });
+      innerConfig.getTargetDir.mockReturnValue(canonicalCwd);
+      const { Storage: realStorage } = await vi.importActual<
+        typeof import('@qwen-code/qwen-code-core')
+      >('@qwen-code/qwen-code-core');
+      const outputRoots: string[] = [];
+      const connection = await bootInMemoryHost({
+        runtimeEnvironment: environment,
+      });
+      try {
+        environment.MODEL_KEY = 'caller-mutation';
+        await connection.client.initialize({
+          protocolVersion: 1,
+          clientCapabilities: {},
+        });
+        const session = await connection.client.newSession({
+          cwd: '/tmp',
+          mcpServers: [],
+        });
+        lastSessionMock!.prompt.mockImplementation(async () => {
+          await Promise.resolve();
+          outputRoots.push(realStorage.getRuntimeBaseDir());
+          return { stopReason: 'end_turn' };
+        });
+        await connection.client.prompt({
+          sessionId: session.sessionId,
+          prompt: [{ type: 'text', text: 'snapshot' }],
+        });
+        await connection.client.extMethod('qwen/settings/getMemory', {});
+        await connection.client.extMethod(
+          SERVE_CONTROL_EXT_METHODS.workspaceReload,
+          {},
+        );
+        expect(outputRoots).toEqual([runtimeBaseDir]);
+        expect(loadSettings).toHaveBeenLastCalledWith(canonicalCwd, {
+          runtimeEnvironment: { MODEL_KEY: 'host-key' },
+          workspaceTrusted: trusted,
+          skipWorkspaceSettings: !trusted,
+        });
+        const policy = vi.mocked(loadCliConfig).mock.calls.at(-1)?.[9];
+        expect(policy?.runtimeEnvironment).toEqual({ MODEL_KEY: 'host-key' });
+        expect(policy?.workspaceTrusted).toBe(trusted);
+        expect(Object.isFrozen(policy?.runtimeEnvironment)).toBe(true);
+        expect(reloadEnvironment).not.toHaveBeenCalled();
+      } finally {
+        await connection.close();
+      }
+    },
+  );
+
+  it('rejects cross-workspace creation, restore, list and settings requests', async () => {
+    const sdk = await vi.importActual<
+      typeof import('@agentclientprotocol/sdk')
+    >('@agentclientprotocol/sdk');
+    // Real transport serializes only actual SDK RequestErrors.
+    const invalidParams = vi.mocked(RequestError.invalidParams);
+    const previousInvalidParams = invalidParams.getMockImplementation()!;
+    invalidParams.mockImplementation(sdk.RequestError.invalidParams);
+    Object.assign(mockConfig, {
+      getRuntimeEnvironment: () => ({}),
+      getTargetDir: () => '/tmp',
+      getSessionRuntimeBaseDir: () => '/tmp/qwen-host-snapshot-unit',
+      isTrustedFolder: () => true,
+    });
+    const connection = await bootInMemoryHost({ runtimeEnvironment: {} });
+    try {
+      await connection.client.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+      });
+      const settingsReads = vi.mocked(loadSettings).mock.calls.length;
+      const sessionId = '550e8400-e29b-41d4-a716-446655440000';
+      for (const request of [
+        () => connection.client.newSession({ cwd: '/', mcpServers: [] }),
+        () =>
+          connection.client.loadSession({
+            cwd: '/',
+            sessionId,
+            mcpServers: [],
+          }),
+        () =>
+          connection.client.unstable_resumeSession({
+            cwd: '/',
+            sessionId,
+            mcpServers: [],
+          }),
+        () => connection.client.unstable_listSessions({ cwd: '/' }),
+        () =>
+          connection.client.extMethod(SERVE_CONTROL_EXT_METHODS.sessionCd, {
+            sessionId,
+            path: '/',
+          }),
+        () =>
+          connection.client.extMethod('qwen/settings/getMemory', { cwd: '/' }),
+      ]) {
+        await expect(request()).rejects.toThrow('different workspace');
+      }
+      expect(loadSettings).toHaveBeenCalledTimes(settingsReads);
+      expect(loadCliConfig).not.toHaveBeenCalled();
+    } finally {
+      await connection.close();
+      invalidParams.mockImplementation(previousInvalidParams);
+    }
   });
 
   it('keeps the bootstrap MCP callback bound to the embedded client connection', async () => {

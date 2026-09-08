@@ -1324,6 +1324,7 @@ export async function loadCliConfig(
    */
   hostPolicy?: {
     runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
+    workspaceTrusted?: boolean;
     processNetworkOwner?: true;
     toolInvocationGuard?: ToolInvocationGuard;
     /** Host-managed session whose exact private cwd is bound after bootstrap. */
@@ -1343,6 +1344,7 @@ export async function loadCliConfig(
           ...(argv.insecure ? { QWEN_TLS_INSECURE: '1' } : {}),
         });
   const environment = runtimeEnvironment ?? process.env;
+  const workspaceTrusted = hostPolicy?.workspaceTrusted;
   const processNetworkOwner =
     runtimeEnvironment === undefined ||
     hostPolicy?.processNetworkOwner === true;
@@ -1399,7 +1401,8 @@ export async function loadCliConfig(
   const ideMode = settings.ide?.enabled ?? false;
 
   const folderTrust = settings.security?.folderTrust?.enabled ?? false;
-  const trustedFolder = isWorkspaceTrusted(settings)?.isTrusted ?? true;
+  const trustedFolder =
+    workspaceTrusted ?? isWorkspaceTrusted(settings)?.isTrusted ?? true;
 
   // Set the context filename in the server's memoryTool module BEFORE loading memory
   // TODO(b/343434939): This is a bit of a hack. The contextFileName should ideally be passed
@@ -2048,7 +2051,11 @@ export async function loadCliConfig(
     toolInvocationGuard: hostPolicy?.toolInvocationGuard,
     // Permission rule persistence callback (writes to settings files).
     onPersistPermissionRule: async (scope, ruleType, rule) => {
-      const currentSettings = loadSettings(cwd, { runtimeEnvironment });
+      const currentSettings = loadSettings(cwd, {
+        runtimeEnvironment,
+        workspaceTrusted,
+        skipWorkspaceSettings: workspaceTrusted === false,
+      });
       const settingScope =
         scope === 'project' ? SettingScope.Workspace : SettingScope.User;
       const key = `permissions.${ruleType}`;
