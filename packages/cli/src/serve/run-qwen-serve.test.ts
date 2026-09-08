@@ -558,6 +558,7 @@ it('mounts the authenticated Managed Runtime worker protocol', async () => {
   const provider: ManagedRuntimeProvider = {
     prepare: vi.fn(() => ({
       ready: Promise.resolve(),
+      finish: vi.fn(),
       getManifest: vi.fn(),
       execute: vi.fn(),
     })),

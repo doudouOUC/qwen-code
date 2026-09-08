@@ -67,6 +67,41 @@ describe('ManagedGatewaySessionEvents', () => {
     ]);
   });
 
+  it('updates a completed task after intentional Runtime release without changing its outcome', async () => {
+    const events = new ManagedGatewaySessionEvents();
+    const input = request();
+    events.ensure(input);
+    events.markRuntimeStarting(input);
+    events.markRuntimeReady(input);
+    events.complete(input);
+    events.markRuntimeLost(input, true);
+    expect(
+      events.authorize(input.sessionId, input.managedClientId),
+    ).toMatchObject({
+      phase: 'completed',
+      runtimeState: 'unknown',
+      runtimeReady: false,
+    });
+    expect(
+      (
+        await events.transcript(input.sessionId, input.managedClientId)
+      ).events.at(-1)?.type,
+    ).toBe('runtime_released');
+    events.markRuntimeLost(input, false);
+    expect(
+      events.authorize(input.sessionId, input.managedClientId),
+    ).toMatchObject({ phase: 'completed', runtimeState: 'failed' });
+    const next = request({
+      messageId: 'queued-next',
+      turnKind: 'continuation',
+    });
+    events.ensure(next);
+    events.markRuntimeLost(input, false);
+    expect(
+      events.authorize(input.sessionId, input.managedClientId),
+    ).toMatchObject({ phase: 'admitted', runtimeState: 'unknown' });
+  });
+
   it('records a late Runtime result without reopening a completed turn', async () => {
     const events = new ManagedGatewaySessionEvents();
     const input = request();

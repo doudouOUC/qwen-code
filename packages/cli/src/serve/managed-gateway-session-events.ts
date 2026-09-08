@@ -18,6 +18,7 @@ export type ManagedGatewaySessionEventType =
   | 'runtime_starting'
   | 'runtime_ready'
   | 'runtime_failed'
+  | 'runtime_released'
   | 'agent_started'
   | 'assistant_thought'
   | 'assistant_delta'
@@ -344,6 +345,20 @@ export class ManagedGatewaySessionEvents {
     };
   }
 
+  markRuntimeLost(
+    request: ManagedGatewayPromptRequest,
+    released: boolean,
+  ): void {
+    const state = this.sessions.get(request.sessionId);
+    if (
+      !state ||
+      this.disposed ||
+      state.request.messageId !== request.messageId
+    )
+      return;
+    this.append(state, released ? 'runtime_released' : 'runtime_failed');
+  }
+
   markRuntimeStarting(request: ManagedGatewayPromptRequest): void {
     const state = this.required(request);
     state.runtimePromptId = request.messageId;
@@ -647,6 +662,9 @@ export class ManagedGatewaySessionEvents {
         break;
       case 'runtime_ready':
         state.runtimeState = 'ready';
+        break;
+      case 'runtime_released':
+        state.runtimeState = 'unknown';
         break;
       case 'runtime_failed':
         state.runtimeState = 'failed';

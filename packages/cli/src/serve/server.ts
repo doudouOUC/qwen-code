@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type { ManagedWorkerBoot } from './managed-runtime-activator.js';
 import express from 'express';
 import type { Application } from 'express';
 import * as path from 'node:path';
@@ -667,6 +668,7 @@ export interface ServeAppDeps {
   managedGatewaySessionEvents?: ManagedGatewaySessionEvents;
   /** Experimental authenticated Tool-only Runtime worker surface. */
   managedRuntimeWorkerProvider?: ManagedRuntimeProvider;
+  ownedManagedRuntime?: ManagedWorkerBoot;
 }
 
 /**
@@ -937,7 +939,8 @@ export function createServeApp(
     webTerminalRegistry.dispose();
   webTerminalLocals.releaseWebTerminalsForWorkspace = (workspaceCwd) =>
     webTerminalRegistry.releaseWorkspace(workspaceCwd);
-  const acpHttpEnabledAtBoot = resolveAcpHttpEnabled(daemonEnvAtBoot);
+  const acpHttpEnabledAtBoot =
+    !deps.ownedManagedRuntime && resolveAcpHttpEnabled(daemonEnvAtBoot);
   const runtimePlatform = deps.runtimePlatform ?? process.platform;
   const liveVoiceSurfaceAvailable =
     runtimePlatform === 'darwin' &&
@@ -2713,6 +2716,7 @@ export function createServeApp(
   if (deps.managedRuntimeWorkerProvider) {
     registerManagedRuntimeWorkerRoutes(app, {
       provider: deps.managedRuntimeWorkerProvider,
+      owned: deps.ownedManagedRuntime,
       authorize: (req, res, next) => {
         if (
           listenerIdentityOf(req).kind !== 'primary' ||

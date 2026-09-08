@@ -148,6 +148,81 @@ describe('Managed Runtime providers', () => {
     await Promise.all(servers.splice(0).map((server) => close(server)));
   });
 
+  it('requires the immutable owned lease and scope on all private operations', async () => {
+    const runtime = fakeRuntime();
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const app = express();
+    app.use(express.json());
+    const owned = {
+      type: 'boot' as const,
+      version: 1 as const,
+      gatewayIncarnation: 'gateway',
+      leaseId: 'lease',
+      epoch: 2,
+      ...prepareRequest,
+      token,
+      outputRoot: '/tmp/owned',
+      cliEntry: '/tmp/cli.js',
+    };
+    registerManagedRuntimeWorkerRoutes(app, {
+      provider: local,
+      owned,
+      authorize: (req, res, next) => {
+        if (req.headers.authorization !== `Bearer ${token}`) {
+          res.sendStatus(401);
+          return;
+        }
+        next();
+      },
+    });
+    for (const operation of [
+      'prepare',
+      'manifest',
+      'execute',
+      'cancel',
+      'release',
+    ]) {
+      const url = `${MANAGED_RUNTIME_ROUTE_PREFIX}/${operation}`;
+      await request(app).post(url).send(prepareRequest).expect(401);
+      await request(app)
+        .post(url)
+        .set('Authorization', `Bearer ${token}`)
+        .send(prepareRequest)
+        .expect(409);
+      await request(app)
+        .post(url)
+        .set('Authorization', `Bearer ${token}`)
+        .set('X-Qwen-Managed-Lease-Id', 'old')
+        .set('X-Qwen-Managed-Lease-Epoch', '2')
+        .send(prepareRequest)
+        .expect(409);
+      await request(app)
+        .post(url)
+        .set('Authorization', `Bearer ${token}`)
+        .set('X-Qwen-Managed-Lease-Id', 'lease')
+        .set('X-Qwen-Managed-Lease-Epoch', '2')
+        .send({ ...prepareRequest, tenantId: 'other' })
+        .expect(409);
+    }
+    expect(runtime.bridge.spawnOrAttach).not.toHaveBeenCalled();
+    const server = createServer(app);
+    servers.push(server);
+    const port = await listen(server);
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: `http://127.0.0.1:${port}`,
+      token,
+      lease: owned,
+    });
+    const handle = remote.prepare(prepareRequest);
+    await handle.ready;
+    expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledOnce();
+    await expect(
+      handle.getManifest(new AbortController().signal),
+    ).resolves.toEqual(manifest);
+    remote.dispose();
+    local.dispose();
+  });
+
   it('keeps Gateway prepare pending until a separate Runtime worker starts', async () => {
     const reservation = createServer();
     const port = await listen(reservation);

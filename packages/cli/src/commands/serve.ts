@@ -229,6 +229,7 @@ interface ServeArgs {
   'prompt-deadline-ms'?: number;
   'experimental-managed-agents': boolean;
   'experimental-managed-runtime-worker': boolean;
+  'experimental-managed-runtime-auto-local': boolean;
   'experimental-managed-runtime-url'?: string;
   'experimental-managed-runtime-token'?: string;
   'writer-idle-timeout-ms'?: number;
@@ -589,6 +590,12 @@ export const serveCommand: CommandModule<unknown, ServeArgs> = {
         description:
           'Expose the private authenticated Managed Runtime worker protocol. Requires a daemon bearer token.',
       })
+      .option('experimental-managed-runtime-auto-local', {
+        type: 'boolean',
+        default: false,
+        description:
+          'Automatically start and manage local Tool-only Runtimes. Requires --experimental-managed-agents.',
+      })
       .option('experimental-managed-runtime-url', {
         type: 'string',
         requiresArg: true,
@@ -918,6 +925,9 @@ export const serveCommand: CommandModule<unknown, ServeArgs> = {
           : {}),
         ...(argv['experimental-managed-agents']
           ? { experimentalManagedAgents: true }
+          : {}),
+        ...(argv['experimental-managed-runtime-auto-local']
+          ? { experimentalManagedRuntimeAutoLocal: true }
           : {}),
         ...(argv['experimental-managed-runtime-worker']
           ? { experimentalManagedRuntimeWorker: true }

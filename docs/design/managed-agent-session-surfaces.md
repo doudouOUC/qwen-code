@@ -156,8 +156,10 @@ The reproducible local test plan and full process/browser report are in
 are intentionally git-ignored by repository convention. No external model
 provider, production deployment, Windows, or Linux run was used for this check.
 
-## Proposed next stage
+## Local Runtime activation (P9a)
 
 The [P9a local Runtime activation design](managed-agent-local-runtime-activation-p9a.md)
-specifies automatic worker startup, workspace reuse, owned-worker fencing,
-cancellation, and awaited cleanup. It is a proposal, not implemented behavior.
+implements opt-in automatic worker startup, workspace reuse, owned-worker fencing,
+cancellation, and awaited cleanup. Its validation section records the macOS
+process checks and remaining platform/E2E limits. Fixed-URL and in-process
+providers remain available without the auto-local flag.

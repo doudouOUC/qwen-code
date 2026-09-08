@@ -321,6 +321,7 @@ export interface ServeOptions {
   experimentalManagedAgents?: boolean;
   /** Expose the private authenticated Tool-only Runtime worker protocol. */
   experimentalManagedRuntimeWorker?: boolean;
+  experimentalManagedRuntimeAutoLocal?: boolean;
   /** Use a remote Runtime worker origin instead of the local provider. */
   experimentalManagedRuntimeUrl?: string;
   /** Bearer credential used only for the remote Runtime worker. */

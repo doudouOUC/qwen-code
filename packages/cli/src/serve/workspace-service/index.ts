@@ -1359,6 +1359,7 @@ export function createDaemonWorkspaceService(
 
     async reload(ctx: WorkspaceRequestContext) {
       assertActiveGeneration();
+      await deps.beforeReload?.();
       let runtimeEnvironmentApplied: boolean | undefined;
       if (deps.reloadDaemonEnv) {
         try {

@@ -5,6 +5,12 @@
  */
 
 import {
+  ManagedRuntimeReleasedError,
+  type ManagedWorkerBoot,
+  type RuntimeFinishReason,
+} from './managed-runtime-activator.js';
+import type { LocalProcessRuntimeActivator } from './local-process-runtime-activator.js';
+import {
   X509Certificate,
   createHash,
   randomUUID,
@@ -154,6 +160,7 @@ import {
   LocalManagedRuntimeProvider,
   RemoteManagedRuntimeProvider,
   type ManagedRuntimeProvider,
+  type ManagedRuntimeHandle,
 } from './managed-runtime-provider.js';
 import {
   MANAGED_RUNTIME_PROTOCOL_VERSION,
@@ -2089,6 +2096,7 @@ export interface RunQwenServeDeps {
   managedRuntimeProvider?: ManagedRuntimeProvider;
   /** Test/embed override for the private Runtime worker surface. */
   managedRuntimeWorkerProvider?: ManagedRuntimeProvider;
+  ownedManagedRuntime?: ManagedWorkerBoot;
   /** Test/embed override for the plain HTTP server constructor. */
   httpServerFactory?: (app: Application) => Server;
   /** Test override for resolving `localhost` before authority is derived. */
@@ -3236,7 +3244,9 @@ async function runQwenServeImpl(
   const shouldPreheat =
     !deps.bridge &&
     shouldPreheatBridge(deps) &&
-    optsIn.experimentalManagedRuntimeUrl === undefined;
+    optsIn.experimentalManagedRuntimeUrl === undefined &&
+    optsIn.experimentalManagedRuntimeAutoLocal !== true &&
+    !deps.ownedManagedRuntime;
   const startup: DaemonStartupSnapshot = {
     processStartedAt: new Date(
       Date.now() - Math.round(process.uptime() * 1000),
@@ -3596,6 +3606,22 @@ async function runQwenServeImpl(
         `--require-auth to keep the loopback developer default.`,
     );
   }
+  if (
+    opts.experimentalManagedRuntimeAutoLocal &&
+    (!opts.experimentalManagedAgents ||
+      opts.experimentalManagedRuntimeUrl !== undefined ||
+      optsIn.experimentalManagedRuntimeToken !== undefined ||
+      opts.experimentalManagedRuntimeWorker)
+  ) {
+    throw new Error(
+      '--experimental-managed-runtime-auto-local requires --experimental-managed-agents and conflicts with Runtime URL, token, or worker mode.',
+    );
+  }
+  const ownedWorkerLauncher = opts.experimentalManagedRuntimeAutoLocal
+    ? (
+        await import('./managed-runtime-worker-launcher.js')
+      ).resolveManagedRuntimeWorkerLauncher()
+    : undefined;
   if (opts.experimentalManagedRuntimeWorker === true && !token) {
     throw new Error(
       `Refusing to expose the Managed Runtime worker without a bearer token. ` +
@@ -3843,6 +3869,7 @@ async function runQwenServeImpl(
   }
   let workspaceRegistrationStore = deps.workspaceRegistrationStore;
   if (
+    !deps.ownedManagedRuntime &&
     workspaceRegistrationStore === undefined &&
     process.env['QWEN_SERVE_NO_PERSISTENT_REGISTRATION'] !== '1'
   ) {
@@ -4334,9 +4361,26 @@ async function runQwenServeImpl(
   let managedGatewayModelRunner = deps.managedGatewayModelRunner;
   let managedRuntimeProvider = deps.managedRuntimeProvider;
   let managedRuntimeWorkerProvider = deps.managedRuntimeWorkerProvider;
+  let localRuntimeActivator: LocalProcessRuntimeActivator | undefined;
+  const runtimePromptBindings = new WeakMap<
+    ManagedRuntimePrepareRequest,
+    ManagedGatewayPromptRequest
+  >();
+  const reloadOwnedRuntime = async (workspace: string): Promise<void> => {
+    const runtime =
+      managedPromptWorkspaceRegistry?.getByWorkspaceCwd(workspace);
+    if (runtime) await localRuntimeActivator?.reloadWorkspace(runtime);
+  };
+  const completeOwnedRuntimeReload = (workspace: string): void => {
+    const runtime =
+      managedPromptWorkspaceRegistry?.getByWorkspaceCwd(workspace);
+    if (runtime) localRuntimeActivator?.completeReload(runtime);
+  };
   const ownedManagedRuntimeProviders = new Set<ManagedRuntimeProvider>();
-  const stopManagedRuntimeProviders = (): void => {
-    for (const provider of ownedManagedRuntimeProviders) provider.dispose();
+  const stopManagedRuntimeProviders = async (): Promise<void> => {
+    await Promise.all(
+      [...ownedManagedRuntimeProviders].map((provider) => provider.dispose()),
+    );
     ownedManagedRuntimeProviders.clear();
     managedRuntimeProvider = undefined;
     managedRuntimeWorkerProvider = undefined;
@@ -4353,17 +4397,28 @@ async function runQwenServeImpl(
       managedPromptWorkspaceRegistry = undefined;
       ownsManagedPromptService = false;
     }
-    stopManagedRuntimeProviders();
+    const results = await Promise.allSettled([
+      stopManagedRuntimeProviders(),
+      ownsManagedGatewayModelRunner
+        ? managedGatewayModelRunner?.dispose()
+        : undefined,
+    ]);
+    managedGatewayModelRunner = undefined;
+    ownsManagedGatewayModelRunner = false;
     if (ownsManagedGatewaySessionEvents) {
+      await managedGatewaySessionEvents?.flush();
       managedGatewaySessionEvents?.dispose();
       managedGatewaySessionEvents = undefined;
       ownsManagedGatewaySessionEvents = false;
     }
-    if (ownsManagedGatewayModelRunner) {
-      await managedGatewayModelRunner?.dispose().catch(() => undefined);
-      managedGatewayModelRunner = undefined;
-      ownsManagedGatewayModelRunner = false;
-    }
+    const errors = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    if (errors.length)
+      throw new AggregateError(
+        errors,
+        'Managed Agent resource shutdown failed.',
+      );
   };
   let managedProcessRegistry:
     | {
@@ -4828,6 +4883,7 @@ async function runQwenServeImpl(
       settings: ReturnType<SettingsRuntime['loadSettings']> | undefined,
       effectiveEnv: Readonly<NodeJS.ProcessEnv>,
     ): string => {
+      if (deps.ownedManagedRuntime) return deps.ownedManagedRuntime.outputRoot;
       const resolveConfiguredPath = (
         configuredPath: string,
         relativeTo: string,
@@ -4898,6 +4954,9 @@ async function runQwenServeImpl(
     const runtimeEffectiveEnv: NodeJS.ProcessEnv = {
       ...runtimeEnvSnapshot.effectiveEnv,
       QWEN_RUNTIME_DIR: primarySessionRuntimeBaseDir,
+      ...(deps.ownedManagedRuntime
+        ? { QWEN_CLI_ENTRY: deps.ownedManagedRuntime.cliEntry }
+        : {}),
     };
     const replaceRuntimeEffectiveEnv = (
       nextEnv: Readonly<NodeJS.ProcessEnv>,
@@ -4907,6 +4966,10 @@ async function runQwenServeImpl(
       }
       Object.assign(runtimeEffectiveEnv, nextEnv);
       runtimeEffectiveEnv['QWEN_RUNTIME_DIR'] = primarySessionRuntimeBaseDir;
+      completeOwnedRuntimeReload(boundWorkspace);
+      if (deps.ownedManagedRuntime)
+        runtimeEffectiveEnv['QWEN_CLI_ENTRY'] =
+          deps.ownedManagedRuntime.cliEntry;
     };
     const primaryRuntimeEnv: {
       mode: 'runtime-overlay';
@@ -5089,24 +5152,26 @@ async function runQwenServeImpl(
     });
     const customIgnoreFiles =
       runtimeBootSettings?.merged.context?.fileFiltering?.customIgnoreFiles;
-    const boundWorkspaces = runtime.resolveBoundWorkspacesFromIdeEnv(
-      boundWorkspace,
-      undefined,
-      (workspace: string, index: number) => {
-        if (index === 0) return true;
-        const trustedSecondary = trustPolicy.evaluateDaemonWorkspaceTrust(
-          bootTrustSnapshot,
-          workspace,
-        ).targetTrusted;
-        if (!trustedSecondary) {
-          daemonLog.warn(
-            'excluding untrusted secondary workspace root from file-system access',
-            { workspace },
-          );
-        }
-        return trustedSecondary;
-      },
-    );
+    const boundWorkspaces = deps.ownedManagedRuntime
+      ? [boundWorkspace]
+      : runtime.resolveBoundWorkspacesFromIdeEnv(
+          boundWorkspace,
+          undefined,
+          (workspace: string, index: number) => {
+            if (index === 0) return true;
+            const trustedSecondary = trustPolicy.evaluateDaemonWorkspaceTrust(
+              bootTrustSnapshot,
+              workspace,
+            ).targetTrusted;
+            if (!trustedSecondary) {
+              daemonLog.warn(
+                'excluding untrusted secondary workspace root from file-system access',
+                { workspace },
+              );
+            }
+            return trustedSecondary;
+          },
+        );
     daemonLog.info('daemon workspace roots initialized', {
       primary: boundWorkspaces[0],
       secondary: boundWorkspaces.slice(1),
@@ -5648,6 +5713,7 @@ async function runQwenServeImpl(
     ) =>
       withSettingsLock(workspace, async () => {
         assertGenerationOpen?.();
+        await reloadOwnedRuntime(workspace);
         const fresh = settingsRuntime.settings.loadSettings(workspace, {
           skipLoadEnvironment: true,
           skipWorkspaceSettings: !trustedWorkspace,
@@ -5745,6 +5811,7 @@ async function runQwenServeImpl(
       persistSetting: persistSettingFn,
       persistSettings: persistSettingsFn,
       preheatAcpChild: () => bridge.preheat(),
+      beforeReload: () => reloadOwnedRuntime(boundWorkspace),
       reloadDaemonEnv: reloadPrimaryDaemonEnv,
       queryWorkspaceStatus: (method, idle) =>
         bridge.queryWorkspaceStatus(method, idle),
@@ -5857,6 +5924,7 @@ async function runQwenServeImpl(
           }
           Object.assign(effectiveEnv, nextEnv);
           effectiveEnv['QWEN_RUNTIME_DIR'] = sessionRuntimeBaseDir;
+          completeOwnedRuntimeReload(workspace);
         },
       };
     };
@@ -5869,6 +5937,7 @@ async function runQwenServeImpl(
     ) =>
       withSettingsLock(workspace, async () => {
         assertGenerationOpen?.();
+        await reloadOwnedRuntime(workspace);
         const fresh = settingsRuntime.settings.loadSettings(workspace, {
           skipLoadEnvironment: true,
           skipWorkspaceSettings: !trusted,
@@ -6225,9 +6294,11 @@ async function runQwenServeImpl(
         persistDisabledSkillsBatch: persistDisabledSkillsBatchFn,
         persistSetting: persistSettingFn,
         persistSettings: persistSettingsFn,
+        beforeReload: () => reloadOwnedRuntime(workspaceInput.cwd),
         reloadDaemonEnv: (workspace, assertGenerationOpen) =>
           withSettingsLock(workspace, async () => {
             assertGenerationOpen?.();
+            await reloadOwnedRuntime(workspace);
             const fresh = settingsRuntime.settings.loadSettings(workspace, {
               skipLoadEnvironment: true,
               skipWorkspaceSettings: !secondaryTrusted,
@@ -6383,7 +6454,11 @@ async function runQwenServeImpl(
       );
       ownedManagedRuntimeProviders.add(managedRuntimeWorkerProvider);
     }
-    if (opts.experimentalManagedAgents === true && !managedRuntimeProvider) {
+    if (
+      opts.experimentalManagedAgents === true &&
+      !managedRuntimeProvider &&
+      !ownedWorkerLauncher
+    ) {
       if (opts.experimentalManagedRuntimeUrl) {
         managedRuntimeProvider = new RemoteManagedRuntimeProvider({
           baseUrl: opts.experimentalManagedRuntimeUrl,
@@ -6426,6 +6501,39 @@ async function runQwenServeImpl(
             path.join(managedAgentsStateDir, 'presentation.jsonl'),
           );
           ownsManagedGatewaySessionEvents = true;
+        }
+        if (ownedWorkerLauncher && !managedRuntimeProvider) {
+          const [
+            { LocalProcessRuntimeActivator },
+            { AutoLocalManagedRuntimeProvider },
+          ] = await Promise.all([
+            import('./local-process-runtime-activator.js'),
+            import('./auto-local-managed-runtime-provider.js'),
+          ]);
+          localRuntimeActivator = new LocalProcessRuntimeActivator({
+            stateDir: managedAgentsStateDir,
+            ...ownedWorkerLauncher,
+            env: daemonRuntimeBaseEnv,
+            log: (event, fields) =>
+              daemonLog.info(`managed runtime ${event}`, fields),
+          });
+          managedRuntimeProvider = new AutoLocalManagedRuntimeProvider(
+            workspaceRegistry,
+            localRuntimeActivator,
+            (request, released) => {
+              try {
+                const prompt = runtimePromptBindings.get(request);
+                if (prompt)
+                  managedGatewaySessionEvents?.markRuntimeLost(
+                    prompt,
+                    released,
+                  );
+              } catch {
+                daemonLog.warn('managed runtime lifecycle event failed');
+              }
+            },
+          );
+          ownedManagedRuntimeProviders.add(managedRuntimeProvider);
         }
         if (!managedGatewayModelRunner) {
           managedGatewayModelRunner = new ResidentManagedGatewayModelRunner(
@@ -6505,14 +6613,23 @@ async function runQwenServeImpl(
               signal,
               deadlineController.signal,
             ]);
+            let runtimeHandle: ManagedRuntimeHandle | undefined;
+            let finishReason: RuntimeFinishReason = 'failed';
             try {
-              const runtimeHandle = runtimeProvider.prepare(
-                managedRuntimePrepareRequest(request),
-              );
+              const runtimeStartedAt = Date.now();
+              const runtimeRequest = managedRuntimePrepareRequest(request);
+              runtimePromptBindings.set(runtimeRequest, request);
+              runtimeHandle = runtimeProvider.prepare(runtimeRequest);
               void runtimeHandle.ready.then(
                 () => {
                   try {
                     events.markRuntimeReady(request);
+                    daemonLog.info('managed runtime prepared', {
+                      workspaceId: request.workspaceId,
+                      sessionId: request.sessionId,
+                      promptId: request.messageId,
+                      durationMs: Date.now() - runtimeStartedAt,
+                    });
                   } catch (error) {
                     daemonLog.warn(
                       'managed gateway Runtime readiness event failed',
@@ -6529,6 +6646,7 @@ async function runQwenServeImpl(
                   }
                 },
                 (error: unknown) => {
+                  if (error instanceof ManagedRuntimeReleasedError) return;
                   try {
                     events.markRuntimeFailed(request);
                   } catch {
@@ -6590,7 +6708,11 @@ async function runQwenServeImpl(
                 },
                 executionSignal,
               );
+              finishReason = 'completed';
             } finally {
+              runtimeHandle?.finish(
+                executionSignal.aborted ? 'cancelled' : finishReason,
+              );
               if (deadlineTimer) clearTimeout(deadlineTimer);
             }
           },
@@ -7172,9 +7294,11 @@ async function runQwenServeImpl(
           persistDisabledSkillsBatch: persistDisabledSkillsBatchFn,
           persistSetting: persistSettingFn,
           persistSettings: persistSettingsFn,
+          beforeReload: () => reloadOwnedRuntime(cwd),
           reloadDaemonEnv: (workspace, assertGenerationOpen) =>
             withSettingsLock(workspace, async () => {
               assertGenerationOpen?.();
+              await reloadOwnedRuntime(workspace);
               const fresh = settingsRuntime.settings.loadSettings(workspace, {
                 skipLoadEnvironment: true,
                 skipWorkspaceSettings: !trusted,
@@ -7419,6 +7543,7 @@ async function runQwenServeImpl(
         }
       },
       beginDrain(runtimeToDrain: WorkspaceRuntime): void {
+        localRuntimeActivator?.beginDrain(runtimeToDrain);
         if (runtimeToDrain.primary) {
           if (bridgeRef === runtimeToDrain.bridge) bridgeRef = undefined;
           invalidatePrimaryServeFeaturesCache();
@@ -7450,6 +7575,7 @@ async function runQwenServeImpl(
         }
       },
       cancelDrain(runtimeToDrain: WorkspaceRuntime): void {
+        localRuntimeActivator?.cancelDrain(runtimeToDrain);
         if (runtimeToDrain.primary && bridgeRef === undefined) {
           bridgeRef = runtimeToDrain.bridge;
           invalidatePrimaryServeFeaturesCache();
@@ -7493,9 +7619,11 @@ async function runQwenServeImpl(
       },
       getActivity(runtimeToDrain: WorkspaceRuntime) {
         return {
-          pendingSessionStarts: totalSessionAdmission.snapshotForWorkspace(
-            runtimeToDrain.workspaceCwd,
-          ).inFlight,
+          pendingSessionStarts:
+            totalSessionAdmission.snapshotForWorkspace(
+              runtimeToDrain.workspaceCwd,
+            ).inFlight +
+            (localRuntimeActivator?.workspaceActivity(runtimeToDrain) ?? 0),
           channelWorkers:
             runtimeToDrain.provenance === 'live-conversation'
               ? 0
@@ -7517,6 +7645,7 @@ async function runQwenServeImpl(
         if (existing) return existing;
         const cleanup = (async () => {
           const containmentErrors: Error[] = [];
+          await localRuntimeActivator?.revokeWorkspace(runtimeToDrain);
           try {
             await workspaceVoiceCoordinator.disposeRuntime(
               runtimeToDrain,
@@ -7781,6 +7910,7 @@ async function runQwenServeImpl(
       workspaceTrustHotReloadAvailable,
       voiceCoordinator: workspaceVoiceCoordinator,
       bridge,
+      ownedManagedRuntime: deps.ownedManagedRuntime,
       webShellDir,
       boundWorkspace,
       qwenCodeVersion: resolvedCliVersion,
@@ -7788,7 +7918,7 @@ async function runQwenServeImpl(
       // The real long-running daemon keeps scheduled-task sessions resident
       // (keepalive) and reloads them on boot (rehydration). Off by default so
       // direct createServeApp embeds/tests don't spawn sessions.
-      manageScheduledTaskSessions: true,
+      manageScheduledTaskSessions: !deps.ownedManagedRuntime,
       currentSessionSchedulingAvailable: deps.bridge === undefined,
       fsFactory: routeFsFactory,
       primaryWorkspaceTrusted: trustedWorkspace,
@@ -7957,7 +8087,7 @@ async function runQwenServeImpl(
         decision: DaemonWorkspaceTrustDecision,
       ): { key: string; boundWorkspaces: readonly string[] } => {
         const boundWorkspaces =
-          entry.primary && decision.targetTrusted
+          !deps.ownedManagedRuntime && entry.primary && decision.targetTrusted
             ? runtime.resolveBoundWorkspacesFromIdeEnv(
                 entry.workspaceCwd,
                 undefined,
@@ -9302,6 +9432,7 @@ async function runQwenServeImpl(
           // `qwen` processes in the operator's `ps` output.
           daemonLog.warn(`received ${signal} during drain — forcing exit`);
           try {
+            localRuntimeActivator?.killAllSync();
             managedProcessRegistry?.killAllSync();
             channelWorkerManager?.killAllSync();
             for (const runtimeBridge of getRuntimeBridgesForCleanup()) {
@@ -9868,7 +9999,24 @@ async function runQwenServeImpl(
       }
     } else {
       try {
-        server = deps.httpServerFactory?.(app) ?? createServer(app);
+        server =
+          deps.httpServerFactory?.(app) ??
+          createServer((req, res) => {
+            if (
+              deps.ownedManagedRuntime &&
+              (req.method !== 'POST' ||
+                !/^\/internal\/managed-runtime\/v1\/(prepare|manifest|execute|cancel|release)$/.test(
+                  req.url ?? '',
+                ))
+            ) {
+              res.writeHead(404);
+              res.end();
+              return;
+            }
+            app(req, res);
+          });
+        if (deps.ownedManagedRuntime)
+          server.on('upgrade', (_req, socket) => socket.destroy());
       } catch (err) {
         rejectServerConstruction(
           err instanceof Error ? err : new Error(String(err)),

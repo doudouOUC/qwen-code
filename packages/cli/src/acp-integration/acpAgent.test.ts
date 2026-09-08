@@ -13597,6 +13597,9 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       ],
       executionStatus: 'success',
     });
+    vi.mocked(innerConfig.refreshAuth).mockRejectedValue(
+      new Error('Tool-only Runtime must not authenticate a model'),
+    );
     const { agent, agentPromise } = await bootAcpAgent();
     await agent.newSession({
       cwd: '/tmp',
@@ -13608,6 +13611,15 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
         },
       },
     });
+
+    await expect(
+      agent.prompt({
+        sessionId,
+        prompt: [{ type: 'text', text: 'Do not run a model here' }],
+      }),
+    ).rejects.toThrow('Tool-only Sessions');
+    expect(innerConfig.refreshAuth).not.toHaveBeenCalled();
+    expect(innerConfig.getLlmClient().initialize).not.toHaveBeenCalled();
 
     const manifest = await agent.extMethod(
       SERVE_CONTROL_EXT_METHODS.sessionManagedRuntimeToolManifest,

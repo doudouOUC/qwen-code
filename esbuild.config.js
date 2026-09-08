@@ -179,7 +179,11 @@ const external = [
 const BUNDLE_CHUNK_DIR = 'chunks';
 
 const mainBuild = esbuild.build({
-  entryPoints: { cli: 'packages/cli/src/cli.ts' },
+  entryPoints: {
+    cli: 'packages/cli/src/cli.ts',
+    'managed-runtime-worker':
+      'packages/cli/src/serve/managed-runtime-worker-entry.ts',
+  },
   bundle: true,
   outdir: 'dist',
   entryNames: '[name]',

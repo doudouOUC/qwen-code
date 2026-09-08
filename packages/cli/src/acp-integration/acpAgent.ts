@@ -852,6 +852,13 @@ function managedRuntimeToolManifest(config: Config): {
   return { capabilityDigest, tools };
 }
 
+function isManagedRuntimeToolSession(config: Config): boolean {
+  return (
+    config.getSessionSourceType?.() === 'managed-gateway' &&
+    config.getSessionSourceId?.() === config.getSessionId()
+  );
+}
+
 function assertManagedRuntimeSession(config: Config, sessionId: string): void {
   if (
     config.getSessionSourceType() !== 'managed-gateway' ||
@@ -5892,6 +5899,11 @@ class QwenAgent implements Agent {
     if (!session) {
       throw new Error(`Session not found: ${sessionId}`);
     }
+    if (isManagedRuntimeToolSession(session.getConfig()))
+      throw RequestError.invalidParams(
+        undefined,
+        'Managed Runtime Tool-only Sessions cannot run model Prompts.',
+      );
     const sanitizedParams = { ...params, sessionId };
     const meta =
       params._meta && typeof params._meta === 'object'
@@ -13409,6 +13421,7 @@ class QwenAgent implements Agent {
   }
 
   private async ensureAuthenticated(config: Config): Promise<void> {
+    if (isManagedRuntimeToolSession(config)) return;
     const selectedType = config.getModelsConfig().getCurrentAuthType();
     if (!selectedType) {
       throw RequestError.authRequired(
@@ -13551,7 +13564,11 @@ class QwenAgent implements Agent {
     const llmClient = config.getLlmClient();
     const needsInitialize = !llmClient.isInitialized();
 
-    if (needsInitialize && options.deferWorkspaceActivation !== true) {
+    if (
+      needsInitialize &&
+      options.deferWorkspaceActivation !== true &&
+      !isManagedRuntimeToolSession(config)
+    ) {
       await llmClient.initialize(undefined, options.signal);
     }
     options.signal?.throwIfAborted();
@@ -13759,11 +13776,12 @@ class QwenAgent implements Agent {
 
       // After replay and resume-state restoration so a durable cron fire can't
       // interleave with either.
-      session.startCronScheduler();
+      if (!isManagedRuntimeToolSession(config)) session.startCronScheduler();
 
-      setTimeout(() => {
-        void session.sendAvailableCommandsUpdate();
-      }, 0);
+      if (!isManagedRuntimeToolSession(config))
+        setTimeout(() => {
+          void session.sendAvailableCommandsUpdate();
+        }, 0);
       return session;
     } catch (error) {
       if (!published) {
@@ -13793,6 +13811,7 @@ class QwenAgent implements Agent {
   }
 
   private buildAvailableModels(config: Config): NewSessionResponse['models'] {
+    if (isManagedRuntimeToolSession(config)) return undefined;
     const rawCurrentModelId = (
       config.getModel() ||
       this.config.getModel() ||
@@ -13842,6 +13861,7 @@ class QwenAgent implements Agent {
   }
 
   private buildConfigOptions(config: Config): SessionConfigOption[] {
+    if (isManagedRuntimeToolSession(config)) return [];
     const currentApprovalMode = config.getApprovalMode();
     const modelOptions = this.buildSelectableModelOptions(config);
     const rawCurrentModelId = (config.getModel() || '').trim();

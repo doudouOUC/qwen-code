@@ -9,6 +9,11 @@ import type {
   BridgeManagedRuntimeToolExecuteResult,
   BridgeManagedRuntimeToolManifest,
 } from '@qwen-code/acp-bridge/bridgeTypes';
+import {
+  MANAGED_LEASE_ID_HEADER,
+  MANAGED_LEASE_EPOCH_HEADER,
+  type RuntimeFinishReason,
+} from './managed-runtime-activator.js';
 import type { AcpSessionBridge } from './acp-session-bridge.js';
 import { isLoopbackBind } from './loopback-binds.js';
 import type { ManagedGatewayToolRuntime } from './managed-gateway-model-runtime.js';
@@ -40,6 +45,7 @@ type BridgeSession = Awaited<ReturnType<AcpSessionBridge['spawnOrAttach']>>;
 
 export interface ManagedRuntimeHandle extends ManagedGatewayToolRuntime {
   readonly ready: Promise<void>;
+  finish(reason: RuntimeFinishReason): void;
 }
 
 export interface ManagedRuntimeProvider {
@@ -53,7 +59,7 @@ export interface ManagedRuntimeProvider {
     sessionId: string,
     expected?: ManagedRuntimePrepareRequest,
   ): Promise<boolean>;
-  dispose(): void;
+  dispose(): void | Promise<void>;
 }
 
 export class ManagedRuntimeProviderError extends Error {
@@ -61,7 +67,8 @@ export class ManagedRuntimeProviderError extends Error {
     readonly code:
       | 'managed_runtime_identity_conflict'
       | 'managed_runtime_unavailable'
-      | 'managed_runtime_disposed',
+      | 'managed_runtime_disposed'
+      | 'managed_runtime_capacity_exhausted',
     message: string,
     readonly retryable: boolean,
   ) {
@@ -248,6 +255,7 @@ export class LocalManagedRuntimeProvider implements ManagedRuntimeProvider {
     const readyBinding = this.startWarmup(runtime, request);
     return {
       ready: readyBinding.then(() => undefined),
+      finish: () => {},
       getManifest: async (signal) => {
         const binding = await waitForValue(readyBinding, signal);
         const operationSignal = AbortSignal.any([
@@ -577,6 +585,7 @@ class RemoteResponseError extends Error {
 
 export interface RemoteManagedRuntimeProviderOptions {
   readonly baseUrl: string;
+  readonly lease?: { readonly leaseId: string; readonly epoch: number };
   readonly token: string;
   readonly fetch?: typeof fetch;
   readonly prepareRetryWindowMs?: number;
@@ -674,7 +683,7 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
   private readonly entries = new Map<string, RemoteProviderEntry>();
   private readonly lifetime = new AbortController();
 
-  constructor(options: RemoteManagedRuntimeProviderOptions) {
+  constructor(private readonly options: RemoteManagedRuntimeProviderOptions) {
     this.baseUrl = resolveRemoteBaseUrl(options.baseUrl);
     this.token = options.token.trim();
     if (!this.token) throw new Error('Managed Runtime token is required.');
@@ -696,7 +705,10 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
     );
   }
 
-  prepare(request: ManagedRuntimePrepareRequest): ManagedRuntimeHandle {
+  prepare(
+    request: ManagedRuntimePrepareRequest,
+    retryWindowMs = this.retryWindowMs,
+  ): ManagedRuntimeHandle {
     if (this.lifetime.signal.aborted) {
       throw new ManagedRuntimeProviderError(
         'managed_runtime_disposed',
@@ -718,7 +730,7 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
     if (!entry) {
       const controller = new AbortController();
       const signal = AbortSignal.any([this.lifetime.signal, controller.signal]);
-      const ready = this.prepareRemote(request, signal);
+      const ready = this.prepareRemote(request, signal, retryWindowMs);
       entry = { request: structuredClone(request), controller, ready };
       this.entries.set(request.sessionId, entry);
       void ready.catch(() => {
@@ -730,6 +742,7 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
     const active = entry;
     return {
       ready: active.ready,
+      finish: () => {},
       getManifest: async (signal) => {
         const operationSignal = AbortSignal.any([
           signal,
@@ -860,6 +873,7 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
   private async prepareRemote(
     request: ManagedRuntimePrepareRequest,
     signal: AbortSignal,
+    retryWindowMs: number,
   ): Promise<void> {
     const startedAt = Date.now();
     let retryDelayMs = this.retryDelayMs;
@@ -873,7 +887,7 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
             true,
           ),
         ),
-      this.retryWindowMs,
+      retryWindowMs,
     );
     deadlineTimer.unref();
     const prepareSignal = AbortSignal.any([signal, deadline.signal]);
@@ -904,7 +918,7 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
             error instanceof TypeError ||
             (error instanceof RemoteResponseError &&
               (error.status === 429 || error.status === 503));
-          if (!retryable || Date.now() - startedAt >= this.retryWindowMs) {
+          if (!retryable || Date.now() - startedAt >= retryWindowMs) {
             throw error;
           }
           await delay(retryDelayMs, prepareSignal);
@@ -935,6 +949,12 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
         headers: {
           authorization: `Bearer ${this.token}`,
           'content-type': 'application/json',
+          ...(this.options.lease
+            ? {
+                [MANAGED_LEASE_ID_HEADER]: this.options.lease.leaseId,
+                [MANAGED_LEASE_EPOCH_HEADER]: String(this.options.lease.epoch),
+              }
+            : {}),
         },
         body: JSON.stringify(body),
         signal,

@@ -29,6 +29,9 @@ const STRING_EXEC_OPTIONS: ExecFileOptionsWithStringEncoding = {
   windowsHide: true,
 };
 
+/** A verified termination whose exit status was unsuccessful. */
+export class ProcessExitError extends Error {}
+
 export interface ProcessAttachmentOptions {
   /**
    * The caller owns the complete process tree rooted at this child. POSIX
@@ -644,7 +647,7 @@ class TrackedChild implements TrackedChildProcess {
 
   private throwForUncleanExit(exitInfo: AcpChannelExitInfo | undefined): void {
     if (exitInfo && (exitInfo.exitCode !== 0 || exitInfo.signalCode !== null)) {
-      throw new Error(
+      throw new ProcessExitError(
         `ACP child pid=${this.child.pid ?? 'unknown'} exited uncleanly during shutdown ` +
           `(code=${exitInfo.exitCode ?? 'none'}, signal=${exitInfo.signalCode ?? 'none'})`,
       );

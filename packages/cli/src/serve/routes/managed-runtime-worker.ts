@@ -4,6 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {
+  MANAGED_LEASE_ID_HEADER,
+  MANAGED_LEASE_EPOCH_HEADER,
+  type ManagedWorkerBoot,
+} from '../managed-runtime-activator.js';
 import type { Application, Request, RequestHandler, Response } from 'express';
 import type { ManagedRuntimeProvider } from '../managed-runtime-provider.js';
 import { ManagedRuntimeProviderError } from '../managed-runtime-provider.js';
@@ -18,6 +23,7 @@ import {
 
 export interface RegisterManagedRuntimeWorkerRoutesDeps {
   readonly provider: ManagedRuntimeProvider;
+  readonly owned?: ManagedWorkerBoot;
   readonly authorize: RequestHandler;
 }
 
@@ -78,9 +84,28 @@ export function registerManagedRuntimeWorkerRoutes(
   app: Application,
   deps: RegisterManagedRuntimeWorkerRoutesDeps,
 ): void {
+  const authorize: RequestHandler = (req, res, next) =>
+    deps.authorize(req, res, () => {
+      const owned = deps.owned;
+      if (
+        owned &&
+        (req.get(MANAGED_LEASE_ID_HEADER) !== owned.leaseId ||
+          req.get(MANAGED_LEASE_EPOCH_HEADER) !== String(owned.epoch) ||
+          req.body?.tenantId !== owned.tenantId ||
+          req.body?.workspaceId !== owned.workspaceId ||
+          req.body?.workspaceCwd !== owned.workspaceCwd)
+      ) {
+        res.status(409).json({
+          code: 'managed_runtime_identity_conflict',
+          error: 'Managed Runtime lease or workspace binding conflicts.',
+        });
+        return;
+      }
+      next();
+    });
   app.post(
     `${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`,
-    deps.authorize,
+    authorize,
     async (req, res) => {
       try {
         const request = parseManagedRuntimePrepareRequest(req.body);
@@ -97,7 +122,7 @@ export function registerManagedRuntimeWorkerRoutes(
 
   app.post(
     `${MANAGED_RUNTIME_ROUTE_PREFIX}/manifest`,
-    deps.authorize,
+    authorize,
     async (req, res) => {
       const connection = requestSignal(req, res);
       try {
@@ -118,7 +143,7 @@ export function registerManagedRuntimeWorkerRoutes(
 
   app.post(
     `${MANAGED_RUNTIME_ROUTE_PREFIX}/execute`,
-    deps.authorize,
+    authorize,
     async (req, res) => {
       const connection = requestSignal(req, res);
       try {
@@ -142,7 +167,7 @@ export function registerManagedRuntimeWorkerRoutes(
 
   app.post(
     `${MANAGED_RUNTIME_ROUTE_PREFIX}/cancel`,
-    deps.authorize,
+    authorize,
     async (req, res) => {
       try {
         const request = parseManagedRuntimeCancelRequest(req.body);
@@ -163,7 +188,7 @@ export function registerManagedRuntimeWorkerRoutes(
 
   app.post(
     `${MANAGED_RUNTIME_ROUTE_PREFIX}/release`,
-    deps.authorize,
+    authorize,
     async (req, res) => {
       try {
         const request = parseManagedRuntimePrepareRequest(req.body);

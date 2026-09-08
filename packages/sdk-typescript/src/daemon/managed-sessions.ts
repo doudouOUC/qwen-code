@@ -48,6 +48,7 @@ export type DaemonManagedSessionEventType =
   | 'runtime_starting'
   | 'runtime_ready'
   | 'runtime_failed'
+  | 'runtime_released'
   | 'agent_started'
   | 'assistant_thought'
   | 'assistant_delta'
