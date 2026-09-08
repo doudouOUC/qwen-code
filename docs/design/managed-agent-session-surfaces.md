@@ -1,5 +1,10 @@
 # Managed Agent session surfaces
 
+The product target is now to make Managed Agent the daemon's default execution
+implementation; see [the default migration design](managed-agent-daemon-default.md).
+The separate surface described here remains the implemented experimental entry
+point. It does not establish ordinary-session protocol or coding-capability parity.
+
 ## Status and scope
 
 Implemented on the experimental P8 checkpoint `4df73b9c76`.
