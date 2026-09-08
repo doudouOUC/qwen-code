@@ -29,6 +29,7 @@ import {
   type MicrocompactOptions,
 } from '../services/microcompaction/microcompact.js';
 import { slimCompactionInput } from '../services/compactionInputSlimming.js';
+import { captureAutoMemoryExtractionHistory } from '../memory/extractionAgentPlanner.js';
 import {
   goalRequiresExactPermit,
   PAUSED_GOAL_SYSTEM_REMINDER,
@@ -2490,6 +2491,13 @@ export class LlmClient {
         projectRoot,
         sessionId,
         history,
+        extractionHistory: captureAutoMemoryExtractionHistory(
+          {
+            getHistoryTailShallow: (count, curated) =>
+              this.getHistoryTailShallow(count, curated),
+          },
+          this.config.getEffectiveInputModalities(),
+        ),
         config: this.config,
       })
       .then((result) => result.touchedTopics.length)

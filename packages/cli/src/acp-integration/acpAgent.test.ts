@@ -3292,6 +3292,75 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     await agentPromise;
   });
 
+  it('retains Gateway writers until managed Tool Session close succeeds, including retry', async () => {
+    const innerConfig = await setupSessionMocks('managed-gateway-close');
+    let resolveClose!: () => void;
+    let rejectClose!: (error: Error) => void;
+    const closeGate = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    const closeManagedToolSession = vi
+      .fn<Config['closeManagedToolSession']>()
+      .mockReturnValueOnce(closeGate)
+      .mockResolvedValue(undefined);
+    Object.assign(innerConfig, { closeManagedToolSession });
+    let writerOwned = false;
+    innerConfig.hasSessionWriteOwnership.mockImplementation(() => writerOwned);
+    innerConfig.closeSessionWriter.mockImplementation(async () => {
+      writerOwned = false;
+    });
+    const { agent, agentPromise } = await bootInitializedAcpAgent(
+      makeSessionSettings(),
+      'expected-capability',
+    );
+
+    try {
+      await agent.newSession({ cwd: '/tmp', mcpServers: [] });
+      writerOwned = true;
+      let writerShutdownSettled = false;
+      const shutdown = agent.beginManagedShutdown().writerShutdown;
+      const observedShutdown = shutdown.then(
+        () => {
+          writerShutdownSettled = true;
+        },
+        (error: unknown) => {
+          writerShutdownSettled = true;
+          return error;
+        },
+      );
+      await vi.waitFor(() =>
+        expect(closeManagedToolSession).toHaveBeenCalledOnce(),
+      );
+      expect(writerShutdownSettled).toBe(false);
+      expect(innerConfig.closeSessionWriter).not.toHaveBeenCalled();
+      expect(innerConfig.hasSessionWriteOwnership()).toBe(true);
+      expect(innerConfig.shutdown).not.toHaveBeenCalled();
+
+      const drainError = new Error('Runtime tool Session did not drain');
+      rejectClose(drainError);
+      await expect(observedShutdown).resolves.toMatchObject({
+        message: 'Managed session writer shutdown failed',
+        errors: [drainError],
+      });
+      expect(innerConfig.closeSessionWriter).not.toHaveBeenCalled();
+      expect(innerConfig.hasSessionWriteOwnership()).toBe(true);
+      expect(innerConfig.shutdown).not.toHaveBeenCalled();
+
+      await agent.beginManagedShutdown().writerShutdown;
+      expect(closeManagedToolSession).toHaveBeenCalledTimes(2);
+      expect(innerConfig.closeSessionWriter).toHaveBeenCalledExactlyOnceWith({
+        handoff: true,
+      });
+      expect(innerConfig.hasSessionWriteOwnership()).toBe(false);
+    } finally {
+      resolveClose();
+      closeManagedToolSession.mockResolvedValue(undefined);
+      mockConnectionState.resolve();
+      await agentPromise;
+    }
+  });
+
   it('waits for an initializing managed Config after closing its writer', async () => {
     const innerConfig = await setupSessionMocks('managed-initializing-session');
     let releaseInitialization!: () => void;

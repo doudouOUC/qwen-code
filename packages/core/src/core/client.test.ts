@@ -8730,12 +8730,19 @@ hello
       })();
       mockTurnRunFn.mockReturnValue(mockStream);
 
+      const history: Content[] = [
+        ...Array.from({ length: 50 }, (_, index) => ({
+          role: index % 2 === 0 ? 'user' : 'model',
+          parts: [{ text: `Earlier message ${index}` }],
+        })),
+        { role: 'user', parts: [{ text: 'I prefer terse responses.' }] },
+        { role: 'model', parts: [{ text: 'Done' }] },
+      ];
+      const recentHistory = history.slice(-40);
       const mockChat: Partial<LlmChat> = {
         addHistory: vi.fn(),
-        getHistory: vi.fn().mockReturnValue([
-          { role: 'user', parts: [{ text: 'I prefer terse responses.' }] },
-          { role: 'model', parts: [{ text: 'Done' }] },
-        ]),
+        getHistory: vi.fn().mockReturnValue(history),
+        getHistoryTailShallow: vi.fn().mockReturnValue(recentHistory),
       };
       client['chat'] = mockChat as LlmChat;
 
@@ -8753,8 +8760,15 @@ hello
         projectRoot: '/test/project/root',
         sessionId: 'test-session-id',
         history: recordedHistory,
+        extractionHistory: recentHistory,
         config: mockConfig,
       });
+      expect(mockChat.getHistoryTailShallow).toHaveBeenCalledWith(40, true);
+      recentHistory[0].parts![0].text = 'A later turn';
+      expect(
+        mockMemoryManager.scheduleExtract.mock.calls[0][0].extractionHistory[0]
+          .parts[0].text,
+      ).toBe('Earlier message 12');
       expect(mockMemoryManager.scheduleDream).toHaveBeenCalledWith({
         projectRoot: '/test/project/root',
         sessionId: 'test-session-id',
@@ -15051,10 +15065,10 @@ Other open files:
       };
 
       const client = new LlmClient(makeMockConfigForShutdown(mgr));
-      // Avoid needing a real chat — the method calls getHistoryShallow().
-      (
-        client as unknown as { getHistoryShallow: () => unknown[] }
-      ).getHistoryShallow = () => [];
+      client['chat'] = {
+        getHistory: () => [],
+        getHistoryTailShallow: () => [],
+      } as unknown as LlmChat;
 
       const runBgTasks = (
         client as unknown as {
@@ -15309,6 +15323,7 @@ function makeMockConfigForShutdown(
     getManagedAutoDreamEnabled: vi.fn().mockReturnValue(true),
     getAutoSkillEnabled: vi.fn().mockReturnValue(false),
     getModel: vi.fn().mockReturnValue('test-model'),
+    getEffectiveInputModalities: vi.fn().mockReturnValue({}),
     getBaseLlmClient: vi.fn().mockReturnValue({
       generateContent: vi.fn(),
     }),

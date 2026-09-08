@@ -28,6 +28,7 @@ import {
   type LspClient,
   type ToolName,
   type ToolInvocationGuard,
+  type ManagedToolSessionFactory,
   ToolNames,
   NativeLspClient,
   createDebugLogger,
@@ -1327,6 +1328,7 @@ export async function loadCliConfig(
     workspaceTrusted?: boolean;
     processNetworkOwner?: true;
     toolInvocationGuard?: ToolInvocationGuard;
+    managedToolSessionFactory?: ManagedToolSessionFactory;
     /** Host-managed session whose exact private cwd is bound after bootstrap. */
     provisionalWorkspace?: true;
     sessionRestore?: {
@@ -2049,6 +2051,7 @@ export async function loadCliConfig(
         bareMode || safeMode ? undefined : settings.permissions?.autoMode,
     },
     toolInvocationGuard: hostPolicy?.toolInvocationGuard,
+    managedToolSessionFactory: hostPolicy?.managedToolSessionFactory,
     // Permission rule persistence callback (writes to settings files).
     onPersistPermissionRule: async (scope, ruleType, rule) => {
       const currentSettings = loadSettings(cwd, {

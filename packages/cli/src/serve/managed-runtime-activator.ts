@@ -37,6 +37,7 @@ export class ManagedRuntimeReleasedError extends Error {}
 export interface ManagedRuntimeUse {
   readonly endpoint: Promise<ManagedRuntimeEndpoint>;
   readonly signal: AbortSignal;
+  readonly exited: Promise<void>;
   release(reason: RuntimeFinishReason): void;
   beginOperation(): (certain: boolean) => void;
 }

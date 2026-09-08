@@ -106,6 +106,9 @@ const { mockRestoreWorktreeContext, mockWithDaemonSpan } = vi.hoisted(() => {
 });
 
 vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => ({
+  createBuiltinManagedToolRuntime: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).createBuiltinManagedToolRuntime,
   createDebugLogger: () => ({
     debug: vi.fn(),
     error: vi.fn(),

@@ -551,41 +551,12 @@ it('wires the opt-in Managed Prompt service into the runtime app', async () => {
   }
 });
 
-it('mounts the authenticated Managed Runtime worker protocol', async () => {
-  const workspace = fs.realpathSync(
-    fs.mkdtempSync(path.join(os.tmpdir(), 'qws-managed-runtime-worker-')),
-  );
-  const provider: ManagedRuntimeProvider = {
-    prepare: vi.fn(() => ({
-      ready: Promise.resolve(),
-      finish: vi.fn(),
-      getManifest: vi.fn(),
-      execute: vi.fn(),
-    })),
-    cancel: vi.fn().mockResolvedValue(true),
-    release: vi.fn().mockResolvedValue(true),
-    dispose: vi.fn(),
-  };
-  let handle: RunHandle | undefined;
-  try {
-    handle = await runQwenServe(
-      {
-        port: 0,
-        hostname: '127.0.0.1',
-        mode: 'http-bridge',
-        token: 'runtime-worker-secret',
-        workspace,
-        maxSessions: 1,
-        serveWebShell: false,
-        experimentalManagedRuntimeWorker: true,
-      },
-      {
-        bridge: makeRuntimeBridge(),
-        managedRuntimeWorkerProvider: provider,
-        preheatBridge: false,
-      },
+it.each([false, true])(
+  'mounts the authenticated Managed Runtime worker protocol with owned=%s',
+  async (owned) => {
+    const workspace = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'qws-managed-runtime-worker-')),
     );
-    await handle.runtimeReady;
     const body = {
       protocolVersion: MANAGED_RUNTIME_PROTOCOL_VERSION,
       tenantId: 'tenant-worker',
@@ -594,33 +565,120 @@ it('mounts the authenticated Managed Runtime worker protocol', async () => {
       sessionId: '550e8400-e29b-41d4-a716-446655440109',
       turnKind: 'bootstrap',
     };
-    await fetch(`${handle.url}${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    }).then((response) => expect(response.status).toBe(401));
-    const response = await fetch(
-      `${handle.url}${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`,
-      {
-        method: 'POST',
-        headers: {
-          authorization: 'Bearer runtime-worker-secret',
-          'content-type': 'application/json',
+    const headers = {
+      authorization: 'Bearer runtime-worker-secret',
+      'content-type': 'application/json',
+      'X-Qwen-Managed-Lease-Id': 'test-lease',
+      'X-Qwen-Managed-Lease-Epoch': '1',
+    };
+    const provider: ManagedRuntimeProvider = {
+      getToolV2Client: vi.fn(),
+      prepare: vi.fn(() => ({
+        ready: Promise.resolve(),
+        finish: vi.fn(),
+        getManifest: vi.fn(),
+        execute: vi.fn(),
+      })),
+      cancel: vi.fn().mockResolvedValue(true),
+      release: vi.fn().mockResolvedValue(true),
+      dispose: vi.fn(),
+    };
+    let handle: RunHandle | undefined;
+    try {
+      handle = await runQwenServe(
+        {
+          port: 0,
+          hostname: '127.0.0.1',
+          mode: 'http-bridge',
+          token: 'runtime-worker-secret',
+          workspace,
+          maxSessions: 1,
+          serveWebShell: false,
+          experimentalManagedRuntimeWorker: true,
         },
+        {
+          bridge: makeRuntimeBridge(),
+          managedRuntimeWorkerProvider: provider,
+          ...(owned
+            ? {
+                ownedManagedRuntime: {
+                  type: 'boot' as const,
+                  version: 1 as const,
+                  gatewayIncarnation: 'test-gateway',
+                  leaseId: 'test-lease',
+                  epoch: 1,
+                  tenantId: body.tenantId,
+                  workspaceId: body.workspaceId,
+                  workspaceCwd: workspace,
+                  token: 'runtime-worker-secret',
+                  outputRoot: workspace,
+                  cliEntry: '/test/cli.js',
+                },
+              }
+            : {}),
+          preheatBridge: false,
+        },
+      );
+      await handle.runtimeReady;
+      await fetch(`${handle.url}${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
-      },
-    );
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({
-      protocolVersion: MANAGED_RUNTIME_PROTOCOL_VERSION,
-      ready: true,
-    });
-    expect(provider.prepare).toHaveBeenCalledWith(body);
-  } finally {
-    await handle?.close();
-    fs.rmSync(workspace, { recursive: true, force: true });
-  }
-});
+      }).then((response) => expect(response.status).toBe(401));
+      const response = await fetch(
+        `${handle.url}${MANAGED_RUNTIME_ROUTE_PREFIX}/prepare`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+        },
+      );
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toEqual({
+        protocolVersion: MANAGED_RUNTIME_PROTOCOL_VERSION,
+        ready: true,
+      });
+      expect(provider.prepare).toHaveBeenCalledWith(body);
+      const releaseUrl = `${handle.url}/internal/managed-runtime/v2/release`;
+      const releaseBody = JSON.stringify({ ...body, protocolVersion: 2 });
+      const released = await fetch(releaseUrl, {
+        method: 'POST',
+        headers,
+        body: releaseBody,
+      });
+      expect(released.status).toBe(owned ? 200 : 404);
+      if (owned) {
+        await expect(released.json()).resolves.toEqual({
+          protocolVersion: 2,
+          released: true,
+        });
+        expect(provider.release).toHaveBeenCalledWith(body.sessionId, body, {
+          terminal: true,
+        });
+        const conflict = await fetch(releaseUrl, {
+          method: 'POST',
+          headers: { ...headers, 'X-Qwen-Managed-Lease-Id': 'other' },
+          body: releaseBody,
+        });
+        expect(conflict.status).toBe(409);
+        expect((await fetch(releaseUrl, { headers })).status).toBe(404);
+        expect(
+          (
+            await fetch(`${releaseUrl}?extra=1`, {
+              method: 'POST',
+              headers,
+              body: releaseBody,
+            })
+          ).status,
+        ).toBe(404);
+        expect(provider.release).toHaveBeenCalledOnce();
+      } else expect(provider.release).not.toHaveBeenCalled();
+    } finally {
+      await handle?.close();
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
+  },
+);
 
 it('refuses to expose a Managed Runtime worker without a bearer token', async () => {
   await expect(

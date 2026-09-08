@@ -899,6 +899,7 @@ describe('Session', () => {
       getApprovalModeRevision: vi.fn().mockReturnValue(0),
       switchModel: switchModelSpy,
       getModel: vi.fn().mockImplementation(() => currentModel),
+      getEffectiveInputModalities: vi.fn().mockReturnValue({}),
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
       getSessionSourceType: vi.fn().mockReturnValue(undefined),
       isProvisionalWorkspace: vi.fn().mockReturnValue(false),
@@ -2573,6 +2574,10 @@ describe('Session', () => {
     it('recalls before the initial send and schedules background work after a successful turn', async () => {
       const memoryPrompt = '<system-reminder>remember this</system-reminder>';
       const finalHistory: Content[] = [
+        ...Array.from({ length: 50 }, (_, index) => ({
+          role: index % 2 === 0 ? 'user' : 'model',
+          parts: [{ text: `Earlier message ${index}` }],
+        })),
         { role: 'user', parts: [{ text: 'hello' }] },
         { role: 'model', parts: [{ text: 'response' }] },
       ];
@@ -2582,6 +2587,10 @@ describe('Session', () => {
         strategy: 'heuristic',
       });
       vi.mocked(mockChat.getHistoryShallow).mockReturnValue(finalHistory);
+      const extractionHistory = finalHistory.slice(-40);
+      vi.mocked(mockChat.getHistoryTailShallow).mockReturnValue(
+        extractionHistory,
+      );
       mockChat.sendMessageStream = vi
         .fn()
         .mockResolvedValue(createEmptyStream());
@@ -2600,9 +2609,16 @@ describe('Session', () => {
         projectRoot: '/repo',
         sessionId: 'test-session-id',
         history: finalHistory,
+        extractionHistory,
         config: mockConfig,
       });
       expect(mockMemoryManager.scheduleExtract).toHaveBeenCalledOnce();
+      expect(mockChat.getHistoryTailShallow).toHaveBeenCalledWith(40, true);
+      extractionHistory[0].parts![0].text = 'A later turn';
+      expect(
+        mockMemoryManager.scheduleExtract.mock.calls[0][0].extractionHistory[0]
+          .parts[0].text,
+      ).toBe('Earlier message 12');
       expect(mockMemoryManager.scheduleDream).toHaveBeenCalledWith({
         projectRoot: '/repo',
         sessionId: 'test-session-id',
@@ -14016,11 +14032,15 @@ describe('Session', () => {
       });
 
       it('uses the current chat after automatic compression replaces it', async () => {
+        const compressedHistory: Content[] = [
+          { role: 'user', parts: [{ text: 'Compressed conversation' }] },
+        ];
         const compressedChat = {
           sendMessageStream: vi.fn().mockResolvedValue(createEmptyStream()),
           addHistory: vi.fn(),
           getHistory: vi.fn().mockReturnValue([]),
           getHistoryShallow: vi.fn().mockReturnValue([]),
+          getHistoryTailShallow: vi.fn().mockReturnValue(compressedHistory),
           getLastModelMessageText: vi.fn().mockReturnValue(''),
         } as unknown as LlmChat;
 
@@ -14042,6 +14062,10 @@ describe('Session', () => {
         });
 
         expect(mockChat.sendMessageStream).not.toHaveBeenCalled();
+        expect(mockChat.getHistoryTailShallow).not.toHaveBeenCalled();
+        expect(mockMemoryManager.scheduleExtract).toHaveBeenCalledWith(
+          expect.objectContaining({ extractionHistory: compressedHistory }),
+        );
         expect(compressedChat.sendMessageStream).toHaveBeenCalledWith(
           'qwen3-code-plus',
           {
@@ -15149,6 +15173,7 @@ describe('Session', () => {
           addHistory: vi.fn(),
           getHistory: vi.fn().mockReturnValue([]),
           getHistoryShallow: vi.fn().mockReturnValue([]),
+          getHistoryTailShallow: vi.fn().mockReturnValue([]),
           getLastModelMessageText: vi.fn().mockReturnValue(''),
         } as unknown as LlmChat;
         mockConfig.getSessionTokenLimit = vi.fn().mockReturnValue(100);

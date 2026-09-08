@@ -60,6 +60,32 @@ function scope(id = 'a') {
 }
 
 describe('owned Runtime activation', () => {
+  it('separates admission closure from verified worker exit', async () => {
+    const { activator } = await setup(
+      1,
+      fixture.replace(
+        "process.on('SIGTERM', () => process.exit(0));",
+        "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 250));",
+      ),
+    );
+    const workspace = scope();
+    const use = activator.activate(workspace);
+    await use.endpoint;
+    let exited = false;
+    const exit = use.exited.then(() => {
+      exited = true;
+    });
+    const shutdown = activator.revokeWorkspace(workspace.runtime);
+    expect(use.signal.aborted).toBe(true);
+    await Promise.resolve();
+    expect(exited).toBe(false);
+    expect(activator.workspaceActivity(workspace.runtime)).toBe(1);
+    await shutdown;
+    await exit;
+    expect(exited).toBe(true);
+    expect(activator.workspaceActivity(workspace.runtime)).toBe(0);
+  });
+
   it('starts once for concurrent uses, fences each lease and ignores duplicate release', async () => {
     const { activator, log } = await setup();
     const workspace = scope();

@@ -11,6 +11,7 @@ import {
   SessionEndReason,
   Storage,
   type Config,
+  type ShellConfiguration,
 } from '@qwen-code/qwen-code-core';
 import {
   createInMemoryChannel,
@@ -38,6 +39,8 @@ import {
 } from '../config/config.js';
 import { loadSettings } from '../config/settings.js';
 import type { WorkspaceGenerationGuard } from './workspace-registry.js';
+import type { AutoLocalManagedRuntimeProvider } from './auto-local-managed-runtime-provider.js';
+import { createManagedToolSessionFactory } from './managed-tool-session.js';
 
 const HOST_PRIVATE_ENV_KEYS = new Set([
   'QWEN_SERVER_TOKEN',
@@ -55,6 +58,13 @@ export interface ManagedAgentChannelFactoryOptions {
   workspaceTrusted: boolean;
   generationGuard: WorkspaceGenerationGuard;
   argv: CliArgs;
+  toolRuntime?: {
+    provider: AutoLocalManagedRuntimeProvider;
+    tenantId: string;
+    workspaceId: string;
+    shellConfiguration: ShellConfiguration;
+    platform: NodeJS.Platform;
+  };
 }
 
 export function createManagedAgentChannelFactory(
@@ -68,6 +78,14 @@ export function createManagedAgentChannelFactory(
   } = options;
   const sourceEnv = Object.freeze({ ...options.runtimeEnvironment });
   const sourceArgv = structuredClone(options.argv);
+  const managedToolSessionFactory = options.toolRuntime
+    ? createManagedToolSessionFactory({
+        ...options.toolRuntime,
+        workspaceCwd,
+        workspaceTrusted,
+        generationGuard,
+      })
+    : undefined;
 
   const createChannel = async (
     requestedCwd: string,
@@ -171,7 +189,7 @@ export function createManagedAgentChannelFactory(
             undefined,
             undefined,
             true,
-            { runtimeEnvironment, workspaceTrusted },
+            { runtimeEnvironment, workspaceTrusted, managedToolSessionFactory },
           );
           generationGuard.assertOpen();
           hostOwnsConfig = true;
@@ -185,6 +203,7 @@ export function createManagedAgentChannelFactory(
             },
             {
               runtimeEnvironment,
+              managedToolSessionFactory,
               privateParentCapability,
               externalToolGuardRequired:
                 overrides[PRIVATE_EXTERNAL_TOOL_GUARD_ENV] ===

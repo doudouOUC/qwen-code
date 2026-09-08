@@ -106,6 +106,36 @@ export function registerManagedRuntimeWorkerRoutes(
       next();
     });
   if (deps.owned && deps.provider.getToolV2Client) {
+    app.post(
+      '/internal/managed-runtime/v2/release',
+      authorize,
+      async (req, res) => {
+        try {
+          const body: unknown = req.body;
+          if (
+            !body ||
+            typeof body !== 'object' ||
+            Array.isArray(body) ||
+            (body as Record<string, unknown>)['protocolVersion'] !== 2
+          )
+            throw new ManagedRuntimeProtocolError();
+          const request = parseManagedRuntimePrepareRequest({
+            ...body,
+            protocolVersion: 1,
+          });
+          const released = await deps.provider.release(
+            request.sessionId,
+            request,
+            {
+              terminal: true,
+            },
+          );
+          res.status(200).json({ protocolVersion: 2, released });
+        } catch (error) {
+          sendError(res, error);
+        }
+      },
+    );
     const operations = {
       manifest: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Manifest,
       'begin-turn': SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BeginTurn,

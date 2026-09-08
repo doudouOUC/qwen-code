@@ -9,10 +9,11 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { estimateTextTokens } from './request-tokenizer/textTokenizer.js';
+import { PDF_MAX_PAGES_PER_READ } from './pdf-constants.js';
+export { PDF_MAX_PAGES_PER_READ } from './pdf-constants.js';
 
 const MAX_PDF_TEXT_OUTPUT_CHARS = 100000;
 const PDF_FULL_TEXT_PAGE_LIMIT = 10;
-export const PDF_MAX_PAGES_PER_READ = 20;
 const PDF_PAGE_COUNT_SIZE_HEURISTIC_BYTES = 100 * 1024;
 export const PDF_TEXT_RESULT_MAX_TOKENS = 12_000;
 const PDF_TEXT_RESULT_WRAPPER_TOKEN_CHARS = 64;

@@ -20,13 +20,11 @@ import { isLoopbackBind } from './loopback-binds.js';
 import type { ManagedGatewayToolRuntime } from './managed-gateway-model-runtime.js';
 import {
   MANAGED_RUNTIME_PROTOCOL_VERSION,
-  MANAGED_RUNTIME_ROUTE_PREFIX,
   type ManagedRuntimeCancelResponse,
   type ManagedRuntimeExecuteResponse,
   type ManagedRuntimeManifestResponse,
   type ManagedRuntimePrepareRequest,
   type ManagedRuntimeReadyResponse,
-  type ManagedRuntimeReleaseResponse,
   sameManagedRuntimeIdentity,
 } from './managed-runtime-protocol.js';
 import type {
@@ -41,12 +39,17 @@ const DEFAULT_PREPARE_RETRY_WINDOW_MS = 5 * 60_000;
 const DEFAULT_PREPARE_RETRY_DELAY_MS = 100;
 const DEFAULT_PREPARE_RETRY_MAX_DELAY_MS = 2_000;
 const CONTROL_REQUEST_TIMEOUT_MS = 5_000;
+const TOOL_REQUEST_TIMEOUT_MS = 10 * 60_000;
 
 type BridgeSession = Awaited<ReturnType<AcpSessionBridge['spawnOrAttach']>>;
 
 export interface ManagedRuntimeHandle extends ManagedGatewayToolRuntime {
   readonly ready: Promise<void>;
   finish(reason: RuntimeFinishReason): void;
+}
+
+export interface ManagedRuntimeReleaseOptions {
+  terminal?: boolean;
 }
 
 export interface ManagedRuntimeProvider {
@@ -62,6 +65,7 @@ export interface ManagedRuntimeProvider {
   release(
     sessionId: string,
     expected?: ManagedRuntimePrepareRequest,
+    options?: ManagedRuntimeReleaseOptions,
   ): Promise<boolean>;
   dispose(): void | Promise<void>;
 }
@@ -97,10 +101,12 @@ interface LocalWarmup {
 
 interface LocalRelease {
   readonly request: ManagedRuntimePrepareRequest;
-  readonly warmup?: LocalWarmup;
+  warmup?: LocalWarmup;
   binding?: LocalBinding;
   pending?: Promise<boolean>;
   cleanup?: () => Promise<void>;
+  terminal?: boolean;
+  completed?: boolean;
 }
 
 class ManagedRuntimeSessionCleanupError extends Error {
@@ -432,27 +438,34 @@ export class LocalManagedRuntimeProvider implements ManagedRuntimeProvider {
   async release(
     sessionId: string,
     expected?: ManagedRuntimePrepareRequest,
+    options?: ManagedRuntimeReleaseOptions,
   ): Promise<boolean> {
     const warmup = this.warmups.get(sessionId);
     const binding = this.bindings.get(sessionId);
     let release = this.releases.get(sessionId);
     const current = release?.request ?? warmup?.request ?? binding?.request;
-    if (expected && current && !sameManagedRuntimeIdentity(current, expected)) {
+    if (
+      expected &&
+      (expected.sessionId !== sessionId ||
+        (current && !sameManagedRuntimeIdentity(current, expected)))
+    ) {
       throw new ManagedRuntimeProviderError(
         'managed_runtime_identity_conflict',
         'Managed Runtime Session identity changed.',
         false,
       );
     }
+    this.lifetime.signal.throwIfAborted();
     if (!release) {
       const request = current ?? expected;
       if (!request) return false;
-      this.lifetime.signal.throwIfAborted();
       release = { request: structuredClone(request), binding, warmup };
       this.releases.set(sessionId, release);
       warmup?.controller.abort(new ManagedRuntimeReleaseAbortError());
       binding?.controller.abort(new ManagedRuntimeReleaseAbortError());
     }
+    release.terminal ||= options?.terminal === true;
+    if (release.completed) return true;
     if (release.pending) return release.pending;
     const retained = release;
     const pending = this.finishRelease(sessionId, retained)
@@ -462,7 +475,12 @@ export class LocalManagedRuntimeProvider implements ManagedRuntimeProvider {
             this.bindings.delete(sessionId);
           if (this.warmups.get(sessionId) === retained.warmup)
             this.warmups.delete(sessionId);
-          this.releases.delete(sessionId);
+          if (retained.terminal) {
+            retained.completed = true;
+            delete retained.binding;
+            delete retained.warmup;
+            delete retained.cleanup;
+          } else this.releases.delete(sessionId);
         }
         return released;
       })
@@ -479,13 +497,13 @@ export class LocalManagedRuntimeProvider implements ManagedRuntimeProvider {
   ): Promise<boolean> {
     if (release.cleanup) {
       await release.cleanup();
-      return false;
+      return true;
     }
     if (!release.binding && release.warmup) {
       try {
         release.binding = await release.warmup.promise;
       } catch (error) {
-        if (error instanceof ManagedRuntimeReleaseAbortError) return false;
+        if (error instanceof ManagedRuntimeReleaseAbortError) return true;
         if (error instanceof ManagedRuntimeSessionCleanupError)
           release.cleanup = error.cleanup;
         throw error;
@@ -535,7 +553,7 @@ export class LocalManagedRuntimeProvider implements ManagedRuntimeProvider {
       } catch (error) {
         if (error instanceof ManagedRuntimeSessionCleanupError)
           release.cleanup = error.cleanup;
-        if (isSessionNotFound(error)) return false;
+        if (isSessionNotFound(error)) return true;
         throw error;
       }
     }
@@ -738,6 +756,10 @@ interface RemoteProviderEntry {
   request: ManagedRuntimePrepareRequest;
   readonly controller: AbortController;
   readonly ready: Promise<void>;
+  releasing?: boolean;
+  release?: Promise<boolean>;
+  v2?: ManagedToolV2Client;
+  terminal?: boolean;
 }
 
 class RemoteResponseError extends Error {
@@ -845,9 +867,15 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
   private readonly retryDelayMs: number;
   private readonly retryMaxDelayMs: number;
   private readonly entries = new Map<string, RemoteProviderEntry>();
+  private readonly closedSessions = new Map<
+    string,
+    ManagedRuntimePrepareRequest
+  >();
   private readonly lifetime = new AbortController();
+  private readonly lease?: { readonly leaseId: string; readonly epoch: number };
 
-  constructor(private readonly options: RemoteManagedRuntimeProviderOptions) {
+  constructor(options: RemoteManagedRuntimeProviderOptions) {
+    this.lease = options.lease && { ...options.lease };
     this.baseUrl = resolveRemoteBaseUrl(options.baseUrl);
     this.token = options.token.trim();
     if (!this.token) throw new Error('Managed Runtime token is required.');
@@ -873,10 +901,21 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
     request: ManagedRuntimePrepareRequest,
     retryWindowMs = this.retryWindowMs,
   ): ManagedRuntimeHandle {
+    request = structuredClone(request);
     if (this.lifetime.signal.aborted) {
       throw new ManagedRuntimeProviderError(
         'managed_runtime_disposed',
         'Managed Runtime provider is disposed.',
+        false,
+      );
+    }
+    const closed = this.closedSessions.get(request.sessionId);
+    if (closed) {
+      throw new ManagedRuntimeProviderError(
+        sameManagedRuntimeIdentity(closed, request)
+          ? 'managed_runtime_unavailable'
+          : 'managed_runtime_identity_conflict',
+        'Managed Runtime Session is permanently closed.',
         false,
       );
     }
@@ -888,17 +927,30 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
         false,
       );
     }
+    if (entry?.releasing) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_unavailable',
+        'Managed Runtime Session is being released.',
+        false,
+      );
+    }
     if (entry) {
       entry.request = structuredClone(request);
     }
     if (!entry) {
       const controller = new AbortController();
-      const signal = AbortSignal.any([this.lifetime.signal, controller.signal]);
+      // Release must await preparation before sending close. Aborting only its
+      // HTTP response would leave a late-created Session without an owner.
+      const signal = this.lifetime.signal;
       const ready = this.prepareRemote(request, signal, retryWindowMs);
       entry = { request: structuredClone(request), controller, ready };
       this.entries.set(request.sessionId, entry);
       void ready.catch(() => {
-        if (this.entries.get(request.sessionId) === entry) {
+        if (
+          this.entries.get(request.sessionId) === entry &&
+          !entry?.v2 &&
+          !entry?.releasing
+        ) {
           this.entries.delete(request.sessionId);
         }
       });
@@ -966,6 +1018,144 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
     };
   }
 
+  async getToolV2Client(
+    request: ManagedRuntimePrepareRequest,
+  ): Promise<ManagedToolV2Client> {
+    if (!this.lease) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_unavailable',
+        'Managed Tool v2 requires an owned Runtime lease.',
+        false,
+      );
+    }
+    const current = this.entries.get(request.sessionId);
+    if (!current?.releasing) this.prepare(request);
+    const entry = this.entries.get(request.sessionId);
+    if (!entry || !sameManagedRuntimeIdentity(entry.request, request)) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_identity_conflict',
+        'Managed Runtime Session binding changed.',
+        false,
+      );
+    }
+    entry.v2 ??= this.createToolV2Client(entry);
+    await entry.ready;
+    this.lifetime.signal.throwIfAborted();
+    return entry.v2;
+  }
+
+  private createToolV2Client(entry: RemoteProviderEntry): ManagedToolV2Client {
+    const call = async <T>(
+      operation: string,
+      params: Record<string, unknown> = {},
+      allowDraining = false,
+    ): Promise<T> => {
+      const { managedToolDigest } = await import('@qwen-code/qwen-code-core');
+      this.lifetime.signal.throwIfAborted();
+      if (this.entries.get(entry.request.sessionId) !== entry) {
+        throw new ManagedRuntimeProviderError(
+          'managed_runtime_identity_conflict',
+          'Managed Runtime Session binding changed.',
+          false,
+        );
+      }
+      if (!allowDraining) entry.controller.signal.throwIfAborted();
+      const identity = params['identity'] ?? params['reference'];
+      if (
+        identity !== undefined &&
+        (identity as { sessionId?: unknown }).sessionId !==
+          entry.request.sessionId
+      ) {
+        throw new ManagedRuntimeProviderError(
+          'managed_runtime_identity_conflict',
+          'Managed Runtime invocation belongs to another Session.',
+          false,
+        );
+      }
+      const body = { ...entry.request, protocolVersion: 2, ...params };
+      managedToolDigest(body, 1024 * 1024);
+      const response = await this.postJson<{
+        protocolVersion?: unknown;
+        result?: T;
+      }>(
+        operation,
+        body,
+        AbortSignal.any([
+          this.lifetime.signal,
+          ...(allowDraining ? [] : [entry.controller.signal]),
+          AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
+        ]),
+        operation === 'manifest'
+          ? MAX_REMOTE_MANIFEST_BYTES
+          : MAX_REMOTE_TOOL_RESULT_BYTES,
+        2,
+      );
+      const empty = operation === 'begin-turn' || operation === 'confirm';
+      if (
+        response.protocolVersion !== 2 ||
+        (empty
+          ? response.result !== null
+          : !response.result ||
+            typeof response.result !== 'object' ||
+            Array.isArray(response.result))
+      ) {
+        throw new Error('Managed Runtime returned an invalid v2 response.');
+      }
+      const validResult = (value: unknown) =>
+        value !== null &&
+        typeof value === 'object' &&
+        ['not_started', 'success', 'error', 'cancelled'].includes(
+          (value as { executionStatus?: string }).executionStatus ?? '',
+        );
+      if (operation === 'execute' && !validResult(response.result)) {
+        throw new Error('Managed Runtime did not confirm physical execution.');
+      }
+      if (operation === 'status' || operation === 'cancel') {
+        const status = response.result as { state?: string; result?: unknown };
+        if (
+          !['prepared', 'executing', 'cancel_requested', 'settled'].includes(
+            status.state ?? '',
+          ) ||
+          (status.state === 'settled' && !validResult(status.result))
+        ) {
+          throw new Error(
+            'Managed Runtime returned an invalid invocation status.',
+          );
+        }
+      }
+      return response.result as T;
+    };
+    return {
+      manifest: () => call('manifest'),
+      beginTurn: async (identity) => {
+        await call('begin-turn', { identity });
+      },
+      prepare: (identity, toolName, input) =>
+        call('prepare', { identity, toolName, input }),
+      confirmation: (reference) => call('confirmation', { reference }),
+      confirm: async (reference, outcome, payload, phase) => {
+        await call('confirm', {
+          reference,
+          outcome,
+          ...(payload === undefined ? {} : { payload }),
+          ...(phase === undefined ? {} : { phase }),
+        });
+      },
+      preflight: (reference) => call('preflight', { reference }),
+      execute: (reference) => call('execute', { reference }),
+      status: (reference, afterSeq) =>
+        call(
+          'status',
+          {
+            reference,
+            ...(afterSeq === undefined ? {} : { afterSeq }),
+          },
+          true,
+        ),
+      cancel: (reference) => call('cancel', { reference }, true),
+    };
+  }
+
   async cancel(
     sessionId: string,
     executionId: string,
@@ -995,9 +1185,38 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
   async release(
     sessionId: string,
     expected?: ManagedRuntimePrepareRequest,
+    options?: ManagedRuntimeReleaseOptions,
   ): Promise<boolean> {
-    const entry = this.entries.get(sessionId);
-    if (!entry) return false;
+    let entry = this.entries.get(sessionId);
+    const closed = this.closedSessions.get(sessionId);
+    const terminal = options?.terminal === true || entry?.v2 !== undefined;
+    if (terminal && !this.lease) {
+      throw new Error(
+        'Terminal Session release requires an owned Runtime lease.',
+      );
+    }
+    if (
+      expected &&
+      (expected.sessionId !== sessionId ||
+        (closed && !sameManagedRuntimeIdentity(closed, expected)))
+    ) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_identity_conflict',
+        'Managed Runtime Session identity changed.',
+        false,
+      );
+    }
+    this.lifetime.signal.throwIfAborted();
+    if (closed) return true;
+    if (!entry) {
+      if (!expected) return false;
+      entry = {
+        request: structuredClone(expected),
+        controller: new AbortController(),
+        ready: Promise.resolve(),
+      };
+      this.entries.set(sessionId, entry);
+    }
     if (expected && !sameManagedRuntimeIdentity(entry.request, expected)) {
       throw new ManagedRuntimeProviderError(
         'managed_runtime_identity_conflict',
@@ -1005,24 +1224,49 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
         false,
       );
     }
-    this.entries.delete(sessionId);
+    entry.terminal ||= terminal;
+    entry.releasing = true;
     entry.controller.abort(new Error('Managed Runtime Session released.'));
-    if (this.lifetime.signal.aborted) return true;
-    try {
-      const response =
-        await this.postIdempotentJson<ManagedRuntimeReleaseResponse>(
+    if (entry.release) return entry.release;
+    const retained = entry;
+    const release = (async () => {
+      await retained.ready.catch(() => {});
+      this.lifetime.signal.throwIfAborted();
+      let sentTerminal: boolean;
+      do {
+        sentTerminal = retained.terminal === true;
+        const protocolVersion = sentTerminal ? 2 : 1;
+        const response = await this.postIdempotentJson<{
+          protocolVersion: unknown;
+          released: unknown;
+        }>(
           'release',
-          entry.request,
-          AbortSignal.timeout(CONTROL_REQUEST_TIMEOUT_MS),
+          { ...retained.request, protocolVersion },
+          AbortSignal.any([
+            this.lifetime.signal,
+            AbortSignal.timeout(CONTROL_REQUEST_TIMEOUT_MS),
+          ]),
           MAX_REMOTE_CONTROL_RESPONSE_BYTES,
+          protocolVersion,
         );
-      return (
-        response.protocolVersion === MANAGED_RUNTIME_PROTOCOL_VERSION &&
-        response.released === true
-      );
-    } catch {
-      return false;
-    }
+        if (
+          response.protocolVersion !== protocolVersion ||
+          response.released !== true
+        ) {
+          throw new Error('Managed Runtime did not confirm Session release.');
+        }
+      } while (retained.terminal && !sentTerminal);
+      if (sentTerminal) {
+        this.closedSessions.set(sessionId, retained.request);
+      }
+      if (this.entries.get(sessionId) === retained)
+        this.entries.delete(sessionId);
+      return true;
+    })().finally(() => {
+      retained.release = undefined;
+    });
+    retained.release = release;
+    return release;
   }
 
   dispose(): void {
@@ -1032,6 +1276,7 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
       entry.controller.abort(new Error('Managed Runtime provider disposed.'));
     }
     this.entries.clear();
+    this.closedSessions.clear();
   }
 
   private async prepareRemote(
@@ -1102,10 +1347,11 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
     body: unknown,
     signal: AbortSignal,
     maxResponseBytes: number,
+    protocolVersion: 1 | 2 = 1,
   ): Promise<T> {
     const response = await this.fetchImpl(
       new URL(
-        `${MANAGED_RUNTIME_ROUTE_PREFIX.slice(1)}/${operation}`,
+        `internal/managed-runtime/v${protocolVersion}/${operation}`,
         this.baseUrl,
       ),
       {
@@ -1113,10 +1359,10 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
         headers: {
           authorization: `Bearer ${this.token}`,
           'content-type': 'application/json',
-          ...(this.options.lease
+          ...(this.lease
             ? {
-                [MANAGED_LEASE_ID_HEADER]: this.options.lease.leaseId,
-                [MANAGED_LEASE_EPOCH_HEADER]: String(this.options.lease.epoch),
+                [MANAGED_LEASE_ID_HEADER]: this.lease.leaseId,
+                [MANAGED_LEASE_EPOCH_HEADER]: String(this.lease.epoch),
               }
             : {}),
         },
@@ -1146,16 +1392,29 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
     body: unknown,
     signal: AbortSignal,
     maxResponseBytes: number,
+    protocolVersion: 1 | 2 = 1,
   ): Promise<T> {
     try {
-      return await this.postJson<T>(operation, body, signal, maxResponseBytes);
+      return await this.postJson<T>(
+        operation,
+        body,
+        signal,
+        maxResponseBytes,
+        protocolVersion,
+      );
     } catch (error) {
       const retryable =
         !signal.aborted &&
         (error instanceof TypeError ||
           (error instanceof RemoteResponseError && error.status === 503));
       if (!retryable) throw error;
-      return this.postJson<T>(operation, body, signal, maxResponseBytes);
+      return this.postJson<T>(
+        operation,
+        body,
+        signal,
+        maxResponseBytes,
+        protocolVersion,
+      );
     }
   }
 }

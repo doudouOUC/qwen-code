@@ -40,6 +40,9 @@ interface Generation {
   readonly boot: ManagedWorkerBoot;
   readonly controller: AbortController;
   readonly uses: Set<symbol>;
+  readonly exited: Promise<void>;
+  readonly resolveExit: () => void;
+  readonly rejectExit: (error: unknown) => void;
   endpoint: Promise<ManagedRuntimeEndpoint>;
   child?: ChildProcess;
   tracked?: TrackedChildProcess;
@@ -118,6 +121,13 @@ export class LocalProcessRuntimeActivator {
       const epoch = (this.epochs.get(key) ?? 0) + 1;
       this.epochs.set(key, epoch);
       const leaseId = randomUUID();
+      let resolveExit!: () => void;
+      let rejectExit!: (error: unknown) => void;
+      const exited = new Promise<void>((resolve, reject) => {
+        resolveExit = resolve;
+        rejectExit = reject;
+      });
+      void exited.catch(() => {});
       generation = {
         key,
         scope,
@@ -136,6 +146,9 @@ export class LocalProcessRuntimeActivator {
         },
         controller: new AbortController(),
         uses: new Set(),
+        exited,
+        resolveExit,
+        rejectExit,
         endpoint: Promise.resolve(undefined as never),
         ready: false,
         retiring: false,
@@ -170,6 +183,7 @@ export class LocalProcessRuntimeActivator {
           : { ...endpoint, deadline: prepareDeadline },
       ),
       signal: active.controller.signal,
+      exited: active.exited,
       release: (reason) => {
         if (released) return;
         released = true;
@@ -188,12 +202,16 @@ export class LocalProcessRuntimeActivator {
       beginOperation: () => {
         active.controller.signal.throwIfAborted();
         active.operations++;
-        let finished = false;
+        let state: 'active' | 'uncertain' | 'finished' = 'active';
         return (certain) => {
-          if (finished) return;
-          finished = true;
-          if (certain) active.operations--;
-          else active.retiring = true;
+          if (state === 'finished') return;
+          if (certain) {
+            state = 'finished';
+            active.operations--;
+          } else {
+            state = 'uncertain';
+            active.retiring = true;
+          }
           if (active.retiring && active.uses.size === 0)
             void this.stop(
               active,
@@ -274,6 +292,7 @@ export class LocalProcessRuntimeActivator {
     return {
       endpoint,
       signal: new AbortController().signal,
+      exited: Promise.resolve(),
       release: () => {},
       beginOperation: () => () => {},
     };
@@ -411,7 +430,9 @@ export class LocalProcessRuntimeActivator {
       await rm(g.boot.outputRoot, { recursive: true, force: true });
       if (this.generations.get(g.key) === g) this.generations.delete(g.key);
       this.log(g, 'released');
+      g.resolveExit();
     })().catch((error) => {
+      g.rejectExit(error);
       this.log(g, 'cleanup_failed');
       throw error;
     });

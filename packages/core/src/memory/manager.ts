@@ -134,6 +134,7 @@ export interface ScheduleExtractParams {
   projectRoot: string;
   sessionId: string;
   history: Content[];
+  extractionHistory: Content[];
   now?: Date;
   config?: Config;
 }
@@ -582,7 +583,10 @@ export class MemoryManager {
 
   private track<T>(taskId: string, promise: Promise<T>): Promise<T> {
     this.inFlight.set(taskId, promise);
-    void promise.finally(() => this.inFlight.delete(taskId));
+    const settled = () => {
+      this.inFlight.delete(taskId);
+    };
+    void promise.then(settled, settled);
     return promise;
   }
 
@@ -816,7 +820,9 @@ export class MemoryManager {
     } finally {
       this.extractCurrentTaskId.delete(params.projectRoot);
       this.extractRunning.delete(params.projectRoot);
-      void this.startQueuedExtract(params.projectRoot);
+      void this.startQueuedExtract(params.projectRoot).catch((error) => {
+        debugLogger.warn('Queued memory extraction failed:', error);
+      });
     }
   }
 

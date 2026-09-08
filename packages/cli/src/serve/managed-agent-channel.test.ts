@@ -28,6 +28,7 @@ import { createAcpAgentHost } from '../acp-integration/acpAgent.js';
 import { loadCliConfig, type CliArgs } from '../config/config.js';
 import { loadSettings, type LoadedSettings } from '../config/settings.js';
 import { createManagedAgentChannelFactory } from './managed-agent-channel.js';
+import type { AutoLocalManagedRuntimeProvider } from './auto-local-managed-runtime-provider.js';
 import { createWorkspaceGenerationGuard } from './workspace-registry.js';
 
 vi.mock('../acp-integration/acpAgent.js', () => ({
@@ -106,6 +107,45 @@ describe('managed Agent channel', () => {
       argv,
     });
   }
+
+  it('passes the same lazy tool Session producer to bootstrap and actual Session hosts', async () => {
+    const acquire = vi.fn();
+    const provider = {
+      getToolV2Client: acquire,
+      release: vi.fn(),
+    } as unknown as AutoLocalManagedRuntimeProvider;
+    const create = createManagedAgentChannelFactory({
+      workspaceCwd: cwd,
+      sessionRuntimeBaseDir: join(root, 'output'),
+      runtimeEnvironment: {},
+      workspaceTrusted: true,
+      generationGuard: guard,
+      argv: {} as CliArgs,
+      toolRuntime: {
+        provider,
+        tenantId: 'tenant',
+        workspaceId: 'workspace',
+        shellConfiguration: {
+          executable: 'bash',
+          argsPrefix: ['-c'],
+          shell: 'bash',
+        },
+        platform: 'darwin',
+      },
+    });
+    const channel = await create(cwd, privateOverrides);
+    const bootstrap =
+      vi.mocked(loadCliConfig).mock.calls[0][9]?.managedToolSessionFactory;
+    const host =
+      vi.mocked(createAcpAgentHost).mock.calls[0][4]?.managedToolSessionFactory;
+    expect(bootstrap).toBeTypeOf('function');
+    expect(host).toBe(bootstrap);
+    const session = host!({ getTargetDir: () => cwd } as Config);
+    await session.close();
+    expect(acquire).not.toHaveBeenCalled();
+    await channel.kill();
+    await channel.exited;
+  });
 
   it('pins copied settings, argv, environment and output while consuming private markers', async () => {
     const ambient = { ...process.env };

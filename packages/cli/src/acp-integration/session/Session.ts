@@ -78,6 +78,7 @@ import {
   markDuplicateProviderToolCallResponseSent,
   PLAN_MODE_ENTRY_SIBLING_SKIP_MESSAGE,
   createDebugLogger,
+  captureAutoMemoryExtractionHistory,
   DiscoveredMCPTool,
   StreamEventType,
   ToolConfirmationOutcome,
@@ -6163,12 +6164,17 @@ export class Session implements SessionContext {
                 this.config.getManagedAutoMemoryEnabled()
               ) {
                 const memoryManager = this.config.getMemoryManager();
-                const history = this.#getCurrentChat().getHistoryShallow();
+                const chat = this.#getCurrentChat();
+                const history = chat.getHistoryShallow();
                 void memoryManager
                   .scheduleExtract({
                     projectRoot: this.config.getProjectRoot(),
                     sessionId: this.config.getSessionId(),
                     history,
+                    extractionHistory: captureAutoMemoryExtractionHistory(
+                      chat,
+                      this.config.getEffectiveInputModalities(),
+                    ),
                     config: this.config,
                   })
                   .catch((error: unknown) => {

@@ -9,10 +9,11 @@
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import express from 'express';
+import express, { type RequestHandler } from 'express';
 import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ManagedToolV2Client } from '@qwen-code/acp-bridge/bridgeTypes';
+import type { ManagedWorkerBoot } from './managed-runtime-activator.js';
 import type { AcpSessionBridge } from './acp-session-bridge.js';
 import {
   LocalManagedRuntimeProvider,
@@ -108,11 +109,17 @@ function fakeRuntime(): {
   return { bridge, registry, execute, cancel, close };
 }
 
-function workerApp(provider: LocalManagedRuntimeProvider) {
+function workerApp(
+  provider: LocalManagedRuntimeProvider,
+  owned?: ManagedWorkerBoot,
+  beforeRoutes?: RequestHandler,
+) {
   const app = express();
   app.use(express.json());
+  if (beforeRoutes) app.use(beforeRoutes);
   registerManagedRuntimeWorkerRoutes(app, {
     provider,
+    owned,
     authorize: (req, res, next) => {
       if (req.headers.authorization !== `Bearer ${token}`) {
         res.status(401).json({ error: 'Unauthorized' });
@@ -162,6 +169,534 @@ describe('Managed Runtime providers', () => {
       cancel: vi.fn(async () => ({ state: 'cancel_requested' })),
     };
   }
+
+  function ownedBoot(): ManagedWorkerBoot {
+    return {
+      type: 'boot',
+      version: 1,
+      gatewayIncarnation: 'gateway',
+      leaseId: 'lease',
+      epoch: 1,
+      ...prepareRequest,
+      token,
+      outputRoot: '/tmp/owned-output',
+      cliEntry: '/cli.js',
+    };
+  }
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  it('fences a parsed first v2 request that arrives after release is acknowledged', async () => {
+    const runtime = fakeRuntime();
+    runtime.bridge.getManagedToolV2Client = vi.fn(
+      () => toolV2Client() as unknown as ManagedToolV2Client,
+    );
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const entered = deferred<void>();
+    const dispatch = deferred<void>();
+    const owned = ownedBoot();
+    const server = createServer(
+      workerApp(local, owned, (req, _res, next) => {
+        if (req.path.endsWith('/v2/manifest')) {
+          entered.resolve();
+          void dispatch.promise.then(() => next());
+        } else next();
+      }),
+    );
+    servers.push(server);
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: `http://127.0.0.1:${await listen(server)}`,
+      token,
+      lease: owned,
+    });
+    try {
+      const client = await remote.getToolV2Client(prepareRequest);
+      const manifest = client.manifest().catch((error: unknown) => error);
+      await entered.promise;
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest),
+      ).resolves.toBe(true);
+      expect(await manifest).toBeInstanceOf(Error);
+      expect(runtime.close).toHaveBeenCalledOnce();
+      const late = vi.spyOn(local, 'getToolV2Client');
+      dispatch.resolve();
+      await vi.waitFor(() => expect(late).toHaveBeenCalledOnce());
+      await expect(late.mock.results[0].value).rejects.toThrow();
+      expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledOnce();
+      expect(() => local.prepare(prepareRequest)).toThrow('closing');
+      expect(() => remote.prepare(prepareRequest)).toThrow();
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest),
+      ).resolves.toBe(true);
+    } finally {
+      dispatch.resolve();
+      remote.dispose();
+      local.dispose();
+    }
+  });
+
+  it('upgrades a pending local v1 release to a terminal identity before completing cleanup', async () => {
+    const runtime = fakeRuntime();
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    await local.prepare(prepareRequest).ready;
+    const close = deferred<void>();
+    runtime.close.mockReturnValueOnce(close.promise);
+    const ordinary = local.release(prepareRequest.sessionId, prepareRequest);
+    const terminal = local.release(prepareRequest.sessionId, prepareRequest, {
+      terminal: true,
+    });
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    close.resolve();
+    expect(await Promise.all([ordinary, terminal])).toEqual([true, true]);
+    expect(runtime.close).toHaveBeenCalledOnce();
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    await expect(local.getToolV2Client(prepareRequest)).rejects.toThrow();
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest),
+    ).resolves.toBe(true);
+    await expect(
+      local.release(
+        prepareRequest.sessionId,
+        { ...prepareRequest, tenantId: 'other' },
+        { terminal: true },
+      ),
+    ).rejects.toThrow('identity');
+    expect(runtime.close).toHaveBeenCalledOnce();
+    local.dispose();
+  });
+
+  it('retains a failed terminal close for retry and seals before any preparation has arrived', async () => {
+    const runtime = fakeRuntime();
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    vi.mocked(runtime.bridge.resumeSession).mockRejectedValueOnce(
+      new Error('restore failed'),
+    );
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest, {
+        terminal: true,
+      }),
+    ).rejects.toThrow('restore failed');
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    vi.mocked(runtime.bridge.resumeSession).mockRejectedValueOnce(
+      Object.assign(new Error('not found'), { code: 'session_not_found' }),
+    );
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest, {
+        terminal: true,
+      }),
+    ).resolves.toBe(true);
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    await expect(
+      local.release(prepareRequest.sessionId, prepareRequest, {
+        terminal: true,
+      }),
+    ).resolves.toBe(true);
+    expect(runtime.bridge.resumeSession).toHaveBeenCalledTimes(2);
+    expect(runtime.bridge.spawnOrAttach).not.toHaveBeenCalled();
+    local.dispose();
+  });
+
+  it('keeps ordinary v1 release reusable for the same Session identity', async () => {
+    const runtime = fakeRuntime();
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    await local.prepare(prepareRequest).ready;
+    await local.release(prepareRequest.sessionId, prepareRequest);
+    await local.prepare(prepareRequest).ready;
+    expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledTimes(2);
+    await local.release(prepareRequest.sessionId, prepareRequest);
+    local.dispose();
+  });
+
+  it('waits for a v2 terminal receipt when a pending remote v1 release is upgraded', async () => {
+    const ordinaryAck = deferred<Response>();
+    const terminalAck = deferred<Response>();
+    const versions: number[] = [];
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: 'http://127.0.0.1:4181',
+      token,
+      lease: ownedBoot(),
+      fetch: vi.fn(async (url: RequestInfo | URL) => {
+        const path = new URL(String(url)).pathname;
+        if (path.endsWith('/prepare'))
+          return Response.json({ protocolVersion: 1, ready: true });
+        const version = path.includes('/v2/') ? 2 : 1;
+        versions.push(version);
+        return version === 1 ? ordinaryAck.promise : terminalAck.promise;
+      }),
+    });
+    try {
+      await remote.prepare(prepareRequest).ready;
+      let closed = false;
+      const ordinary = remote
+        .release(prepareRequest.sessionId, prepareRequest)
+        .then(() => {
+          closed = true;
+        });
+      await vi.waitFor(() => expect(versions).toEqual([1]));
+      const terminal = remote.release(
+        prepareRequest.sessionId,
+        prepareRequest,
+        { terminal: true },
+      );
+      ordinaryAck.resolve(
+        Response.json({ protocolVersion: 1, released: true }),
+      );
+      await vi.waitFor(() => expect(versions).toEqual([1, 2]));
+      expect(closed).toBe(false);
+      terminalAck.resolve(
+        Response.json({ protocolVersion: 2, released: true }),
+      );
+      await Promise.all([ordinary, terminal]);
+      expect(() => remote.prepare(prepareRequest)).toThrow();
+    } finally {
+      remote.dispose();
+    }
+  });
+
+  it('rejects a v1 receipt for terminal release and retries the owned v2 endpoint', async () => {
+    const versions: string[] = [];
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: 'http://127.0.0.1:4181',
+      token,
+      lease: ownedBoot(),
+      fetch: vi.fn(async (url: RequestInfo | URL) => {
+        versions.push(new URL(String(url)).pathname);
+        return Response.json({
+          protocolVersion: versions.length === 1 ? 1 : 2,
+          released: true,
+        });
+      }),
+    });
+    try {
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest, {
+          terminal: true,
+        }),
+      ).rejects.toThrow('did not confirm');
+      expect(() => remote.prepare(prepareRequest)).toThrow();
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest, {
+          terminal: true,
+        }),
+      ).resolves.toBe(true);
+      expect(versions).toEqual([
+        '/internal/managed-runtime/v2/release',
+        '/internal/managed-runtime/v2/release',
+      ]);
+    } finally {
+      remote.dispose();
+    }
+  });
+
+  it('requires an owned lease for terminal release before sending any request', async () => {
+    const fetch = vi.fn();
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: 'http://127.0.0.1:4181',
+      token,
+      fetch,
+    });
+    await expect(
+      remote.release(prepareRequest.sessionId, prepareRequest, {
+        terminal: true,
+      }),
+    ).rejects.toThrow('owned Runtime lease');
+    expect(fetch).not.toHaveBeenCalled();
+    remote.dispose();
+  });
+
+  it('exposes terminal release only with owned auth, lease and strict workspace identity', async () => {
+    const runtime = fakeRuntime();
+    vi.mocked(runtime.bridge.resumeSession).mockRejectedValue(
+      Object.assign(new Error('not found'), { code: 'session_not_found' }),
+    );
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const path = '/internal/managed-runtime/v2/release';
+    const body = { ...prepareRequest, protocolVersion: 2 };
+    await request(workerApp(local)).post(path).send(body).expect(404);
+    const app = workerApp(local, ownedBoot());
+    await request(app).post(path).send(body).expect(401);
+    await request(app)
+      .post(path)
+      .set('authorization', `Bearer ${token}`)
+      .send(body)
+      .expect(409);
+    const authorized = () =>
+      request(app)
+        .post(path)
+        .set('authorization', `Bearer ${token}`)
+        .set('X-Qwen-Managed-Lease-Id', 'lease')
+        .set('X-Qwen-Managed-Lease-Epoch', '1');
+    await authorized()
+      .send({ ...body, tenantId: 'other' })
+      .expect(409);
+    await authorized()
+      .send({ ...body, extra: true })
+      .expect(400);
+    await authorized()
+      .send({ ...body, protocolVersion: 1 })
+      .expect(400);
+    const result = await authorized().send(body).expect(200);
+    expect(result.body).toEqual({ protocolVersion: 2, released: true });
+    expect(() => local.prepare(prepareRequest)).toThrow();
+    local.dispose();
+  });
+
+  it('connects all nine v2 methods through the owned HTTP listener without losing optional fields', async () => {
+    const runtime = fakeRuntime();
+    const client = toolV2Client();
+    runtime.bridge.getManagedToolV2Client = vi.fn(
+      () => client as unknown as ManagedToolV2Client,
+    );
+    vi.mocked(runtime.bridge.getSessionSummary).mockReturnValue({
+      workspaceCwd,
+      sourceType: 'managed-gateway',
+      sourceId: prepareRequest.sessionId,
+    } as never);
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const owned: ManagedWorkerBoot = {
+      type: 'boot',
+      version: 1,
+      gatewayIncarnation: 'gateway',
+      leaseId: 'lease',
+      epoch: 1,
+      ...prepareRequest,
+      token,
+      outputRoot: '/tmp/owned-output',
+      cliEntry: '/cli.js',
+    };
+    const server = createServer(workerApp(local, owned));
+    servers.push(server);
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: `http://127.0.0.1:${await listen(server)}`,
+      token,
+      lease: owned,
+    });
+    try {
+      const connected = await remote.getToolV2Client(prepareRequest);
+      await connected.manifest();
+      const identity = {
+        sessionId: invocation.sessionId,
+        promptId: invocation.promptId,
+        callId: invocation.callId,
+        capabilityDigest: invocation.capabilityDigest,
+        policyRevision: invocation.policyRevision,
+      };
+      await connected.beginTurn(identity);
+      await connected.prepare(identity, 'read_file', {
+        file_path: 'proof.txt',
+      });
+      await connected.confirmation(invocation);
+      await connected.confirm(invocation, 'proceed_once' as never);
+      await connected.confirm(
+        invocation,
+        'proceed_once' as never,
+        { answers: { answer: 'yes' } },
+        'preflight',
+      );
+      await connected.preflight(invocation);
+      await connected.execute(invocation);
+      await connected.status(invocation);
+      await connected.cancel(invocation);
+      expect(client.confirm.mock.calls).toEqual([
+        [invocation, 'proceed_once', undefined, 'permission'],
+        [
+          invocation,
+          'proceed_once',
+          { answers: { answer: 'yes' } },
+          'preflight',
+        ],
+      ]);
+      expect(client.execute).toHaveBeenCalledExactlyOnceWith(invocation);
+      expect(client.status).toHaveBeenCalledExactlyOnceWith(invocation, 0);
+      await expect(
+        remote.getToolV2Client({ ...prepareRequest, tenantId: 'other' }),
+      ).rejects.toThrow();
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest),
+      ).resolves.toBe(true);
+      vi.mocked(runtime.bridge.resumeSession).mockRejectedValueOnce(
+        Object.assign(new Error('not found'), { code: 'session_not_found' }),
+      );
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest),
+      ).resolves.toBe(true);
+    } finally {
+      remote.dispose();
+      local.dispose();
+    }
+  });
+
+  it('pins request identity and lease while retrying cold-start preparation', async () => {
+    const lease = { leaseId: 'owned-lease', epoch: 1 };
+    const input = { ...prepareRequest };
+    let finish!: (response: Response) => void;
+    const first = new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+    let requests = 0;
+    const fetchImpl = vi.fn(
+      async (_url: RequestInfo | URL, _options?: RequestInit) => {
+        if (++requests === 1) return first;
+        return Response.json({ protocolVersion: 1, ready: true });
+      },
+    );
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: 'http://127.0.0.1:4181',
+      token,
+      lease,
+      fetch: fetchImpl,
+      prepareRetryDelayMs: 0,
+    });
+    try {
+      const pending = remote.getToolV2Client(input);
+      input.workspaceCwd = '/other';
+      input.tenantId = 'other';
+      lease.epoch = 2;
+      lease.leaseId = 'other';
+      finish(new Response('', { status: 503 }));
+      await pending;
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      for (const [, options] of fetchImpl.mock.calls) {
+        expect(JSON.parse(String(options?.body))).toEqual(prepareRequest);
+        expect(
+          new Headers(options?.headers).get('X-Qwen-Managed-Lease-Id'),
+        ).toBe('owned-lease');
+        expect(
+          new Headers(options?.headers).get('X-Qwen-Managed-Lease-Epoch'),
+        ).toBe('1');
+      }
+    } finally {
+      remote.dispose();
+    }
+  });
+
+  it('retains a failed remote release, permits v2 drain queries, and retries cleanup without executing twice', async () => {
+    let releases = 0;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname.endsWith('/v1/prepare'))
+        return Response.json({ protocolVersion: 1, ready: true });
+      if (pathname.endsWith('/release')) {
+        if (++releases === 1) return new Response('', { status: 500 });
+        return Response.json({ protocolVersion: 2, released: true });
+      }
+      if (pathname.endsWith('/execute'))
+        throw new TypeError('lost execute response');
+      return Response.json({
+        protocolVersion: 2,
+        result: {
+          state: 'settled',
+          cancelRequested: true,
+          result: { executionStatus: 'cancelled' },
+        },
+      });
+    });
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: 'http://127.0.0.1:4181',
+      token,
+      lease: { leaseId: 'lease', epoch: 1 },
+      fetch: fetchImpl,
+    });
+    try {
+      const client = await remote.getToolV2Client(prepareRequest);
+      await expect(client.execute(invocation)).rejects.toThrow(
+        'lost execute response',
+      );
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest),
+      ).rejects.toThrow('HTTP 500');
+      await expect(
+        client.prepare(invocation, 'read_file', {}),
+      ).rejects.toThrow();
+      await expect(client.status(invocation)).resolves.toMatchObject({
+        state: 'settled',
+      });
+      await expect(client.cancel(invocation)).resolves.toMatchObject({
+        state: 'settled',
+      });
+      await expect(
+        remote.release(prepareRequest.sessionId, prepareRequest),
+      ).resolves.toBe(true);
+      await expect(client.status(invocation)).rejects.toThrow();
+      expect(
+        fetchImpl.mock.calls.filter(([url]) =>
+          new URL(String(url)).pathname.endsWith('/execute'),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      remote.dispose();
+    }
+  });
+
+  it.each([
+    { method: 'execute', result: {} },
+    { method: 'execute', result: { executionStatus: 'executing' } },
+    { method: 'status', result: { state: 'settled' } },
+    { method: 'cancel', result: { state: 'settled', result: {} } },
+  ] as const)(
+    'rejects a $method response without a physical terminal result: $result',
+    async ({ method, result }) => {
+      const remote = new RemoteManagedRuntimeProvider({
+        baseUrl: 'http://127.0.0.1:4181',
+        token,
+        lease: { leaseId: 'lease', epoch: 1 },
+        fetch: vi.fn(async (input: RequestInfo | URL) =>
+          Response.json(
+            new URL(String(input)).pathname.endsWith('/v1/prepare')
+              ? { protocolVersion: 1, ready: true }
+              : { protocolVersion: 2, result },
+          ),
+        ),
+      });
+      try {
+        const client = await remote.getToolV2Client(prepareRequest);
+        await expect(client[method](invocation)).rejects.toThrow(
+          method === 'execute'
+            ? 'did not confirm physical execution'
+            : 'invalid invocation status',
+        );
+      } finally {
+        remote.dispose();
+      }
+    },
+  );
+
+  it('waits for in-flight preparation before releasing its remote Session and keeps failed acquire cleanup reachable', async () => {
+    let finish!: (value: Response) => void;
+    const ready = new Promise<Response>((resolve) => {
+      finish = resolve;
+    });
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) =>
+      new URL(String(input)).pathname.endsWith('/prepare')
+        ? ready
+        : Response.json({ protocolVersion: 2, released: true }),
+    );
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: 'http://127.0.0.1:4181',
+      token,
+      lease: { leaseId: 'lease', epoch: 1 },
+      fetch: fetchImpl,
+    });
+    try {
+      const acquired = remote.getToolV2Client(prepareRequest);
+      const acquireResult = acquired.catch((error: unknown) => error);
+      const released = remote.release(prepareRequest.sessionId, prepareRequest);
+      await Promise.resolve();
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      finish(new Response('', { status: 500 }));
+      expect(await acquireResult).toBeInstanceOf(Error);
+      await expect(released).resolves.toBe(true);
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+    } finally {
+      remote.dispose();
+    }
+  });
 
   const invocation = {
     sessionId: prepareRequest.sessionId,
@@ -672,7 +1207,7 @@ describe('Managed Runtime providers', () => {
     await expect(ready).resolves.toMatchObject({
       message: 'Managed Runtime Session released.',
     });
-    await expect(release).resolves.toBe(false);
+    await expect(release).resolves.toBe(true);
     expect(runtime.close).not.toHaveBeenCalled();
     expect(runtime.bridge.detachClient).toHaveBeenCalledWith(
       prepareRequest.sessionId,
@@ -772,7 +1307,7 @@ describe('Managed Runtime providers', () => {
     expect(() => local.prepare(prepareRequest)).toThrow('closing');
     await expect(
       local.release(prepareRequest.sessionId, prepareRequest),
-    ).resolves.toBe(false);
+    ).resolves.toBe(true);
     expect(runtime.bridge.detachClient).toHaveBeenCalledTimes(2);
     expect(runtime.close).not.toHaveBeenCalled();
     expect(runtime.bridge.spawnOrAttach).toHaveBeenCalledTimes(1);
@@ -800,7 +1335,7 @@ describe('Managed Runtime providers', () => {
     expect(() => local.prepare(prepareRequest)).toThrow('closing');
     await expect(
       local.release(prepareRequest.sessionId, prepareRequest),
-    ).resolves.toBe(false);
+    ).resolves.toBe(true);
     expect(runtime.bridge.detachClient).toHaveBeenCalledTimes(2);
     expect(runtime.bridge.detachClient).toHaveBeenLastCalledWith(
       prepareRequest.sessionId,

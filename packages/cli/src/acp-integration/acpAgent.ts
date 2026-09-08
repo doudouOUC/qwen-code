@@ -37,6 +37,7 @@ import {
   SessionWriterUnavailableError,
   SESSION_TITLE_MAX_LENGTH,
   Storage,
+  type ManagedToolSessionFactory,
   tokenLimit,
   getMCPDiscoveryState,
   getMCPServerStatus,
@@ -2696,6 +2697,7 @@ async function addRuntimeMcpServer(
 }
 
 export interface AcpAgentOptions {
+  managedToolSessionFactory?: ManagedToolSessionFactory;
   runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
   privateParentCapability?: string;
   externalToolGuardRequired?: boolean;
@@ -2985,6 +2987,7 @@ export async function createAcpAgentHost(
             externalToolGuardProviderAttached,
             workspaceBinding,
             ownedToolRuntime,
+            options.managedToolSessionFactory,
           );
           return agentInstance;
         }, createStream()),
@@ -3934,7 +3937,12 @@ class QwenAgent implements Agent {
       for (const config of configList) {
         if (this.managedToolRuntimes.has(config)) continue;
         try {
-          writerTerminals.push(config.closeSessionWriter({ handoff: true }));
+          writerTerminals.push(
+            (async () => {
+              await config.closeManagedToolSession?.();
+              await config.closeSessionWriter({ handoff: true });
+            })(),
+          );
         } catch (error) {
           writerTerminals.push(Promise.reject(error));
         }
@@ -4847,6 +4855,7 @@ class QwenAgent implements Agent {
     private readonly externalToolGuardProviderAttached = false,
     private readonly workspaceBinding?: AcpWorkspaceBinding,
     private readonly ownedToolRuntime = false,
+    private readonly managedToolSessionFactory?: ManagedToolSessionFactory,
   ) {
     const environment = workspaceBinding?.environment ?? process.env;
     // Pool kill switch via env var so operators can A/B compare or
@@ -13746,9 +13755,11 @@ class QwenAgent implements Agent {
       true,
       this.workspaceBinding ||
         this.managedToolInvocationGuard ||
+        this.managedToolSessionFactory ||
         restoreOptions ||
         provisionalWorkspace
         ? {
+            managedToolSessionFactory: this.managedToolSessionFactory,
             runtimeEnvironment: this.workspaceBinding?.environment,
             workspaceTrusted: this.workspaceBinding?.trusted,
             ...(provisionalWorkspace

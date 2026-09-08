@@ -183,6 +183,11 @@ import type { GoalRecoveryRecord } from '../goals/goal-persistence.js';
 import { createGoalCheckpointVerifier } from '../goals/goal-checkpoint-verifier.js';
 import { createGoalVerifier } from '../goals/goal-verifier.js';
 import type { ToolInvocationGuard } from '../core/tool-invocation-guard.js';
+import {
+  createManagedBuiltinTool,
+  type ManagedToolSession,
+  type ManagedToolSessionFactory,
+} from '../tools/managed-tool-session.js';
 
 // Utils
 import { shouldAttemptBrowserLaunch } from '../utils/browser.js';
@@ -960,6 +965,7 @@ export interface ConfigParameters {
    * before execution. A configured guard fails closed.
    */
   toolInvocationGuard?: ToolInvocationGuard;
+  managedToolSessionFactory?: ManagedToolSessionFactory;
   toolDiscoveryCommand?: string;
   toolCallCommand?: string;
   mcpServerCommand?: string;
@@ -2058,6 +2064,9 @@ export class Config {
   private skillManager: SkillManager | null = null;
   private permissionManager: PermissionManager | null = null;
   private readonly toolInvocationGuard: ToolInvocationGuard | undefined;
+  private readonly managedToolSessionFactory?: ManagedToolSessionFactory;
+  private managedToolSession?: ManagedToolSession;
+  private managedToolSessionClosing = false;
   private modelInvocableCommandsProvider:
     | (() => ReadonlyArray<{ name: string; description: string }>)
     | null = null;
@@ -2488,6 +2497,7 @@ export class Config {
     this.permissionsDeny = params.permissions?.deny || [];
     this.permissionsAutoMode = params.permissions?.autoMode ?? {};
     this.toolInvocationGuard = params.toolInvocationGuard;
+    this.managedToolSessionFactory = params.managedToolSessionFactory;
     this.toolDiscoveryCommand = params.toolDiscoveryCommand;
     this.toolCallCommand = params.toolCallCommand;
     this.mcpServerCommand = params.mcpServerCommand;
@@ -5805,6 +5815,17 @@ export class Config {
     return this.toolRegistry;
   }
 
+  async closeManagedToolSession(): Promise<void> {
+    if (!this.managedToolSessionFactory || isDerivedConfig(this)) return;
+    this.managedToolSessionClosing = true;
+    try {
+      await this.initializationPromise;
+    } catch {
+      // Partial initialization may have acquired a Runtime Session.
+    }
+    await this.managedToolSession?.close();
+  }
+
   /**
    * Shuts down the Config and releases all resources.
    * This method is idempotent and safe to call multiple times.
@@ -5820,6 +5841,8 @@ export class Config {
     if (isDerivedConfig(this)) return;
     this.shutdownRequested = true;
     this.settingsWatcher?.stopWatching();
+    const managed = this.managedToolSessionFactory !== undefined;
+    let resourcesReleased = false;
     const closeWriter = () =>
       this.closeSessionWriter().catch((error) => {
         this.debugLogger.error(
@@ -5828,6 +5851,7 @@ export class Config {
         );
       });
     const earlyWriterClose =
+      !managed &&
       !options?.skipSessionWriter &&
       this.initializationPromise !== undefined &&
       !this.initializationSucceeded
@@ -5845,12 +5869,15 @@ export class Config {
       }
 
       try {
-        await this.shutdownResources(options?.strictResourceCleanup === true);
+        await this.shutdownResources(
+          managed || options?.strictResourceCleanup === true,
+        );
+        resourcesReleased = true;
       } catch (error) {
-        if (options?.strictResourceCleanup) throw error;
+        if (managed || options?.strictResourceCleanup) throw error;
       }
     } finally {
-      if (!options?.skipSessionWriter) {
+      if (!options?.skipSessionWriter && (!managed || resourcesReleased)) {
         await (earlyWriterClose ?? closeWriter());
       }
       this.chatRecordingFailureListeners.clear();
@@ -5914,6 +5941,7 @@ export class Config {
 
   private async shutdownResourcesOnce(): Promise<void> {
     try {
+      await this.closeManagedToolSession();
       this.clearSessionRestoreProjection();
       // Drop this session's project-dir registry entry. It is registered during
       // initialization, so it is released here whenever that step completed —
@@ -9124,6 +9152,30 @@ export class Config {
           error,
         );
         return;
+      }
+
+      if (status !== 'disabled' && this.managedToolSessionFactory) {
+        const session = (this.managedToolSession ??=
+          this.managedToolSessionFactory(this));
+        const managedTool = createManagedBuiltinTool(
+          toolName,
+          this,
+          session,
+          () => {
+            if (this.shutdownRequested || this.managedToolSessionClosing) {
+              return Promise.reject(
+                new Error('Managed tool Session is closing.'),
+              );
+            }
+            if (isDerivedConfig(this)) {
+              return Promise.reject(
+                new Error('Managed child Agent execution scope is not bound.'),
+              );
+            }
+            return session.getClient();
+          },
+        );
+        if (managedTool) factory = async () => managedTool;
       }
 
       if (status === 'deferred') {

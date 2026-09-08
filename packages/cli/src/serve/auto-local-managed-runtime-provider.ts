@@ -9,7 +9,9 @@ import {
   ManagedRuntimeProviderError,
   type ManagedRuntimeProvider,
   type ManagedRuntimeHandle,
+  type ManagedRuntimeReleaseOptions,
 } from './managed-runtime-provider.js';
+import type { ManagedToolV2Client } from '@qwen-code/acp-bridge/bridgeTypes';
 import {
   ManagedRuntimeReleasedError,
   type ManagedRuntimeUse,
@@ -19,18 +21,31 @@ import {
   type ManagedRuntimePrepareRequest,
 } from './managed-runtime-protocol.js';
 import type { LocalProcessRuntimeActivator } from './local-process-runtime-activator.js';
-import type { WorkspaceRegistry } from './workspace-registry.js';
+import type {
+  WorkspaceRegistry,
+  WorkspaceRuntime,
+} from './workspace-registry.js';
 
 interface Binding {
   readonly request: ManagedRuntimePrepareRequest;
   readonly use: ManagedRuntimeUse;
   readonly handle: Promise<ManagedRuntimeHandle>;
+  readonly runtime: WorkspaceRuntime;
+  readonly operations: Map<string, (certain: boolean) => void>;
+  client?: Promise<ManagedToolV2Client>;
+  retiring?: boolean;
+  release?: Promise<boolean>;
+  terminal?: boolean;
   delegate?: RemoteManagedRuntimeProvider;
   unsubscribe?: () => void;
 }
 export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
   private readonly delegates = new Map<string, RemoteManagedRuntimeProvider>();
   private readonly bindings = new Map<string, Binding>();
+  private readonly terminalSessions = new Map<
+    string,
+    { request: ManagedRuntimePrepareRequest; completed: boolean }
+  >();
   private disposed = false;
   constructor(
     private readonly registry: WorkspaceRegistry,
@@ -42,6 +57,15 @@ export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
   ) {}
 
   prepare(request: ManagedRuntimePrepareRequest): ManagedRuntimeHandle {
+    const notificationRequest = request;
+    request = structuredClone(request);
+    if (this.terminalSession(request.sessionId, request)) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_unavailable',
+        'Managed Runtime Session is permanently closed.',
+        false,
+      );
+    }
     const runtime = this.registry.getByWorkspaceId(request.workspaceId);
     if (
       this.disposed ||
@@ -61,6 +85,13 @@ export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
         'Managed Runtime Session identity changed.',
         false,
       );
+    if (previous?.retiring || previous?.client) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_unavailable',
+        'Managed Runtime Session already has an owned binding.',
+        false,
+      );
+    }
     previous?.unsubscribe?.();
     const use = this.activator.activate({
       tenantId: request.tenantId,
@@ -93,14 +124,32 @@ export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
         Math.max(0, endpoint.deadline - Date.now()),
       );
     });
-    const binding: Binding = { request: structuredClone(request), use, handle };
+    const binding: Binding = {
+      request: structuredClone(request),
+      use,
+      handle,
+      runtime,
+      operations: new Map(),
+    };
     this.bindings.set(request.sessionId, binding);
     const onAbort = () => {
       if (this.bindings.get(request.sessionId) !== binding) return;
-      this.bindings.delete(request.sessionId);
+      binding.retiring = true;
+      void use.exited.then(
+        () => {
+          if (
+            !binding.client &&
+            !binding.release &&
+            this.bindings.get(request.sessionId) === binding
+          ) {
+            this.bindings.delete(request.sessionId);
+          }
+        },
+        () => {},
+      );
       if (!this.disposed)
         this.onLost(
-          request,
+          notificationRequest,
           use.signal.reason instanceof ManagedRuntimeReleasedError,
         );
     };
@@ -144,6 +193,101 @@ export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
       },
     };
   }
+
+  async getToolV2Client(
+    request: ManagedRuntimePrepareRequest,
+  ): Promise<ManagedToolV2Client> {
+    let binding = this.bound(request.sessionId, request);
+    if (!binding) {
+      this.prepare(request);
+      binding = this.bindings.get(request.sessionId)!;
+    }
+    const owned = binding;
+    if (!owned.client) {
+      this.assertBinding(owned, false);
+      owned.client = (async () => {
+        await owned.handle;
+        const client = await owned.delegate!.getToolV2Client(owned.request);
+        this.assertBinding(owned, false);
+        const call = async <T>(
+          operation: () => Promise<T>,
+          allowDraining = false,
+        ): Promise<T> => {
+          this.assertBinding(owned, allowDraining);
+          return operation();
+        };
+        const settled = (invocationId: string) => {
+          owned.operations.get(invocationId)?.(true);
+          owned.operations.delete(invocationId);
+        };
+        return {
+          manifest: () => call(() => client.manifest()),
+          beginTurn: (identity) => call(() => client.beginTurn(identity)),
+          prepare: (identity, name, input) =>
+            call(() => client.prepare(identity, name, input)),
+          confirmation: (reference) =>
+            call(() => client.confirmation(reference)),
+          confirm: (reference, outcome, payload, phase) =>
+            call(() => client.confirm(reference, outcome, payload, phase)),
+          preflight: (reference) => call(() => client.preflight(reference)),
+          execute: (reference) =>
+            call(async () => {
+              const invocationId = reference.invocationId;
+              let finish = owned.operations.get(invocationId);
+              if (!finish) {
+                finish = owned.use.beginOperation();
+                owned.operations.set(invocationId, finish);
+              }
+              try {
+                const result = await client.execute(reference);
+                settled(invocationId);
+                return result;
+              } catch (error) {
+                owned.retiring = true;
+                finish(false);
+                throw error;
+              }
+            }),
+          status: (reference, afterSeq) =>
+            call(async () => {
+              const invocationId = reference.invocationId;
+              const status = await client.status(reference, afterSeq);
+              if (status.state === 'settled') settled(invocationId);
+              return status;
+            }, true),
+          cancel: (reference) =>
+            call(async () => {
+              const invocationId = reference.invocationId;
+              const status = await client.cancel(reference);
+              if (status.state === 'settled') settled(invocationId);
+              return status;
+            }, true),
+        } satisfies ManagedToolV2Client;
+      })();
+    }
+    return owned.client;
+  }
+
+  private assertBinding(binding: Binding, allowDraining: boolean): void {
+    const runtime = this.registry.getByWorkspaceId(binding.request.workspaceId);
+    if (
+      this.disposed ||
+      this.bindings.get(binding.request.sessionId) !== binding ||
+      runtime !== binding.runtime ||
+      runtime.workspaceCwd !== binding.request.workspaceCwd ||
+      (!allowDraining &&
+        (!runtime.trusted ||
+          runtime.generationGuard?.closed ||
+          binding.retiring))
+    ) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_unavailable',
+        'Managed Runtime Session binding is unavailable.',
+        false,
+      );
+    }
+    binding.use.signal.throwIfAborted();
+  }
   async cancel(
     sessionId: string,
     executionId: string,
@@ -156,22 +300,87 @@ export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
   async release(
     sessionId: string,
     expected?: ManagedRuntimePrepareRequest,
+    options?: ManagedRuntimeReleaseOptions,
   ): Promise<boolean> {
     const binding = this.bound(sessionId, expected);
-    if (!binding) return false;
-    this.bindings.delete(sessionId);
-    binding.unsubscribe?.();
-    binding.use.release('cancelled');
-    await binding.handle.catch(() => undefined);
-    return binding.delegate?.release(sessionId, binding.request) ?? false;
+    let terminal = this.terminalSession(sessionId, expected);
+    if (options?.terminal || binding?.client) {
+      const request = binding?.request ?? expected;
+      if (!terminal && request) {
+        terminal = { request: structuredClone(request), completed: !binding };
+        this.terminalSessions.set(sessionId, terminal);
+      }
+      if (binding) binding.terminal = true;
+    }
+    if (terminal?.completed) return true;
+    if (!binding) return expected !== undefined;
+    binding.retiring = true;
+    if (binding.release) return binding.release;
+    const release = (async () => {
+      await binding.handle.catch(() => {});
+      if (binding.use.signal.aborted || !binding.delegate) {
+        await binding.use.exited;
+      } else {
+        try {
+          let sentTerminal: boolean;
+          do {
+            sentTerminal = binding.terminal === true;
+            if (
+              !(await binding.delegate.release(sessionId, binding.request, {
+                terminal: sentTerminal,
+              }))
+            ) {
+              throw new Error(
+                'Managed Runtime did not confirm Session release.',
+              );
+            }
+          } while (binding.terminal && !sentTerminal);
+        } catch (error) {
+          if (!binding.use.signal.aborted) throw error;
+          await binding.use.exited;
+        }
+      }
+      for (const finish of binding.operations.values()) finish(true);
+      binding.operations.clear();
+      binding.use.release('cancelled');
+      binding.unsubscribe?.();
+      const completed = this.terminalSessions.get(sessionId);
+      if (completed) completed.completed = true;
+      if (this.bindings.get(sessionId) === binding)
+        this.bindings.delete(sessionId);
+      return true;
+    })().finally(() => {
+      binding.release = undefined;
+    });
+    binding.release = release;
+    return release;
   }
   async dispose(): Promise<void> {
     this.disposed = true;
     const closing = this.activator.close();
     for (const delegate of this.delegates.values()) delegate.dispose();
-    this.bindings.clear();
     await closing;
+    this.bindings.clear();
     this.delegates.clear();
+    this.terminalSessions.clear();
+  }
+  private terminalSession(
+    sessionId: string,
+    expected?: ManagedRuntimePrepareRequest,
+  ) {
+    const terminal = this.terminalSessions.get(sessionId);
+    if (
+      expected &&
+      (expected.sessionId !== sessionId ||
+        (terminal && !sameManagedRuntimeIdentity(terminal.request, expected)))
+    ) {
+      throw new ManagedRuntimeProviderError(
+        'managed_runtime_identity_conflict',
+        'Managed Runtime Session identity changed.',
+        false,
+      );
+    }
+    return terminal;
   }
   private bound(
     sessionId: string,

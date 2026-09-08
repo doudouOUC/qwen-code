@@ -14,8 +14,12 @@ import type {
   ToolResult,
   ToolResultDisplay,
 } from './tools.js';
-import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
-import { ToolNames, ToolDisplayNames } from './tool-names.js';
+import { BaseDeclarativeTool, BaseToolInvocation } from './tools.js';
+import { ToolNames } from './tool-names.js';
+import {
+  getReadFileToolDefinition,
+  projectReadFileToolClassifierInput,
+} from './builtin-tool-definitions.js';
 
 import type { PartListUnion } from '@google/genai';
 import type { PermissionDecision } from '../permissions/types.js';
@@ -537,37 +541,20 @@ export class ReadFileTool extends BaseDeclarativeTool<
   }
 
   constructor(private config: Config) {
+    const definition = getReadFileToolDefinition();
     super(
-      ReadFileTool.Name,
-      ToolDisplayNames.READ_FILE,
-      `Reads and returns the content of a specified file. The file_path argument MUST be an absolute path. Always construct it by combining the project root with the file's relative path (e.g. project root '/path/to/project/' + relative 'foo/bar.txt' = '/path/to/project/foo/bar.txt'). If the user provides a relative path, resolve it against the project root first. If the file is large, the content will be truncated. The tool's response will clearly indicate if truncation has occurred and will provide details on how to read more of the file using the 'offset' and 'limit' parameters. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), PDF files, and Jupyter notebooks (.ipynb). For text files, it can read specific line ranges. For PDF files, use the 'pages' parameter to extract specific page ranges as text (e.g. '1-5'). Max ${PDF_MAX_PAGES_PER_READ} pages per request. Large PDFs cannot be read all at once when the model does not support native PDF input; retry with narrower page ranges if the tool reports a PDF is too large. With a configured vision bridge, failed PDF text extraction or an irreducibly large single page may be transcribed automatically, at most four pages per call; this transcription is lossy and marked as untrusted. This tool can read Jupyter notebooks (.ipynb) and returns structured cell content with outputs.`,
-      Kind.Read,
-      {
-        properties: {
-          file_path: {
-            description:
-              "The absolute path to the file to read (e.g., '/home/user/project/file.txt'). Relative paths are not supported. You must provide an absolute path.",
-            type: 'string',
-          },
-          offset: {
-            description:
-              "Optional: For text files, the 0-based line number to start reading from. Requires 'limit' to be set. Use for paginating through large files.",
-            type: 'integer',
-          },
-          limit: {
-            description:
-              "Optional: For text files, maximum number of lines to read. Use with 'offset' to paginate through large files. If omitted, reads the entire file (if feasible, up to a default limit).",
-            type: 'integer',
-          },
-          pages: {
-            description: `Optional: For PDF files, the page range to extract as text (e.g., '1-5', '3', '10-20'). Pages are 1-indexed. Max ${PDF_MAX_PAGES_PER_READ} pages per request. Open-ended ranges like '3-' are not supported. Use this for large PDFs or when the model does not support native PDF input.`,
-            type: 'string',
-          },
-        },
-        required: ['file_path'],
-        type: 'object',
-      },
+      definition.name,
+      definition.displayName,
+      definition.description,
+      definition.kind,
+      definition.schema.parametersJsonSchema,
+      definition.isOutputMarkdown,
+      definition.canUpdateOutput,
     );
+  }
+
+  override toAutoClassifierInput(_params: ReadFileToolParams): string {
+    return projectReadFileToolClassifierInput();
   }
 
   protected override validateToolParamValues(
