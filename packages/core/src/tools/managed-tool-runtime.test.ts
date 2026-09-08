@@ -18,7 +18,12 @@ import {
   type ToolResult,
   type ToolResultDisplay,
 } from './tools.js';
-import { ManagedToolRuntime } from './managed-tool-runtime.js';
+import {
+  ManagedToolRuntime,
+  createBuiltinManagedToolRuntime,
+  type ManagedToolExecutionResult,
+  type ManagedToolRuntimeFileHistory,
+} from './managed-tool-runtime.js';
 import type {
   ManagedToolCallIdentity,
   ManagedToolInvocationReference,
@@ -127,6 +132,7 @@ describe('ManagedToolRuntime', () => {
   let revision: string;
   let identity: ManagedToolCallIdentity;
   let events: string[];
+  let config: Config;
 
   beforeEach(() => {
     vi.resetAllMocks();
@@ -143,7 +149,7 @@ describe('ManagedToolRuntime', () => {
     snapshot = vi.fn(async () => {
       events.push('snapshot');
     });
-    const config = {
+    config = {
       getSessionId: () => sessionId,
       getDisableAllHooks: () => false,
       getMessageBus: () => undefined,
@@ -178,6 +184,166 @@ describe('ManagedToolRuntime', () => {
     await runtime.beginTurn(call);
     return reference(await runtime.prepare(call, tool.name, args));
   }
+
+  function useSharedHistory(history: ManagedToolRuntimeFileHistory) {
+    runtime = new ManagedToolRuntime(
+      config,
+      () => [tool],
+      () => revision,
+      history,
+    );
+  }
+
+  it('waits for the shared parent history without creating child snapshots', async () => {
+    const ready = deferred<void>();
+    const prepareTurn = vi.fn(() => ready.promise);
+    useSharedHistory({ prepareTurn, execute: (operation) => operation() });
+    const beginning = runtime.beginTurn(identity);
+    const preparing = runtime.prepare(identity, tool.name, input);
+    await Promise.resolve();
+    expect(prepareTurn).toHaveBeenCalledExactlyOnceWith(identity);
+    expect(tool.invocations).toHaveLength(0);
+    expect(snapshot).not.toHaveBeenCalled();
+    ready.resolve();
+    await beginning;
+    const ref = reference(await preparing);
+    await runtime.preflight(ref);
+    await runtime.execute(ref);
+    await runtime.beginTurn({ ...identity, promptId: 'child-prompt-2' });
+    expect(prepareTurn).toHaveBeenCalledTimes(2);
+    expect(snapshot).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancel', 'policy', 'session'] as const)(
+    'settles queued %s invalidation without physically executing the tool',
+    async (change) => {
+      const gate = deferred<void>();
+      const execute = vi.fn(
+        async (operation: () => Promise<ManagedToolExecutionResult>) => {
+          await gate.promise;
+          return operation();
+        },
+      );
+      useSharedHistory({ prepareTurn: async () => {}, execute });
+      const ref = await prepare();
+      await runtime.preflight(ref);
+      const pending = runtime.execute(ref);
+      expect(tool.invocations[0].execute).not.toHaveBeenCalled();
+      if (change === 'cancel') runtime.cancel(ref);
+      if (change === 'policy') revision = 'replaced-policy';
+      if (change === 'session') {
+        vi.spyOn(config, 'getSessionId').mockReturnValue(
+          '4f17902c-bb4c-4ae8-bb5e-a3f25753a6ab',
+        );
+      }
+      expect(runtime.status(ref).state).not.toBe('settled');
+      gate.resolve();
+      expect(await pending).toMatchObject({
+        executionStatus: 'not_started',
+        error: { message: expect.any(String) },
+      });
+      expect(runtime.status(ref)).toMatchObject({
+        state: 'settled',
+        result: { executionStatus: 'not_started' },
+      });
+      expect(tool.invocations[0].execute).not.toHaveBeenCalled();
+      expect(hooks.post).not.toHaveBeenCalled();
+      expect(hooks.failure).not.toHaveBeenCalled();
+    },
+  );
+
+  it('waits for queued execution cancellation before Runtime disposal finishes', async () => {
+    const gate = deferred<void>();
+    useSharedHistory({
+      prepareTurn: async () => {},
+      execute: async (operation) => {
+        await gate.promise;
+        return operation();
+      },
+    });
+    const ref = await prepare();
+    await runtime.preflight(ref);
+    const pending = runtime.execute(ref);
+    let disposed = false;
+    const disposal = runtime.dispose().then(() => {
+      disposed = true;
+    });
+    await Promise.resolve();
+    expect(disposed).toBe(false);
+    gate.resolve();
+    expect((await pending).executionStatus).toBe('not_started');
+    await disposal;
+    expect(disposed).toBe(true);
+    expect(tool.invocations[0].execute).not.toHaveBeenCalled();
+  });
+
+  it('binds admitted builtins once to the child tool Config and forwards shared history', async () => {
+    const { ReadFileTool } = await import('./read-file.js');
+    const parentRead = new ReadFileTool(config);
+    const parentBuild = vi.spyOn(parentRead, 'build');
+    const getTool = vi.fn((name: string) =>
+      name === ReadFileTool.Name ? parentRead : tool,
+    );
+    config.getToolRegistry = () =>
+      ({ getTool }) as unknown as ReturnType<Config['getToolRegistry']>;
+    const childConfig = Object.assign(Object.create(config) as Config, {
+      getTargetDir: () => '/managed-child',
+      getFileService: () => ({ shouldQwenIgnoreFile: () => false }),
+      getWorkspaceContext: () => ({ isPathWithinWorkspace: () => true }),
+      getPlansDir: () => '/managed-child/plans',
+      storage: {
+        getProjectTempDir: () => '/managed-child/tmp',
+        getProjectDir: () => '/managed-child',
+        getUserSkillsDirs: () => [],
+      },
+    });
+    const prepareTurn = vi.fn(async () => {});
+    const build = vi.spyOn(ReadFileTool.prototype, 'build');
+    try {
+      runtime = await createBuiltinManagedToolRuntime(
+        config,
+        {
+          prepareTurn,
+          execute: (operation) => operation(),
+        },
+        childConfig,
+      );
+      const manifest = runtime.manifest();
+      expect(manifest.tools.map(({ name }) => name)).toEqual([
+        ReadFileTool.Name,
+      ]);
+      expect(runtime.manifest()).toEqual(manifest);
+      const call = {
+        ...identity,
+        policyRevision: manifest.policyRevision,
+        capabilityDigest: manifest.capabilityDigest,
+      };
+      await runtime.beginTurn(call);
+      const first = await runtime.prepare(call, ReadFileTool.Name, {
+        file_path: '/managed-child/a.txt',
+      });
+      await runtime.prepare({ ...call, callId: 'call-2' }, ReadFileTool.Name, {
+        file_path: '/managed-child/b.txt',
+      });
+      expect(first.description).toBe('a.txt');
+      expect(first.defaultPermission).toBe('allow');
+      expect(first.sessionId).toBe(sessionId);
+      expect(prepareTurn).toHaveBeenCalledExactlyOnceWith(call);
+      expect(snapshot).not.toHaveBeenCalled();
+      expect(parentBuild).not.toHaveBeenCalled();
+      expect(build).toHaveBeenCalledTimes(2);
+      expect(build.mock.instances[0]).toBe(build.mock.instances[1]);
+      expect(build.mock.instances[0]).not.toBe(parentRead);
+      getTool.mockReturnValue(tool);
+      expect(runtime.manifest().tools).toEqual([]);
+      await expect(runtime.preflight(reference(first))).rejects.toThrow(
+        'capability changed',
+      );
+    } finally {
+      build.mockRestore();
+      parentBuild.mockRestore();
+    }
+  });
 
   it('prepares once without execution and checkpoints at the explicit turn boundary', async () => {
     await runtime.beginTurn(identity);

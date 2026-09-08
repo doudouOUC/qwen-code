@@ -571,8 +571,39 @@ it.each([false, true])(
       'X-Qwen-Managed-Lease-Id': 'test-lease',
       'X-Qwen-Managed-Lease-Epoch': '1',
     };
+    const trackedFileBackups = Object.fromEntries(
+      Array.from({ length: 100 }, (_, i) => [
+        `${'directory/'.repeat(5)}file-${i}.txt`,
+        {
+          backupFileName: '0123456789abcdef@v1',
+          version: 1,
+          backupTime: '2026-09-09T00:00:00.000Z',
+        },
+      ]),
+    );
+    const snapshots = owned
+      ? Array.from({ length: 100 }, (_, i) => ({
+          promptId: `turn-${i}`,
+          timestamp: '2026-09-09T00:00:00.000Z',
+          trackedFileBackups,
+        }))
+      : [];
+    const historyState = {
+      ownerSessionId: body.sessionId,
+      revision: 0,
+      snapshots,
+    };
+    if (owned)
+      expect(Buffer.byteLength(JSON.stringify(historyState))).toBeGreaterThan(
+        1024 * 1024,
+      );
+    const fileHistory = {
+      bind: vi.fn().mockResolvedValue(historyState),
+      checkpoint: vi.fn().mockResolvedValue(historyState),
+      snapshot: vi.fn().mockResolvedValue(historyState),
+    };
     const provider: ManagedRuntimeProvider = {
-      getToolV2Client: vi.fn(),
+      getToolV2Client: vi.fn().mockResolvedValue({ fileHistory }),
       prepare: vi.fn(() => ({
         ready: Promise.resolve(),
         finish: vi.fn(),
@@ -639,6 +670,66 @@ it.each([false, true])(
         ready: true,
       });
       expect(provider.prepare).toHaveBeenCalledWith(body);
+      const binding = {
+        ownerSessionId: body.sessionId,
+        ownerRuntimeSessionId: body.sessionId,
+        executionCwd: workspace,
+        snapshots,
+      };
+      for (const [operation, params] of [
+        ['bind-history', { binding }],
+        ['checkpoint', { promptId: 'parent-turn' }],
+        ['history', {}],
+      ] as const) {
+        const url = `${handle.url}/internal/managed-runtime/v2/${operation}`;
+        const requestBody = JSON.stringify({
+          ...body,
+          protocolVersion: 2,
+          ...params,
+        });
+        const result = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: requestBody,
+        });
+        expect(result.status).toBe(owned ? 200 : 404);
+        if (owned) {
+          await expect(result.json()).resolves.toEqual({
+            protocolVersion: 2,
+            result: historyState,
+          });
+          const unauthorized = await fetch(url, {
+            method: 'POST',
+            headers: { ...headers, authorization: '' },
+            body: requestBody,
+          });
+          expect(unauthorized.status).toBe(401);
+          const conflict = await fetch(url, {
+            method: 'POST',
+            headers: { ...headers, 'X-Qwen-Managed-Lease-Id': 'other' },
+            body: requestBody,
+          });
+          expect(conflict.status).toBe(409);
+          const foreign = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              ...body,
+              protocolVersion: 2,
+              ...params,
+              tenantId: 'foreign',
+            }),
+          });
+          expect(foreign.status).toBe(409);
+        }
+      }
+      if (owned) {
+        expect(fileHistory.bind).toHaveBeenCalledExactlyOnceWith(binding);
+        expect(fileHistory.checkpoint).toHaveBeenCalledExactlyOnceWith(
+          'parent-turn',
+        );
+        expect(fileHistory.snapshot).toHaveBeenCalledExactlyOnceWith();
+      } else expect(provider.getToolV2Client).not.toHaveBeenCalled();
       const releaseUrl = `${handle.url}/internal/managed-runtime/v2/release`;
       const releaseBody = JSON.stringify({ ...body, protocolVersion: 2 });
       const released = await fetch(releaseUrl, {

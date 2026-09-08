@@ -2886,6 +2886,18 @@ export class ChatRecordingService {
     }
   }
 
+  async recordFileHistorySnapshotBatchStrict(
+    snapshots: FileHistorySnapshot[],
+  ): Promise<void> {
+    const record: ChatRecord = {
+      ...this.createBaseRecord('system'),
+      type: 'system',
+      subtype: 'file_history_snapshot',
+      systemPayload: { snapshots: snapshots.map(serializeSnapshot) },
+    };
+    await this.appendRecordStrict(record);
+  }
+
   async recordUserTextElements(
     payload: UserTextElementsRecordPayload,
   ): Promise<void> {

@@ -137,6 +137,9 @@ export function registerManagedRuntimeWorkerRoutes(
       },
     );
     const operations = {
+      'bind-history': SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BindHistory,
+      checkpoint: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Checkpoint,
+      history: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2History,
       manifest: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Manifest,
       'begin-turn': SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BeginTurn,
       prepare: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Prepare,

@@ -7,10 +7,14 @@
 import {
   createBuiltinManagedToolRuntime,
   ManagedToolProtocolError,
+  MANAGED_TOOL_FILE_HISTORY_MAX_BYTES,
   ToolConfirmationOutcome,
   ToolNames,
   managedToolDigest,
   parseManagedToolCallIdentity,
+  parseManagedToolFileHistoryBinding,
+  parseManagedToolFileHistoryPromptId,
+  parseManagedToolFileHistoryState,
   parseManagedToolInvocationReference,
   parseManagedToolConfirmationPayload,
   type ManagedToolRuntime,
@@ -21,6 +25,9 @@ import { parseCallerSuppliedSessionId } from '../config/session-id.js';
 
 const METHODS = SERVE_CONTROL_EXT_METHODS;
 const methodKeys = new Map<string, readonly string[]>([
+  [METHODS.sessionManagedToolV2BindHistory, ['sessionId', 'binding']],
+  [METHODS.sessionManagedToolV2Checkpoint, ['sessionId', 'promptId']],
+  [METHODS.sessionManagedToolV2History, ['sessionId']],
   [METHODS.sessionManagedToolV2Manifest, ['sessionId']],
   [METHODS.sessionManagedToolV2BeginTurn, ['sessionId', 'identity']],
   [
@@ -45,7 +52,8 @@ export function isManagedToolRuntimeMethod(method: string): boolean {
 export function isManagedToolRuntimeDrainMethod(method: string): boolean {
   return (
     method === METHODS.sessionManagedToolV2Status ||
-    method === METHODS.sessionManagedToolV2Cancel
+    method === METHODS.sessionManagedToolV2Cancel ||
+    method === METHODS.sessionManagedToolV2History
   );
 }
 
@@ -53,7 +61,12 @@ export function parseManagedToolRuntimeSessionId(
   method: string,
   params: Record<string, unknown>,
 ): string {
-  managedToolDigest(params, 1024 * 1024);
+  managedToolDigest(
+    params,
+    method === METHODS.sessionManagedToolV2BindHistory
+      ? MANAGED_TOOL_FILE_HISTORY_MAX_BYTES
+      : 1024 * 1024,
+  );
   const keys = methodKeys.get(method);
   if (!keys || Object.keys(params).some((key) => !keys.includes(key))) {
     throw new ManagedToolProtocolError();
@@ -72,6 +85,28 @@ export async function dispatchManagedToolRuntimeRequest(
   params: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const sessionId = parseManagedToolRuntimeSessionId(method, params);
+  if (
+    method === METHODS.sessionManagedToolV2BindHistory ||
+    method === METHODS.sessionManagedToolV2Checkpoint ||
+    method === METHODS.sessionManagedToolV2History
+  ) {
+    if (!('fileHistory' in runtime) || !runtime.fileHistory)
+      throw new ManagedToolProtocolError(
+        'Managed file history is unavailable.',
+      );
+    const history = runtime.fileHistory;
+    const state =
+      method === METHODS.sessionManagedToolV2BindHistory
+        ? await history.bind(
+            parseManagedToolFileHistoryBinding(params['binding']),
+          )
+        : method === METHODS.sessionManagedToolV2Checkpoint
+          ? await history.checkpoint(
+              parseManagedToolFileHistoryPromptId(params['promptId']),
+            )
+          : await history.snapshot();
+    return { ...parseManagedToolFileHistoryState(state) };
+  }
   if (method === METHODS.sessionManagedToolV2Manifest)
     return { ...(await runtime.manifest()) };
   if (

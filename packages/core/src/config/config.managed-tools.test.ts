@@ -37,6 +37,8 @@ describe('Config managed tool registration', () => {
   let config: Config;
   const getClient = vi.fn<ManagedToolSession['getClient']>();
   const close = vi.fn<ManagedToolSession['close']>();
+  const childSessions: ManagedToolSession[] = [];
+  let rootSession: ManagedToolSession;
   const status = vi.fn<PermissionManager['getToolRegistrationStatus']>();
 
   beforeEach(async () => {
@@ -48,6 +50,32 @@ describe('Config managed tool registration', () => {
     getClient.mockReset().mockRejectedValue(new Error('Runtime not ready'));
     close.mockReset().mockResolvedValue(undefined);
     localConstruct.mockClear();
+    childSessions.length = 0;
+    const makeChild = (): ManagedToolSession => {
+      const session: ManagedToolSession = {
+        ...rootSession,
+        sessionId: randomUUID(),
+        getClient: vi
+          .fn()
+          .mockRejectedValue(new Error('Child Runtime not ready')),
+        close: vi.fn().mockResolvedValue(undefined),
+        createChild: makeChild,
+      };
+      childSessions.push(session);
+      return session;
+    };
+    rootSession = {
+      sessionId: randomUUID(),
+      getClient,
+      close,
+      createChild: makeChild,
+      shellConfiguration: {
+        shell: 'bash',
+        executable: 'bash',
+        argsPrefix: ['-c'],
+      },
+      platform: 'darwin',
+    };
     status
       .mockReset()
       .mockImplementation(async (name) =>
@@ -63,17 +91,7 @@ describe('Config managed tool registration', () => {
       telemetry: { enabled: false },
       usageStatisticsEnabled: false,
       useRipgrep: false,
-      managedToolSessionFactory: () => ({
-        sessionId: randomUUID(),
-        getClient,
-        close,
-        shellConfiguration: {
-          shell: 'bash',
-          executable: 'bash',
-          argsPrefix: ['-c'],
-        },
-        platform: 'darwin',
-      }),
+      managedToolSessionFactory: () => rootSession,
     });
     vi.spyOn(config, 'getPermissionManager').mockReturnValue({
       getToolRegistrationStatus: status,
@@ -170,8 +188,9 @@ describe('Config managed tool registration', () => {
     await registry.stop();
   });
 
-  it('does not let an unbound child execute through its parent Runtime Session', async () => {
-    const child = deriveConfig(config);
+  it('gives a spawned child its own binding while overlays inherit that binding', async () => {
+    const scope = config.createManagedChildExecutionScope();
+    const child = deriveConfig(scope.config);
     const registry = await child.createToolRegistry(undefined, {
       skipDiscovery: true,
       forSubAgent: true,
@@ -185,9 +204,91 @@ describe('Config managed tool registration', () => {
         callId: 'child-call',
         promptId: 'child-turn',
       }),
-    ).rejects.toThrow('scope is not bound');
+    ).rejects.toThrow('Child Runtime not ready');
+    expect(childSessions[0].getClient).toHaveBeenCalledOnce();
+    await scope.close();
+    expect(childSessions[0].close).toHaveBeenCalledOnce();
     expect(getClient).not.toHaveBeenCalled();
     expect(localConstruct).not.toHaveBeenCalled();
     await registry.stop();
+  });
+
+  it('seals nested children, waits raw execution, and closes writers after Runtime', async () => {
+    const events: string[] = [];
+    const child = config.createManagedChildExecutionScope();
+    const grandchild = child.config.createManagedChildExecutionScope();
+    const running = child.run(() =>
+      grandchild.run(
+        () =>
+          new Promise<void>((resolve) => {
+            grandchild.signal!.addEventListener('abort', () => {
+              events.push('aborted');
+              resolve();
+            });
+          }),
+      ),
+    );
+    vi.mocked(childSessions[0].close).mockImplementation(async () => {
+      events.push('runtime');
+    });
+    child.onClose(async () => {
+      events.push('writer');
+    });
+    await config.closeManagedToolSession();
+    await running;
+    expect(events).toEqual(['aborted', 'runtime', 'writer']);
+    expect(child.signal!.aborted).toBe(true);
+    expect(() => config.createManagedChildExecutionScope()).toThrow('closing');
+    await expect(
+      child.run(async () => {
+        throw new Error('started');
+      }),
+    ).rejects.toThrow('closing');
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('retains failed child cleanup and parent ownership for a later close', async () => {
+    const child = config.createManagedChildExecutionScope();
+    const writer = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('writer busy'))
+      .mockResolvedValue(undefined);
+    child.onClose(writer);
+    await expect(config.closeManagedToolSession()).rejects.toThrow(
+      'cleanup failed',
+    );
+    expect(close).not.toHaveBeenCalled();
+    expect(childSessions[0].close).toHaveBeenCalledOnce();
+    await config.closeManagedToolSession();
+    expect(writer).toHaveBeenCalledTimes(2);
+    expect(childSessions[0].close).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('delegates a managed parent checkpoint without local snapshot work', async () => {
+    const checkpoint = vi.fn().mockResolvedValue(undefined);
+    rootSession.beginFileHistoryTurn = checkpoint;
+    const local = vi.spyOn(config.getFileHistoryService(), 'makeSnapshot');
+    await config.makeFileHistorySnapshot('parent-turn');
+    expect(checkpoint).toHaveBeenCalledWith('parent-turn');
+    expect(local).not.toHaveBeenCalled();
+  });
+
+  it('records the actual local snapshot when no managed history control is supplied', async () => {
+    config.enableFileCheckpointing();
+    const record = vi.fn();
+    vi.spyOn(config, 'getChatRecordingService').mockReturnValue({
+      recordFileHistorySnapshot: record,
+    } as unknown as ReturnType<Config['getChatRecordingService']>);
+    await config.makeFileHistorySnapshot('local-turn');
+    expect(
+      config
+        .getFileHistoryService()
+        .getSnapshots()
+        .map((snapshot) => snapshot.promptId),
+    ).toEqual(['local-turn']);
+    expect(record).toHaveBeenCalledWith(
+      config.getFileHistoryService().getSnapshots()[0],
+    );
   });
 });

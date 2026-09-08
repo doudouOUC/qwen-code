@@ -172,6 +172,12 @@ export const SERVE_CONTROL_EXT_METHODS = {
     'qwen/control/session/managed-runtime-tools/execute',
   sessionManagedRuntimeToolCancel:
     'qwen/control/session/managed-runtime-tools/cancel',
+  sessionManagedToolV2BindHistory:
+    'qwen/control/session/managed-runtime-tools/v2/bind-history',
+  sessionManagedToolV2Checkpoint:
+    'qwen/control/session/managed-runtime-tools/v2/checkpoint',
+  sessionManagedToolV2History:
+    'qwen/control/session/managed-runtime-tools/v2/history',
   sessionManagedToolV2Manifest:
     'qwen/control/session/managed-runtime-tools/v2/manifest',
   sessionManagedToolV2BeginTurn:

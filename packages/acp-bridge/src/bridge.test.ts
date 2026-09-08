@@ -174,9 +174,23 @@ describe('managed runtime tool bridge', () => {
   it('binds every v2 operation to the issued Runtime client and live Session instance', async () => {
     const calls: Array<{ method: string; params: Record<string, unknown> }> =
       [];
+    const runtimeSessionId = '550e8400-e29b-41d4-a716-446655440109';
     const handle = makeChannel({
+      newSessionImpl: () => ({ sessionId: runtimeSessionId }),
       extMethodImpl: async (method, params) => {
         calls.push({ method, params });
+        if (
+          [
+            SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BindHistory,
+            SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Checkpoint,
+            SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2History,
+          ].some((candidate) => candidate === method)
+        )
+          return {
+            ownerSessionId: '550e8400-e29b-41d4-a716-446655440108',
+            revision: 0,
+            snapshots: [],
+          };
         return {};
       },
     });
@@ -185,7 +199,7 @@ describe('managed runtime tool bridge', () => {
       const session = await bridge.spawnOrAttach({
         workspaceCwd: WS_A,
         sourceType: 'managed-gateway',
-        sourceId: SESS_A,
+        sourceId: runtimeSessionId,
       });
       expect(() =>
         bridge.getManagedToolV2Client(session.sessionId, {}),
@@ -195,9 +209,8 @@ describe('managed runtime tool bridge', () => {
           clientId: 'foreign',
         }),
       ).toThrow(InvalidClientIdError);
-      const client = bridge.getManagedToolV2Client(session.sessionId, {
-        clientId: session.clientId,
-      });
+      const context = { clientId: session.clientId };
+      const client = bridge.getManagedToolV2Client(session.sessionId, context);
       const identity = {
         sessionId: session.sessionId,
         promptId: 'prompt-1',
@@ -210,6 +223,27 @@ describe('managed runtime tool bridge', () => {
         invocationId: 'invocation-1',
         argsDigest: 'b'.repeat(64),
       };
+      const binding = {
+        ownerSessionId: '550e8400-e29b-41d4-a716-446655440108',
+        ownerRuntimeSessionId: session.sessionId,
+        executionCwd: WS_A,
+        snapshots: [],
+      };
+      await client.fileHistory!.bind(binding);
+      await client.fileHistory!.checkpoint('parent-turn');
+      await client.fileHistory!.snapshot();
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BindHistory,
+        params: { sessionId: session.sessionId, binding },
+      });
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Checkpoint,
+        params: { sessionId: session.sessionId, promptId: 'parent-turn' },
+      });
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2History,
+        params: { sessionId: session.sessionId },
+      });
       await client.manifest();
       await client.beginTurn(identity);
       await client.prepare(identity, 'write_file', {
@@ -229,10 +263,32 @@ describe('managed runtime tool bridge', () => {
         params: { sessionId: session.sessionId, reference, afterSeq: 4 },
       });
       expect(handle.agent.promptCalls).toHaveLength(0);
+      const authorizedCalls = calls.length;
+      context.clientId = 'foreign';
+      await expect(client.fileHistory!.bind(binding)).rejects.toThrow(
+        InvalidClientIdError,
+      );
+      await expect(
+        client.fileHistory!.checkpoint('parent-turn'),
+      ).rejects.toThrow(InvalidClientIdError);
+      await expect(client.fileHistory!.snapshot()).rejects.toThrow(
+        InvalidClientIdError,
+      );
+      expect(calls).toHaveLength(authorizedCalls);
+      context.clientId = session.clientId;
       await bridge.closeSession(session.sessionId, {
         clientId: session.clientId,
       });
       expect(() => client.execute(reference)).toThrow(SessionNotFoundError);
+      await expect(client.fileHistory!.snapshot()).rejects.toThrow(
+        SessionNotFoundError,
+      );
+      await expect(client.fileHistory!.checkpoint('late')).rejects.toThrow(
+        SessionNotFoundError,
+      );
+      await expect(client.fileHistory!.bind(binding)).rejects.toThrow(
+        SessionNotFoundError,
+      );
     } finally {
       await bridge.shutdown();
     }

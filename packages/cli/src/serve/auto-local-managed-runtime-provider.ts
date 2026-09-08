@@ -220,7 +220,16 @@ export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
           owned.operations.get(invocationId)?.(true);
           owned.operations.delete(invocationId);
         };
+        const history = client.fileHistory;
         return {
+          fileHistory: history
+            ? {
+                bind: (binding) => call(() => history.bind(binding)),
+                checkpoint: (promptId) =>
+                  call(() => history.checkpoint(promptId)),
+                snapshot: () => call(() => history.snapshot(), true),
+              }
+            : undefined,
           manifest: () => call(() => client.manifest()),
           beginTurn: (identity) => call(() => client.beginTurn(identity)),
           prepare: (identity, name, input) =>

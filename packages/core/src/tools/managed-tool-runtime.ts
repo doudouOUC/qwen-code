@@ -36,6 +36,8 @@ import {
   type ManagedToolDescriptor,
 } from './managed-tool-protocol.js';
 
+import type { ManagedToolFileHistoryClient } from './managed-tool-file-history-protocol.js';
+
 export type ManagedToolConfirmationPhase = 'permission' | 'preflight';
 
 export type ManagedToolV2Client = {
@@ -51,7 +53,7 @@ export type ManagedToolV2Client = {
     | 'cancel']: (
     ...args: Parameters<ManagedToolRuntime[K]>
   ) => Promise<Awaited<ReturnType<ManagedToolRuntime[K]>>>;
-};
+} & { fileHistory?: ManagedToolFileHistoryClient };
 
 export interface ManagedToolExecutionResult {
   executionStatus: 'not_started' | 'success' | 'error' | 'cancelled';
@@ -59,6 +61,13 @@ export interface ManagedToolExecutionResult {
   error?: { message: string; type?: ToolErrorType };
   postHook?: PostToolUseHookResult;
   failureHook?: PostToolUseFailureHookResult;
+}
+
+export interface ManagedToolRuntimeFileHistory {
+  prepareTurn(identity: ManagedToolCallIdentity): Promise<void>;
+  execute(
+    operation: () => Promise<ManagedToolExecutionResult>,
+  ): Promise<ManagedToolExecutionResult>;
 }
 
 export interface ManagedToolProgress {
@@ -127,6 +136,7 @@ export class ManagedToolRuntime {
     private readonly config: Config,
     private readonly tools: () => AnyDeclarativeTool[],
     private readonly policyRevision: () => string,
+    private readonly sharedFileHistory?: ManagedToolRuntimeFileHistory,
   ) {}
 
   manifest(): {
@@ -223,9 +233,13 @@ export class ManagedToolRuntime {
     this.startedPrompts.add(identity.promptId);
     const snapshot = this.scoped(identity, async () => {
       try {
-        await this.config
-          .getFileHistoryService()
-          .makeSnapshot(identity.promptId);
+        if (this.sharedFileHistory) {
+          await this.sharedFileHistory.prepareTurn(identity);
+        } else {
+          await this.config
+            .getFileHistoryService()
+            .makeSnapshot(identity.promptId);
+        }
         this.assertCurrent(identity);
       } finally {
         this.snapshotPending = false;
@@ -487,7 +501,11 @@ export class ManagedToolRuntime {
     if ([...entry.decisions.values()].some((decision) => !decision.settled)) {
       throw new Error('Managed tool confirmation is still pending.');
     }
-    entry.execution = this.scoped(reference, () => this.run(entry));
+    entry.execution = this.scoped(reference, () =>
+      this.sharedFileHistory
+        ? this.sharedFileHistory.execute(() => this.run(entry))
+        : this.run(entry),
+    );
     void entry.execution.catch(() => {});
     return entry.execution.then((result) => structuredClone(result));
   }
@@ -514,7 +532,11 @@ export class ManagedToolRuntime {
       ? undefined
       : this.config.getMessageBus();
     let result: ManagedToolExecutionResult;
+    let executionStarted = false;
     try {
+      signal.throwIfAborted();
+      this.assertCurrent(entry.reference);
+      executionStarted = true;
       const raw = await entry.invocation.execute(
         signal,
         (output) => this.progress(entry, output),
@@ -549,7 +571,11 @@ export class ManagedToolRuntime {
       }
     } catch (error) {
       result = {
-        executionStatus: signal.aborted ? 'cancelled' : 'error',
+        executionStatus: !executionStarted
+          ? 'not_started'
+          : signal.aborted
+            ? 'cancelled'
+            : 'error',
         error: {
           message: error instanceof Error ? error.message : String(error),
           type: ToolErrorType.EXECUTION_FAILED,
@@ -689,6 +715,8 @@ export class ManagedToolRuntime {
 
 export async function createBuiltinManagedToolRuntime(
   config: Config,
+  fileHistory?: ManagedToolRuntimeFileHistory,
+  toolConfig: Config = config,
 ): Promise<ManagedToolRuntime> {
   const [{ ReadFileTool }, { WriteFileTool }, { EditTool }, { ShellTool }] =
     await Promise.all([
@@ -699,13 +727,28 @@ export async function createBuiltinManagedToolRuntime(
     ]);
   const constructors = [ReadFileTool, WriteFileTool, EditTool, ShellTool];
   const revision = randomUUID();
+  const boundTools =
+    toolConfig === config
+      ? undefined
+      : constructors.flatMap((Constructor): AnyDeclarativeTool[] => {
+          const tool = config.getToolRegistry().getTool(Constructor.Name);
+          return tool?.constructor === Constructor
+            ? [new Constructor(toolConfig)]
+            : [];
+        });
   return new ManagedToolRuntime(
-    config,
+    toolConfig,
     () =>
+      boundTools?.filter(
+        (tool) =>
+          config.getToolRegistry().getTool(tool.name)?.constructor ===
+          tool.constructor,
+      ) ??
       constructors.flatMap((Constructor): AnyDeclarativeTool[] => {
         const tool = config.getToolRegistry().getTool(Constructor.Name);
         return tool?.constructor === Constructor ? [tool] : [];
       }),
     () => revision,
+    fileHistory,
   );
 }

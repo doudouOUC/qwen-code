@@ -90,6 +90,57 @@ function use(promise = Promise.resolve(endpoint('one'))) {
 }
 afterEach(() => vi.unstubAllGlobals());
 describe('AutoLocal Managed Runtime provider', () => {
+  it('forwards history with the owned identity and only allows snapshots while closing', async () => {
+    const { provider, activate } = setup();
+    const active = use();
+    activate.mockReturnValue(active);
+    const closing = deferred<Response>();
+    const state = {
+      ownerSessionId: request.sessionId,
+      revision: 0,
+      snapshots: [],
+    };
+    const calls: Array<{ path: string; body: unknown }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: URL, init: RequestInit) => {
+        calls.push({ path: url.pathname, body: JSON.parse(String(init.body)) });
+        if (url.pathname.endsWith('/v1/prepare'))
+          return Response.json({ protocolVersion: 1, ready: true });
+        if (url.pathname.endsWith('/release')) return closing.promise;
+        return Response.json({ protocolVersion: 2, result: state });
+      }),
+    );
+    const client = await provider.getToolV2Client(request);
+    const binding = {
+      ownerSessionId: request.sessionId,
+      ownerRuntimeSessionId: request.sessionId,
+      executionCwd: request.workspaceCwd,
+      snapshots: [],
+    };
+    await expect(client.fileHistory!.bind(binding)).resolves.toEqual(state);
+    await client.fileHistory!.checkpoint('parent-turn');
+    const release = provider.release(request.sessionId, request);
+    await expect(client.fileHistory!.bind(binding)).rejects.toThrow();
+    await expect(client.fileHistory!.checkpoint('late')).rejects.toThrow();
+    await expect(client.fileHistory!.snapshot()).resolves.toEqual(state);
+    expect(calls).toContainEqual({
+      path: '/internal/managed-runtime/v2/bind-history',
+      body: { ...request, protocolVersion: 2, binding },
+    });
+    expect(calls.filter(({ path }) => path.endsWith('/checkpoint'))).toEqual([
+      {
+        path: '/internal/managed-runtime/v2/checkpoint',
+        body: { ...request, protocolVersion: 2, promptId: 'parent-turn' },
+      },
+    ]);
+    closing.resolve(Response.json({ protocolVersion: 2, released: true }));
+    await expect(release).resolves.toBe(true);
+    await expect(client.fileHistory!.snapshot()).rejects.toThrow();
+    expect(active.beginOperation).not.toHaveBeenCalled();
+    await provider.dispose();
+  });
+
   it('retains a failed acquire until release is acknowledged, and rejects an unproved false ACK', async () => {
     const { provider, activate } = setup();
     const active = use();

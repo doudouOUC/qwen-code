@@ -30,10 +30,27 @@ export interface ManagedToolSession {
   readonly shellConfiguration: ShellConfiguration;
   readonly platform: NodeJS.Platform;
   getClient(): Promise<ManagedToolV2Client>;
+  createChild?(config: Config): ManagedToolSession;
+  beginFileHistoryTurn?(promptId: string): Promise<void>;
+  flushFileHistory?(): Promise<void>;
   close(): Promise<void>;
 }
 
 export type ManagedToolSessionFactory = (config: Config) => ManagedToolSession;
+
+export interface ManagedChildExecutionScope {
+  readonly config: Config;
+  readonly signal?: AbortSignal;
+  run<T>(operation: () => Promise<T>): Promise<T>;
+  onClose(cleanup: () => void | Promise<void>): void;
+  close(): Promise<void>;
+}
+
+export function createManagedChildExecutionScope(
+  config: Config,
+): ManagedChildExecutionScope {
+  return config.createManagedChildExecutionScope();
+}
 
 export function createManagedBuiltinTool(
   name: string,

@@ -4,11 +4,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Config, ManagedToolV2Client } from '@qwen-code/qwen-code-core';
+import {
+  FileHistoryService,
+  type Config,
+  type ManagedToolFileHistoryBinding,
+  type ManagedToolFileHistoryState,
+  type ManagedToolV2Client,
+  type ManagedToolInvocationReference,
+} from '@qwen-code/qwen-code-core';
 import type { ManagedRuntimeProvider } from './managed-runtime-provider.js';
 import { createManagedToolSessionFactory } from './managed-tool-session.js';
 import { createWorkspaceGenerationGuard } from './workspace-registry.js';
@@ -26,7 +34,9 @@ function deferred<T>() {
 describe('managed tool Session binding', () => {
   let cwd: string;
   let guard: ReturnType<typeof createWorkspaceGenerationGuard>;
-  const client = {} as ManagedToolV2Client;
+  const clients = new Map<string, ManagedToolV2Client>();
+  const states = new Map<string, ManagedToolFileHistoryState>();
+  const bindings = new Map<string, ManagedToolFileHistoryBinding>();
   const getClient =
     vi.fn<NonNullable<ManagedRuntimeProvider['getToolV2Client']>>();
   const release = vi.fn<ManagedRuntimeProvider['release']>();
@@ -35,20 +45,73 @@ describe('managed tool Session binding', () => {
     release,
   } as unknown as ManagedRuntimeProvider;
 
+  function clientFor(sessionId: string): ManagedToolV2Client {
+    let state: ManagedToolFileHistoryState;
+    const client = {
+      execute: vi.fn().mockResolvedValue({
+        executionStatus: 'success',
+        result: { llmContent: 'ok', returnDisplay: 'ok' },
+      }),
+      status: vi.fn().mockResolvedValue({ state: 'settled' }),
+      cancel: vi.fn().mockResolvedValue({ state: 'settled' }),
+      fileHistory: {
+        bind: vi.fn(async (binding: ManagedToolFileHistoryBinding) => {
+          bindings.set(sessionId, binding);
+          state = states.get(binding.ownerRuntimeSessionId) ?? {
+            ownerSessionId: binding.ownerSessionId,
+            revision: 0,
+            snapshots: structuredClone(binding.snapshots),
+          };
+          states.set(sessionId, state);
+          return structuredClone(state);
+        }),
+        checkpoint: vi.fn(async (promptId: string) => {
+          state.snapshots.push({
+            promptId,
+            timestamp: new Date().toISOString(),
+            trackedFileBackups: {},
+          });
+          state.revision++;
+          return structuredClone(state);
+        }),
+        snapshot: vi.fn(async () => structuredClone(state)),
+      },
+    } as unknown as ManagedToolV2Client;
+    clients.set(sessionId, client);
+    return client;
+  }
   beforeEach(async () => {
     cwd = await realpath(
       await mkdtemp(join(tmpdir(), 'managed-tool-session-')),
     );
+    vi.stubEnv('QWEN_HOME', cwd);
     guard = createWorkspaceGenerationGuard();
-    getClient.mockReset().mockResolvedValue(client);
+    clients.clear();
+    states.clear();
+    bindings.clear();
+    getClient
+      .mockReset()
+      .mockImplementation(async ({ sessionId }) => clientFor(sessionId));
     release.mockReset().mockResolvedValue(true);
   });
   afterEach(async () => {
     guard.close();
+    vi.unstubAllEnvs();
     await rm(cwd, { recursive: true, force: true });
   });
   function create(trusted = true) {
-    return createManagedToolSessionFactory({
+    const id = randomUUID();
+    const service = new FileHistoryService(id, true, cwd);
+    const record = vi.fn().mockResolvedValue(undefined);
+    const config = {
+      getTargetDir: () => cwd,
+      getSessionId: () => id,
+      getFileHistoryService: () => service,
+      getChatRecordingService: () => ({
+        recordFileHistorySnapshotBatchStrict: record,
+      }),
+    } as unknown as Config;
+    const session = createManagedToolSessionFactory({
       provider,
       tenantId: 'tenant',
       workspaceId: 'workspace',
@@ -61,25 +124,28 @@ describe('managed tool Session binding', () => {
         argsPrefix: ['-c'],
       },
       platform: 'darwin',
-    })({ getTargetDir: () => cwd } as Config);
+    })(config);
+    return { session, config, service, record };
   }
 
-  it('does not acquire a worker for declaration-only and replay Configs', async () => {
-    const session = create();
+  it('records an empty no-tool parent turn without acquiring a worker', async () => {
+    const { session, record } = create();
+    await session.beginFileHistoryTurn!('parent-turn');
+    expect(record).toHaveBeenCalledWith([
+      expect.objectContaining({ promptId: 'parent-turn' }),
+    ]);
     await session.close();
     expect(getClient).not.toHaveBeenCalled();
     expect(release).not.toHaveBeenCalled();
     expect(() => session.getClient()).toThrow('closing');
   });
 
-  it('coalesces acquisition and binds independent Runtime Session identities', async () => {
-    const first = create();
-    const second = create();
+  it('coalesces acquisition and keeps independently owned execution identities', async () => {
+    const first = create().session;
+    const second = create().session;
     expect(first.sessionId).not.toBe(second.sessionId);
-    expect(await Promise.all([first.getClient(), first.getClient()])).toEqual([
-      client,
-      client,
-    ]);
+    const [a, b] = await Promise.all([first.getClient(), first.getClient()]);
+    expect(a).toBe(b);
     await second.getClient();
     expect(getClient).toHaveBeenCalledTimes(2);
     expect(getClient).toHaveBeenNthCalledWith(
@@ -100,21 +166,129 @@ describe('managed tool Session binding', () => {
     await second.close();
   });
 
+  it('binds parent history before the first child tool and persists later child changes in the parent writer', async () => {
+    const { session, config, service, record } = create();
+    await session.beginFileHistoryTurn!('parent-1');
+    const child = session.createChild!(config);
+    expect(getClient).not.toHaveBeenCalled();
+    await child.getClient();
+    expect(getClient.mock.calls.map(([request]) => request.sessionId)).toEqual([
+      session.sessionId,
+      child.sessionId,
+    ]);
+    expect(
+      bindings
+        .get(session.sessionId)
+        ?.snapshots.map((snapshot) => snapshot.promptId),
+    ).toEqual(['parent-1']);
+    expect(bindings.get(child.sessionId)).toMatchObject({
+      ownerRuntimeSessionId: session.sessionId,
+      ownerSessionId: config.getSessionId(),
+      snapshots: [],
+    });
+    await child.beginFileHistoryTurn!('child-1');
+    await session.beginFileHistoryTurn!('parent-2');
+    await session.getClient();
+    const state = states.get(session.sessionId)!;
+    state.snapshots[1].trackedFileBackups['created.txt'] = {
+      backupFileName: null,
+      version: 1,
+      backupTime: new Date().toISOString(),
+    };
+    state.revision++;
+    await child.flushFileHistory!();
+    expect(service.getSnapshots().map((snapshot) => snapshot.promptId)).toEqual(
+      ['parent-1', 'parent-2'],
+    );
+    expect(record).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        promptId: 'parent-2',
+        trackedFileBackups: expect.objectContaining({
+          'created.txt': expect.anything(),
+        }),
+      }),
+    ]);
+    await child.close();
+    await session.close();
+  });
+
+  it('retries history persistence after the Gateway writer rejects an update', async () => {
+    const { session, record } = create();
+    await session.getClient();
+    const state = states.get(session.sessionId)!;
+    state.snapshots.push({
+      promptId: 'persist-me',
+      timestamp: new Date().toISOString(),
+      trackedFileBackups: {},
+    });
+    state.revision++;
+    record.mockImplementationOnce(() => {
+      throw new Error('writer unavailable');
+    });
+    await expect(session.flushFileHistory!()).rejects.toThrow(
+      'writer unavailable',
+    );
+    await session.flushFileHistory!();
+    expect(record).toHaveBeenCalledTimes(2);
+    await session.close();
+  });
+
+  it('drains an execution with a lost receipt before syncing its last history and releasing', async () => {
+    const { session, service } = create();
+    const wrapped = await session.getClient();
+    const raw = clients.get(session.sessionId)!;
+    const reference = {
+      invocationId: 'lost-receipt',
+    } as ManagedToolInvocationReference;
+    vi.mocked(raw.execute).mockRejectedValueOnce(new Error('response lost'));
+    await expect(wrapped.execute(reference)).rejects.toThrow('response lost');
+    vi.mocked(raw.cancel).mockResolvedValueOnce({
+      state: 'cancel_requested',
+    } as Awaited<ReturnType<ManagedToolV2Client['cancel']>>);
+    vi.mocked(raw.status).mockImplementationOnce(async () => {
+      const state = states.get(session.sessionId)!;
+      state.snapshots.push({
+        promptId: 'late-edit',
+        timestamp: new Date().toISOString(),
+        trackedFileBackups: {},
+      });
+      state.revision++;
+      return { state: 'settled' } as Awaited<
+        ReturnType<ManagedToolV2Client['status']>
+      >;
+    });
+    await session.close();
+    expect(raw.cancel).toHaveBeenCalledWith(reference);
+    expect(raw.status).toHaveBeenCalledWith(reference);
+    expect(service.getSnapshots().at(-1)?.promptId).toBe('late-edit');
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('retains failed checkpoint ordering so later tools cannot bypass it', async () => {
+    const { session } = create();
+    await session.getClient();
+    vi.mocked(
+      clients.get(session.sessionId)!.fileHistory!.checkpoint,
+    ).mockRejectedValueOnce(new Error('checkpoint unavailable'));
+    await session.beginFileHistoryTurn!('parent-2');
+    await expect(session.getClient()).rejects.toThrow('checkpoint unavailable');
+    await session.close();
+  });
+
   it('awaits late acquisition and real release, retaining a failed close for retry', async () => {
     const acquired = deferred<ManagedToolV2Client>();
     const released = deferred<boolean>();
     getClient.mockReturnValue(acquired.promise);
     release.mockReturnValueOnce(released.promise);
-    const session = create();
-    const pending = session.getClient();
-    const rejectedAcquisition = pending.catch((error: unknown) => error);
+    const { session } = create();
+    const pending = session.getClient().catch((error: unknown) => error);
     await vi.waitFor(() => expect(getClient).toHaveBeenCalledOnce());
     const close = session.close();
     expect(session.close()).toBe(close);
     const rejectedClose = close.catch((error: unknown) => error);
     expect(release).not.toHaveBeenCalled();
-    acquired.resolve(client);
-    expect(await rejectedAcquisition).toMatchObject({
+    acquired.resolve(clientFor(session.sessionId));
+    expect(await pending).toMatchObject({
       message: 'Managed tool Session is closing.',
     });
     await vi.waitFor(() => expect(release).toHaveBeenCalledOnce());
@@ -127,7 +301,7 @@ describe('managed tool Session binding', () => {
 
   it('releases a Session even when acquisition fails after dispatch', async () => {
     getClient.mockRejectedValue(new Error('reply lost'));
-    const session = create();
+    const { session } = create();
     await expect(session.getClient()).rejects.toThrow('reply lost');
     await session.close();
     expect(release).toHaveBeenCalledWith(
@@ -137,16 +311,24 @@ describe('managed tool Session binding', () => {
     );
   });
 
+  it('rejects unsupported history control and still releases the acquired Session', async () => {
+    getClient.mockResolvedValue({} as ManagedToolV2Client);
+    const { session } = create();
+    await expect(session.getClient()).rejects.toThrow('file history control');
+    await session.close();
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it('does not claim cleanup from an unproven false response', async () => {
     release.mockResolvedValueOnce(false);
-    const session = create();
+    const { session } = create();
     await session.getClient();
     await expect(session.close()).rejects.toThrow('unproven');
     await session.close();
   });
 
   it('checks admission before using even an already acquired client', async () => {
-    const session = create();
+    const { session } = create();
     await session.getClient();
     guard.close();
     expect(() => session.getClient()).toThrow();
@@ -155,7 +337,7 @@ describe('managed tool Session binding', () => {
   });
 
   it('rejects an untrusted workspace before contacting the provider', async () => {
-    const session = create(false);
+    const { session } = create(false);
     expect(() => session.getClient()).toThrow('workspace binding');
     await session.close();
     expect(getClient).not.toHaveBeenCalled();

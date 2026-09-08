@@ -13,6 +13,7 @@ import express, { type RequestHandler } from 'express';
 import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ManagedToolV2Client } from '@qwen-code/acp-bridge/bridgeTypes';
+import type { ManagedToolFileHistoryState } from '@qwen-code/qwen-code-core';
 import type { ManagedWorkerBoot } from './managed-runtime-activator.js';
 import type { AcpSessionBridge } from './acp-session-bridge.js';
 import {
@@ -115,7 +116,7 @@ function workerApp(
   beforeRoutes?: RequestHandler,
 ) {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '10mb' }));
   if (beforeRoutes) app.use(beforeRoutes);
   registerManagedRuntimeWorkerRoutes(app, {
     provider,
@@ -157,7 +158,17 @@ describe('Managed Runtime providers', () => {
   });
 
   function toolV2Client() {
+    const historyState: ManagedToolFileHistoryState = {
+      ownerSessionId: prepareRequest.sessionId,
+      revision: 0,
+      snapshots: [],
+    };
     return {
+      fileHistory: {
+        bind: vi.fn(async () => historyState),
+        checkpoint: vi.fn(async () => historyState),
+        snapshot: vi.fn(async () => historyState),
+      },
       manifest: vi.fn(async () => manifest),
       beginTurn: vi.fn(async () => {}),
       prepare: vi.fn(async () => ({})),
@@ -447,7 +458,7 @@ describe('Managed Runtime providers', () => {
     local.dispose();
   });
 
-  it('connects all nine v2 methods through the owned HTTP listener without losing optional fields', async () => {
+  it('connects v2 invocations and file history through the owned HTTP listener without losing optional fields', async () => {
     const runtime = fakeRuntime();
     const client = toolV2Client();
     runtime.bridge.getManagedToolV2Client = vi.fn(
@@ -479,6 +490,53 @@ describe('Managed Runtime providers', () => {
     });
     try {
       const connected = await remote.getToolV2Client(prepareRequest);
+      const trackedFileBackups = Object.fromEntries(
+        Array.from({ length: 100 }, (_, i) => [
+          `${'directory/'.repeat(5)}file-${i}.txt`,
+          {
+            backupFileName: '0123456789abcdef@v1',
+            version: 1,
+            backupTime: '2026-09-09T00:00:00.000Z',
+          },
+        ]),
+      );
+      const snapshots = Array.from({ length: 100 }, (_, i) => ({
+        promptId: `turn-${i}`,
+        timestamp: '2026-09-09T00:00:00.000Z',
+        trackedFileBackups,
+      }));
+      expect(Buffer.byteLength(JSON.stringify(snapshots))).toBeGreaterThan(
+        1024 * 1024,
+      );
+      client.fileHistory.bind.mockResolvedValueOnce({
+        ownerSessionId: prepareRequest.sessionId,
+        revision: 0,
+        snapshots,
+      });
+      const binding = {
+        ownerSessionId: prepareRequest.sessionId,
+        ownerRuntimeSessionId: prepareRequest.sessionId,
+        executionCwd: workspaceCwd,
+        snapshots,
+      };
+      await expect(connected.fileHistory!.bind(binding)).resolves.toEqual({
+        ownerSessionId: prepareRequest.sessionId,
+        revision: 0,
+        snapshots,
+      });
+      await connected.fileHistory!.checkpoint('parent-turn');
+      await connected.fileHistory!.snapshot();
+      expect(client.fileHistory.bind).toHaveBeenCalledExactlyOnceWith(binding);
+      expect(client.fileHistory.checkpoint).toHaveBeenCalledExactlyOnceWith(
+        'parent-turn',
+      );
+      expect(client.fileHistory.snapshot).toHaveBeenCalledExactlyOnceWith();
+      client.fileHistory.snapshot.mockResolvedValueOnce({
+        ownerSessionId: prepareRequest.sessionId,
+        revision: -1,
+        snapshots: [],
+      });
+      await expect(connected.fileHistory!.snapshot()).rejects.toThrow();
       await connected.manifest();
       const identity = {
         sessionId: invocation.sessionId,
@@ -726,6 +784,12 @@ describe('Managed Runtime providers', () => {
       await expect(client.status(invocation)).rejects.toThrow();
       expect(downstream.execute).not.toHaveBeenCalled();
       expect(downstream.status).not.toHaveBeenCalled();
+      await expect(client.fileHistory!.snapshot()).rejects.toThrow();
+      await expect(
+        client.fileHistory!.checkpoint('parent-turn'),
+      ).rejects.toThrow();
+      expect(downstream.fileHistory.snapshot).not.toHaveBeenCalled();
+      expect(downstream.fileHistory.checkpoint).not.toHaveBeenCalled();
       local.dispose();
     }
   });
@@ -759,6 +823,22 @@ describe('Managed Runtime providers', () => {
       state: 'cancel_requested',
     });
     await expect(drain.manifest()).rejects.toThrow();
+    await expect(drain.fileHistory!.snapshot()).resolves.toEqual({
+      ownerSessionId: prepareRequest.sessionId,
+      revision: 0,
+      snapshots: [],
+    });
+    await expect(drain.fileHistory!.checkpoint('late')).rejects.toThrow();
+    await expect(
+      drain.fileHistory!.bind({
+        ownerSessionId: prepareRequest.sessionId,
+        ownerRuntimeSessionId: prepareRequest.sessionId,
+        executionCwd: workspaceCwd,
+        snapshots: [],
+      }),
+    ).rejects.toThrow();
+    expect(downstream.fileHistory.checkpoint).not.toHaveBeenCalled();
+    expect(downstream.fileHistory.bind).not.toHaveBeenCalled();
     expect(runtime.close).toHaveBeenCalledTimes(1);
     const failure = new Error('close did not drain');
     failClose(failure);

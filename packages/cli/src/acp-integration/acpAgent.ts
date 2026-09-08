@@ -150,6 +150,8 @@ import {
   type TurnResultRecordPayload,
   sessionIdContext,
   type ManagedToolRuntime,
+  parseManagedToolFileHistoryBinding,
+  parseManagedToolFileHistoryPromptId,
 } from '@qwen-code/qwen-code-core';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
@@ -208,6 +210,7 @@ import {
   parseManagedToolRuntimeSessionId,
 } from './managed-tool-runtime-session.js';
 import { bindAcpConnectionLifetime } from './acp-connection-lifetime.js';
+import { ManagedToolFileHistorySessions } from './managed-tool-file-history-session.js';
 import { ndJsonStream } from '@qwen-code/acp-bridge/ndJsonStream';
 import {
   ACP_EVENT_LOOP_STALL_RESTART_MS,
@@ -3573,6 +3576,7 @@ class QwenAgent implements Agent {
     }
   >();
   private readonly sealedManagedToolConfigs = new WeakSet<Config>();
+  private readonly managedFileHistory = new ManagedToolFileHistorySessions();
   private readonly managedRuntimeToolExecutions = new Map<
     string,
     { sessionId: string; controller: AbortController }
@@ -3718,15 +3722,27 @@ class QwenAgent implements Agent {
   private async disposeManagedToolRuntime(config: Config): Promise<void> {
     this.sealManagedToolRuntime(config);
     const entry = this.managedToolRuntimes.get(config);
-    if (!entry) return;
+    if (!entry) {
+      await this.managedFileHistory.dispose(config);
+      return;
+    }
     let runtime: ManagedToolRuntime;
     try {
       runtime = await entry.pending;
     } catch (error) {
+      try {
+        await this.managedFileHistory.dispose(config);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          'Managed tool initialization cleanup failed.',
+        );
+      }
       this.managedToolRuntimes.delete(config);
       throw error;
     }
     await runtime.dispose();
+    await this.managedFileHistory.dispose(config);
     this.managedToolRuntimes.delete(config);
   }
 
@@ -3780,6 +3796,59 @@ class QwenAgent implements Agent {
       await session.assertCanStartTurn();
       assertAdmission();
     }
+    if (method === SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BindHistory) {
+      if (
+        this.managedToolRuntimes.has(config) &&
+        !this.managedFileHistory.get(config)
+      )
+        throw RequestError.invalidParams(
+          undefined,
+          'Managed file history must bind before tool execution.',
+        );
+      const binding = await this.managedFileHistory.bind(
+        config,
+        parseManagedToolFileHistoryBinding(params['binding']),
+        (ownerId) => this.sessions.get(ownerId)?.getConfig(),
+        (candidate) => {
+          this.assertManagedSessionAdmission();
+          if (
+            this.sessions.get(candidate.getSessionId())?.getConfig() !==
+              candidate ||
+            this.sealedManagedToolConfigs.has(candidate) ||
+            !candidate.isTrustedFolder() ||
+            (this.managedToolRuntimes.has(candidate) &&
+              !this.managedFileHistory.get(candidate))
+          )
+            throw RequestError.invalidParams(
+              undefined,
+              'Managed file history owner is unavailable.',
+            );
+        },
+      );
+      return { ...binding.owner.state() };
+    }
+    const history = this.managedFileHistory.get(config);
+    if (
+      method === SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Checkpoint ||
+      method === SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2History
+    ) {
+      if (!history)
+        throw RequestError.invalidParams(
+          undefined,
+          'Managed file history is not bound.',
+        );
+      if (method === SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Checkpoint) {
+        if (history.ownerRuntimeSessionId !== sessionId)
+          throw RequestError.invalidParams(
+            undefined,
+            'Only the parent Session may start file history turns.',
+          );
+        await history.owner.checkpoint(
+          parseManagedToolFileHistoryPromptId(params['promptId']),
+        );
+      }
+      return { ...history.owner.state() };
+    }
     let entry = this.managedToolRuntimes.get(config);
     if (!entry) {
       if (draining)
@@ -3791,7 +3860,16 @@ class QwenAgent implements Agent {
         runtime?: ManagedToolRuntime;
         pending: Promise<ManagedToolRuntime>;
       } = {
-        pending: createManagedToolRuntimeSession(config)
+        pending: createManagedToolRuntimeSession(
+          config,
+          history
+            ? {
+                prepareTurn: () => history.owner.ready(),
+                execute: (operation) => history.owner.run(operation),
+              }
+            : undefined,
+          history?.toolConfig,
+        )
           .then((runtime) => {
             created.runtime = runtime;
             if (

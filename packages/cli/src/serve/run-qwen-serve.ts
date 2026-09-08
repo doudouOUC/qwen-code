@@ -10021,7 +10021,7 @@ async function runQwenServeImpl(
             if (
               deps.ownedManagedRuntime &&
               (req.method !== 'POST' ||
-                !/^\/internal\/managed-runtime\/(v1\/(prepare|manifest|execute|cancel|release)|v2\/(manifest|begin-turn|prepare|confirmation|confirm|preflight|execute|status|cancel|release))$/.test(
+                !/^\/internal\/managed-runtime\/(v1\/(prepare|manifest|execute|cancel|release)|v2\/(bind-history|checkpoint|history|manifest|begin-turn|prepare|confirmation|confirm|preflight|execute|status|cancel|release))$/.test(
                   req.url ?? '',
                 ))
             ) {

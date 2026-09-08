@@ -5549,20 +5549,7 @@ export class Session implements SessionContext {
             // indexes snapshots by user-turn position, so skip them.
             if (!isRestoreAskUserQuestion) {
               try {
-                const fileHistoryService = this.config.getFileHistoryService();
-                await fileHistoryService.makeSnapshot(promptId);
-                try {
-                  const latestSnapshot = fileHistoryService
-                    .getSnapshots()
-                    .at(-1);
-                  if (latestSnapshot) {
-                    this.config
-                      .getChatRecordingService()
-                      ?.recordFileHistorySnapshot(latestSnapshot);
-                  }
-                } catch (e) {
-                  debugLogger.error(`FileHistory: recordSnapshot failed: ${e}`);
-                }
+                await this.config.makeFileHistorySnapshot(promptId);
               } catch (e) {
                 debugLogger.error(`FileHistory: makeSnapshot failed: ${e}`);
               }

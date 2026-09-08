@@ -4,6 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {
+  createManagedChildExecutionScope,
+  type ManagedChildExecutionScope,
+} from '../tools/managed-tool-session.js';
+import {
+  bindManagedChildExecution,
+  createManagedChildCleanup,
+} from './managed-child-execution.js';
+import { createChildAbortController } from '../utils/abortController.js';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { Content, Part } from '@google/genai';
@@ -793,6 +802,8 @@ export class BackgroundAgentResumeService {
       return undefined;
     }
 
+    const retiring = registry.awaitResidentDisposal(agentId);
+    if (retiring) await retiring;
     const bgAbortController = new AbortController();
 
     try {
@@ -824,19 +835,20 @@ export class BackgroundAgentResumeService {
 
     let cleanupOwnedMonitorNotifications: (() => void) | undefined;
     let cleanupJsonl: (() => void) | undefined;
+    let managedScope: ManagedChildExecutionScope | undefined;
     let agentConfig: Config | undefined;
     let restoreParentPM: (() => void) | undefined;
     let subagentDispose: (() => Promise<void>) | undefined;
-    let cleanupRuntime: (() => void) | undefined;
+    let cleanupRuntime: (() => Promise<void>) | undefined;
     let runtimeLifecycleOwned = false;
     let setupCleaned = false;
 
-    const cleanupPreparedRuntime = () => {
+    const cleanupPreparedRuntime = async () => {
       if (runtimeLifecycleOwned || setupCleaned) return;
-      setupCleaned = true;
+      await managedScope?.close();
       if (cleanupRuntime) {
-        cleanupRuntime();
-      } else {
+        await cleanupRuntime();
+      } else if (!managedScope?.signal) {
         cleanupOwnedMonitorNotifications?.();
         cleanupJsonl?.();
         if (agentConfig) {
@@ -847,7 +859,8 @@ export class BackgroundAgentResumeService {
         }
         void subagentDispose?.().catch(() => {});
       }
-      restoreParentPM?.();
+      if (!managedScope?.signal) restoreParentPM?.();
+      setupCleaned = true;
     };
 
     try {
@@ -899,10 +912,27 @@ export class BackgroundAgentResumeService {
       // continuing to read the parent's. Reusing `this.config`
       // directly here would short-circuit that isolation. See the
       // matching wrapper in `agent.ts:createApprovalModeOverride`.
-      const approvalOverride = await createApprovalModeOverride(
-        this.config,
-        resolvedApprovalMode as ApprovalMode,
-        { persistedCliFlags: meta.persistedCliFlags },
+      const launchScope = createManagedChildExecutionScope(this.config);
+      managedScope = launchScope;
+      launchScope.onClose(async () => {
+        await agentConfig?.getToolRegistry().stop();
+        cleanupOwnedMonitorNotifications?.();
+        cleanupJsonl?.();
+        restoreParentPM?.();
+      });
+      const onScopeAbort = () =>
+        bgAbortController.abort(launchScope.signal?.reason);
+      if (launchScope.signal?.aborted) onScopeAbort();
+      else
+        launchScope.signal?.addEventListener('abort', onScopeAbort, {
+          once: true,
+        });
+      const approvalOverride = await launchScope.run(() =>
+        createApprovalModeOverride(
+          launchScope.config,
+          resolvedApprovalMode as ApprovalMode,
+          { persistedCliFlags: meta.persistedCliFlags },
+        ),
       );
       const activeAgentConfig = approvalOverride.config;
       const activeRestoreParentPM = approvalOverride.cleanup;
@@ -959,7 +989,7 @@ export class BackgroundAgentResumeService {
           lastUpdatedAt: new Date().toISOString(),
         });
         this.restorePausedEntry(agentId, { resumeBlockedReason: reason });
-        cleanupPreparedRuntime();
+        await cleanupPreparedRuntime();
         return undefined;
       }
       if (target.isFork && !recovery.forkBootstrap) {
@@ -969,7 +999,7 @@ export class BackgroundAgentResumeService {
           lastUpdatedAt: new Date().toISOString(),
         });
         this.restorePausedEntry(agentId, { resumeBlockedReason: reason });
-        cleanupPreparedRuntime();
+        await cleanupPreparedRuntime();
         return undefined;
       }
       const forkResumeCapabilityReminder = target.isFork
@@ -983,15 +1013,18 @@ export class BackgroundAgentResumeService {
       const launchModel = meta.model ?? meta.persistedCliFlags?.model;
       let subagent: AgentHeadless;
       if (target.isFork) {
-        subagent = await this.createResumedForkSubagent(
-          activeAgentConfig,
-          bgEventEmitter,
-          resumeHistory ?? [],
-          currentForkRuntime!,
-          meta.executionAllowedTools,
-          meta.agentId,
-          meta.description,
+        subagent = await launchScope.run(() =>
+          this.createResumedForkSubagent(
+            activeAgentConfig,
+            bgEventEmitter,
+            resumeHistory ?? [],
+            currentForkRuntime!,
+            meta.executionAllowedTools,
+            meta.agentId,
+            meta.description,
+          ),
         );
+        bindManagedChildExecution(subagent, launchScope);
       } else {
         const resumeSubagentConfig =
           launchModel && meta.persistedCliFlags?.authType
@@ -1003,6 +1036,7 @@ export class BackgroundAgentResumeService {
             eventEmitter: bgEventEmitter,
             taskName: meta.description,
             subagentId: meta.agentId,
+            managedScope: launchScope,
             promptConfigOverrides: {
               initialMessages: resumeHistory,
             },
@@ -1031,6 +1065,7 @@ export class BackgroundAgentResumeService {
         subagentDispose = result.dispose;
       }
 
+      launchScope.signal?.throwIfAborted();
       const { jsonlPath, options: transcriptAttachOptions } =
         buildAgentTranscriptAttach(this.config, meta.agentId, {
           sessionId: meta.parentSessionId,
@@ -1126,12 +1161,15 @@ export class BackgroundAgentResumeService {
           : continuationPrompt,
       );
       const resolvedMode = approvalModeToPermissionMode(resolvedApprovalMode);
-      await this.applySubagentStartHook(contextState, {
-        agentId: meta.agentId,
-        agentType: meta.agentType,
-        resolvedMode,
-        signal: bgAbortController.signal,
-      });
+      await launchScope.run(() =>
+        this.applySubagentStartHook(contextState, {
+          agentId: meta.agentId,
+          agentType: meta.agentType,
+          resolvedMode,
+          signal: bgAbortController.signal,
+        }),
+      );
+      launchScope.signal?.throwIfAborted();
       const bgEmitter = subagent.getCore().getEventEmitter();
       let liveToolCallCount = 0;
 
@@ -1179,33 +1217,38 @@ export class BackgroundAgentResumeService {
       let hotResumeCount = nextResumeCount;
       let residentRegistered = false;
 
-      const runtimeCleanup = () => {
-        if (runtimeDisposed) return;
-        runtimeDisposed = true;
-        registry.unregisterResidentAgent(meta.agentId, residentController);
-        residentRegistered = false;
-        bgEmitter.off(AgentEventType.TOOL_CALL, onToolCall);
-        bgEmitter.off(AgentEventType.USAGE_METADATA, onUsageMetadata);
-        cleanupApprovalBridge?.();
-        cleanupOwnedMonitorNotifications?.();
-        cleanupJsonl?.();
-        void activeAgentConfig
-          .getToolRegistry()
-          .stop()
-          .catch(() => {});
-        void subagentDispose?.().catch(() => {});
-      };
+      const runtimeCleanup = createManagedChildCleanup(
+        launchScope,
+        async () => {
+          if (runtimeDisposed) return;
+          if (!launchScope.signal) {
+            void activeAgentConfig
+              .getToolRegistry()
+              .stop()
+              .catch(() => {});
+            void subagentDispose?.().catch(() => {});
+          }
+          bgEmitter.off(AgentEventType.TOOL_CALL, onToolCall);
+          bgEmitter.off(AgentEventType.USAGE_METADATA, onUsageMetadata);
+          cleanupApprovalBridge?.();
+          if (!launchScope.signal) {
+            cleanupOwnedMonitorNotifications?.();
+            cleanupJsonl?.();
+          }
+          registry.unregisterResidentAgent(meta.agentId, residentController);
+          residentRegistered = false;
+          runtimeDisposed = true;
+        },
+      );
       cleanupRuntime = runtimeCleanup;
 
-      const requestRuntimeDisposal = () => {
-        if (disposeRequested || runtimeDisposed) return;
+      const requestRuntimeDisposal = (): Promise<void> => {
         disposeRequested = true;
-        registry.unregisterResidentAgent(meta.agentId, residentController);
-        residentRegistered = false;
         currentAbortController?.abort();
-        if (!turnRunning) {
-          runtimeCleanup();
+        if (!launchScope.signal && turnRunning && currentTurnPromise) {
+          return currentTurnPromise.catch(() => {}).then(runtimeCleanup);
         }
+        return runtimeCleanup();
       };
 
       const runBody = async (
@@ -1220,12 +1263,14 @@ export class BackgroundAgentResumeService {
         try {
           while (true) {
             if (shouldFireStartHook) {
-              await this.applySubagentStartHook(turnContextState, {
-                agentId: meta.agentId,
-                agentType: meta.agentType,
-                resolvedMode,
-                signal: turnAbortController.signal,
-              });
+              await launchScope.run(() =>
+                this.applySubagentStartHook(turnContextState, {
+                  agentId: meta.agentId,
+                  agentType: meta.agentType,
+                  resolvedMode,
+                  signal: turnAbortController.signal,
+                }),
+              );
               const additionalContext = turnContextState.get('hook_context');
               if (additionalContext) {
                 turnContextState.set(
@@ -1252,13 +1297,15 @@ export class BackgroundAgentResumeService {
 
             let stopHookWarning: string | undefined;
             if (hookSystem && !turnAbortController.signal.aborted) {
-              stopHookWarning = await this.runSubagentStopHookLoop(subagent, {
-                agentId: meta.agentId,
-                agentType: meta.agentType,
-                transcriptPath: outputFile,
-                resolvedMode,
-                signal: turnAbortController.signal,
-              });
+              stopHookWarning = await launchScope.run(() =>
+                this.runSubagentStopHookLoop(subagent, {
+                  agentId: meta.agentId,
+                  agentType: meta.agentType,
+                  transcriptPath: outputFile,
+                  resolvedMode,
+                  signal: turnAbortController.signal,
+                }),
+              );
             }
 
             const terminateMode = subagent.getTerminateMode();
@@ -1282,7 +1329,7 @@ export class BackgroundAgentResumeService {
               }
 
               keepResident = residentRegistered && !needsAutoPermissionLease();
-              if (!keepResident) {
+              if (!keepResident && !launchScope.signal) {
                 registry.unregisterResidentAgent(
                   meta.agentId,
                   residentController,
@@ -1345,9 +1392,10 @@ export class BackgroundAgentResumeService {
           }
         } finally {
           turnRunning = false;
-          activeRestoreParentPM();
+          if (!launchScope.signal || (keepResident && !disposeRequested))
+            activeRestoreParentPM();
           if (!keepResident || disposeRequested) {
-            runtimeCleanup();
+            await runtimeCleanup();
           }
         }
       };
@@ -1383,15 +1431,22 @@ export class BackgroundAgentResumeService {
 
       const residentController: ResidentBackgroundAgent = {
         continue: (message) => {
-          if (!canStayResident || disposeRequested || runtimeDisposed) {
+          if (
+            !canStayResident ||
+            disposeRequested ||
+            runtimeDisposed ||
+            launchScope.signal?.aborted
+          ) {
             return false;
           }
           if (needsAutoPermissionLease()) {
-            requestRuntimeDisposal();
+            registry.disposeResidentAgent(meta.agentId, residentController);
             return false;
           }
 
-          const nextAbortController = new AbortController();
+          const nextAbortController = createChildAbortController(
+            launchScope.signal,
+          );
           let restarted;
           try {
             restarted = registry.restartCompletedAgent(
@@ -1445,9 +1500,12 @@ export class BackgroundAgentResumeService {
         },
         dispose: requestRuntimeDisposal,
       };
-      if (canStayResident && !needsAutoPermissionLease()) {
+      if (
+        launchScope.signal ||
+        (canStayResident && !needsAutoPermissionLease())
+      ) {
         registry.registerResidentAgent(meta.agentId, residentController);
-        residentRegistered = true;
+        residentRegistered = canStayResident && !needsAutoPermissionLease();
       }
 
       currentTurnPromise = runBackgroundTurn(
@@ -1459,7 +1517,7 @@ export class BackgroundAgentResumeService {
       currentTurnPromise.catch(reportUnexpectedBackgroundError);
       return entry;
     } catch (error) {
-      cleanupPreparedRuntime();
+      await cleanupPreparedRuntime();
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       debugLogger.warn(

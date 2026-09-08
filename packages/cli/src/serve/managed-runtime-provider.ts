@@ -386,7 +386,15 @@ export class LocalManagedRuntimeProvider implements ManagedRuntimeProvider {
       assertBinding(allowDraining);
       return operation();
     };
+    const history = client.fileHistory;
     return {
+      fileHistory: history
+        ? {
+            bind: (binding) => call(() => history.bind(binding)),
+            checkpoint: (promptId) => call(() => history.checkpoint(promptId)),
+            snapshot: () => call(() => history.snapshot(), true),
+          }
+        : undefined,
       manifest: () => call(() => client.manifest()),
       beginTurn: (identity) => call(() => client.beginTurn(identity)),
       prepare: (identity, name, input) =>
@@ -1050,7 +1058,8 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
       params: Record<string, unknown> = {},
       allowDraining = false,
     ): Promise<T> => {
-      const { managedToolDigest } = await import('@qwen-code/qwen-code-core');
+      const { managedToolDigest, MANAGED_TOOL_FILE_HISTORY_MAX_BYTES } =
+        await import('@qwen-code/qwen-code-core');
       this.lifetime.signal.throwIfAborted();
       if (this.entries.get(entry.request.sessionId) !== entry) {
         throw new ManagedRuntimeProviderError(
@@ -1073,7 +1082,12 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
         );
       }
       const body = { ...entry.request, protocolVersion: 2, ...params };
-      managedToolDigest(body, 1024 * 1024);
+      managedToolDigest(
+        body,
+        operation === 'bind-history'
+          ? MANAGED_TOOL_FILE_HISTORY_MAX_BYTES
+          : 1024 * 1024,
+      );
       const response = await this.postJson<{
         protocolVersion?: unknown;
         result?: T;
@@ -1126,6 +1140,43 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
       return response.result as T;
     };
     return {
+      fileHistory: {
+        bind: async (binding) => {
+          const {
+            parseManagedToolFileHistoryBinding,
+            parseManagedToolFileHistoryState,
+            ManagedToolProtocolError,
+          } = await import('@qwen-code/qwen-code-core');
+          const parsed = parseManagedToolFileHistoryBinding(binding);
+          const state = parseManagedToolFileHistoryState(
+            await call('bind-history', { binding: parsed }),
+          );
+          if (state.ownerSessionId !== parsed.ownerSessionId)
+            throw new ManagedToolProtocolError(
+              'Managed file history owner changed.',
+            );
+          return state;
+        },
+        checkpoint: async (promptId) => {
+          const {
+            parseManagedToolFileHistoryPromptId,
+            parseManagedToolFileHistoryState,
+          } = await import('@qwen-code/qwen-code-core');
+          return parseManagedToolFileHistoryState(
+            await call('checkpoint', {
+              promptId: parseManagedToolFileHistoryPromptId(promptId),
+            }),
+          );
+        },
+        snapshot: async () => {
+          const { parseManagedToolFileHistoryState } = await import(
+            '@qwen-code/qwen-code-core'
+          );
+          return parseManagedToolFileHistoryState(
+            await call('history', {}, true),
+          );
+        },
+      },
       manifest: () => call('manifest'),
       beginTurn: async (identity) => {
         await call('begin-turn', { identity });

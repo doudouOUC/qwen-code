@@ -185,6 +185,7 @@ import { createGoalVerifier } from '../goals/goal-verifier.js';
 import type { ToolInvocationGuard } from '../core/tool-invocation-guard.js';
 import {
   createManagedBuiltinTool,
+  type ManagedChildExecutionScope,
   type ManagedToolSession,
   type ManagedToolSessionFactory,
 } from '../tools/managed-tool-session.js';
@@ -2067,6 +2068,10 @@ export class Config {
   private readonly managedToolSessionFactory?: ManagedToolSessionFactory;
   private managedToolSession?: ManagedToolSession;
   private managedToolSessionClosing = false;
+  private managedToolSessionClosePromise?: Promise<void>;
+  private managedToolSessionOwner?: Config;
+  private managedChildScopes = new Set<ManagedChildExecutionScope>();
+  private sharedFileHistoryService?: FileHistoryService;
   private modelInvocableCommandsProvider:
     | (() => ReadonlyArray<{ name: string; description: string }>)
     | null = null;
@@ -2498,6 +2503,7 @@ export class Config {
     this.permissionsAutoMode = params.permissions?.autoMode ?? {};
     this.toolInvocationGuard = params.toolInvocationGuard;
     this.managedToolSessionFactory = params.managedToolSessionFactory;
+    if (params.managedToolSessionFactory) this.managedToolSessionOwner = this;
     this.toolDiscoveryCommand = params.toolDiscoveryCommand;
     this.toolCallCommand = params.toolCallCommand;
     this.mcpServerCommand = params.mcpServerCommand;
@@ -4268,6 +4274,7 @@ export class Config {
   }
 
   hydrateSessionRestoreFileHistory(): void {
+    if (this.sharedFileHistoryService) return;
     if (this.restoredFileHistory) return;
     const snapshots = this.sessionRestoreRuntime?.fileHistorySnapshots;
     if (!snapshots?.length) return;
@@ -5815,15 +5822,147 @@ export class Config {
     return this.toolRegistry;
   }
 
-  async closeManagedToolSession(): Promise<void> {
-    if (!this.managedToolSessionFactory || isDerivedConfig(this)) return;
+  closeManagedToolSession(): Promise<void> {
+    if (
+      !this.managedToolSessionFactory ||
+      this.managedToolSessionOwner !== this
+    )
+      return Promise.resolve();
     this.managedToolSessionClosing = true;
-    try {
-      await this.initializationPromise;
-    } catch {
-      // Partial initialization may have acquired a Runtime Session.
+    this.managedToolSessionClosePromise ??= (async () => {
+      const children = await Promise.allSettled(
+        [...this.managedChildScopes].map((scope) => scope.close()),
+      );
+      const failures = children.filter(
+        (result) => result.status === 'rejected',
+      );
+      if (failures.length)
+        throw new AggregateError(
+          failures.map((result) => result.reason),
+          'Managed child Agent cleanup failed.',
+        );
+      try {
+        await this.initializationPromise;
+      } catch {
+        // Partial initialization may have acquired a Runtime Session.
+      }
+      await this.managedToolSession?.flushFileHistory?.();
+      await this.managedToolSession?.close();
+    })();
+    const current = this.managedToolSessionClosePromise;
+    void current.catch(() => {
+      if (this.managedToolSessionClosePromise === current)
+        this.managedToolSessionClosePromise = undefined;
+    });
+    return current;
+  }
+
+  private getManagedToolSession(): ManagedToolSession | undefined {
+    const owner = this.managedToolSessionOwner;
+    if (!owner?.managedToolSessionFactory) return undefined;
+    return (owner.managedToolSession ??=
+      owner.managedToolSessionFactory(owner));
+  }
+
+  createManagedChildExecutionScope(): ManagedChildExecutionScope {
+    const parent = this.managedToolSessionOwner;
+    if (!parent || !this.managedToolSessionFactory) {
+      return {
+        config: this,
+        run: (operation) => operation(),
+        onClose: () => {},
+        close: async () => {},
+      };
     }
-    await this.managedToolSession?.close();
+    if (parent.managedToolSessionClosing || parent.shutdownRequested)
+      throw new Error('Managed parent Agent is closing.');
+    const session = parent.getManagedToolSession();
+    if (!session?.createChild)
+      throw new Error('Managed child Agent execution is unavailable.');
+    const config = deriveConfig(this);
+    config.managedToolSessionOwner = config;
+    config.managedToolSessionClosing = false;
+    config.managedToolSessionClosePromise = undefined;
+    config.managedChildScopes = new Set();
+    config.managedToolSession = session.createChild(config);
+    const controller = new AbortController();
+    const running = new Set<Promise<unknown>>();
+    const callbacks = new Set<() => void | Promise<void>>();
+    let closing = false;
+    let cleanup: Promise<void> | undefined;
+    const scope: ManagedChildExecutionScope = {
+      config,
+      signal: controller.signal,
+      onClose: (callback) => {
+        if (closing) throw new Error('Managed child Agent is closing.');
+        callbacks.add(callback);
+      },
+      run: <T>(operation: () => Promise<T>): Promise<T> => {
+        if (closing || parent.managedToolSessionClosing)
+          return Promise.reject(new Error('Managed child Agent is closing.'));
+        let pending: Promise<T>;
+        try {
+          pending = operation();
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        running.add(pending);
+        void pending.then(
+          () => running.delete(pending),
+          () => running.delete(pending),
+        );
+        return pending;
+      },
+      close: () => {
+        closing = true;
+        config.managedToolSessionClosing = true;
+        controller.abort(
+          new DOMException('Managed child Agent is closing.', 'AbortError'),
+        );
+        cleanup ??= (async () => {
+          // Seal descendants before waiting for a parent Agent that may be
+          // awaiting one of them; their raw execute promises exclude close.
+          const descendants = Promise.allSettled(
+            [...config.managedChildScopes].map((child) => child.close()),
+          );
+          await Promise.allSettled([...running]);
+          const failures = (await descendants).filter(
+            (result) => result.status === 'rejected',
+          );
+          if (failures.length)
+            throw new AggregateError(
+              failures.map((result) => result.reason),
+              'Managed child Agent cleanup failed.',
+            );
+          await config.closeManagedToolSession();
+          for (const callback of callbacks) {
+            await callback();
+            callbacks.delete(callback);
+          }
+          parent.managedChildScopes.delete(scope);
+        })();
+        const current = cleanup;
+        void current.catch(() => {
+          if (cleanup === current) cleanup = undefined;
+        });
+        return current;
+      },
+    };
+    parent.managedChildScopes.add(scope);
+    return scope;
+  }
+
+  async makeFileHistorySnapshot(promptId: string): Promise<void> {
+    const managed = this.getManagedToolSession();
+    if (managed?.beginFileHistoryTurn) {
+      await managed.beginFileHistoryTurn(promptId);
+      return;
+    }
+    const service = this.getFileHistoryService();
+    await service.makeSnapshot(promptId);
+    const latest = service.getSnapshots().at(-1);
+    if (latest)
+      this.getChatRecordingService()?.recordFileHistorySnapshot(latest);
   }
 
   /**
@@ -5859,6 +5998,7 @@ export class Config {
         : undefined;
 
     try {
+      if (managed) await this.closeManagedToolSession();
       if (!options?.skipSessionWriter && !earlyWriterClose) {
         try {
           this.chatRecordingService?.finalize();
@@ -7780,7 +7920,10 @@ export class Config {
   }
 
   getFileCheckpointingEnabled(): boolean {
-    return this.fileCheckpointingEnabled;
+    return (
+      this.sharedFileHistoryService?.isEnabled() ??
+      this.fileCheckpointingEnabled
+    );
   }
 
   enableFileCheckpointing(): void {
@@ -7789,6 +7932,7 @@ export class Config {
   }
 
   getFileHistoryService(): FileHistoryService {
+    if (this.sharedFileHistoryService) return this.sharedFileHistoryService;
     if (!this.fileHistoryService) {
       const service = new FileHistoryService(
         this.sessionId,
@@ -7811,6 +7955,15 @@ export class Config {
       }
     }
     return this.fileHistoryService;
+  }
+
+  bindSharedFileHistoryService(service: FileHistoryService): void {
+    if (
+      this.sharedFileHistoryService &&
+      this.sharedFileHistoryService !== service
+    )
+      throw new Error('Managed file history owner is already bound.');
+    this.sharedFileHistoryService = service;
   }
 
   getProxy(): string | undefined {
@@ -9155,8 +9308,7 @@ export class Config {
       }
 
       if (status !== 'disabled' && this.managedToolSessionFactory) {
-        const session = (this.managedToolSession ??=
-          this.managedToolSessionFactory(this));
+        const session = this.getManagedToolSession()!;
         const managedTool = createManagedBuiltinTool(
           toolName,
           this,
@@ -9165,11 +9317,6 @@ export class Config {
             if (this.shutdownRequested || this.managedToolSessionClosing) {
               return Promise.reject(
                 new Error('Managed tool Session is closing.'),
-              );
-            }
-            if (isDerivedConfig(this)) {
-              return Promise.reject(
-                new Error('Managed child Agent execution scope is not bound.'),
               );
             }
             return session.getClient();

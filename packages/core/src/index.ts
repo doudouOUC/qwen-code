@@ -112,6 +112,8 @@ export * from './tools/tool-registry.js';
 export * from './tools/tools.js';
 export * from './tools/managed-tool-protocol.js';
 export * from './tools/managed-tool-runtime.js';
+export * from './tools/managed-tool-file-history.js';
+export * from './tools/managed-tool-file-history-protocol.js';
 export * from './tools/runtime-backed-tool.js';
 export * from './tools/managed-tool-session.js';
 export * from './tools/builtin-tool-definitions.js';

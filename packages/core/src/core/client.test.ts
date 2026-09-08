@@ -103,7 +103,6 @@ import {
 import { GOAL_HOOK_ID_OUTPUT_KEY } from '../goals/goalHook.js';
 import { emptyGoalSnapshot } from '../goals/goal-protocol.js';
 import type { GoalRuntime } from '../goals/goal-runtime.js';
-import type { FileHistorySnapshot } from '../services/fileHistoryService.js';
 import { runWithAgentContext } from '../agents/runtime/agent-context.js';
 import {
   clearCacheSafeParams,
@@ -649,6 +648,7 @@ describe('Gemini Client (client.ts)', () => {
       assertCanStartTurn: vi.fn().mockResolvedValue(undefined),
       getChatRecordingService: vi.fn().mockReturnValue(undefined),
       getFileHistoryService: vi.fn().mockReturnValue(mockFileHistoryService),
+      makeFileHistorySnapshot: vi.fn().mockResolvedValue(undefined),
       getResumedSessionData: vi.fn().mockReturnValue(undefined),
       getSessionRestoreRuntime: vi.fn().mockReturnValue(undefined),
       getArenaAgentClient: vi.fn().mockReturnValue(null),
@@ -13688,31 +13688,8 @@ Other open files:
       });
     });
 
-    describe('file history snapshot persistence', () => {
-      let recordFileHistorySnapshot: ReturnType<typeof vi.fn>;
-      const latestSnapshot: FileHistorySnapshot = {
-        promptId: 'prompt-uq',
-        timestamp: new Date('2026-06-13T00:00:00.000Z'),
-        trackedFileBackups: {
-          'a.txt': {
-            backupFileName: 'backup-a',
-            version: 1,
-            backupTime: new Date('2026-06-13T00:00:01.000Z'),
-          },
-        },
-      };
-
+    describe('file history checkpoint delegation', () => {
       beforeEach(() => {
-        recordFileHistorySnapshot = vi.fn();
-        mockFileHistoryService.makeSnapshot.mockResolvedValue(undefined);
-        mockFileHistoryService.getSnapshots.mockReturnValue([latestSnapshot]);
-        vi.mocked(mockConfig.getChatRecordingService).mockReturnValue({
-          recordAttributionSnapshot: vi.fn(),
-          recordFileHistorySnapshot,
-          recordUserMessage: vi.fn(),
-          recordCronPrompt: vi.fn(),
-        } as unknown as ReturnType<Config['getChatRecordingService']>);
-
         mockTurnRunFn.mockReturnValue(
           (async function* () {
             yield { type: LlmEventType.Content, value: 'ok' };
@@ -13737,44 +13714,27 @@ Other open files:
         return chunks;
       }
 
-      it('calls makeSnapshot for UserQuery turns', async () => {
+      it('calls the Config checkpoint for UserQuery turns', async () => {
         await collectStream(SendMessageType.UserQuery, 'prompt-file-history');
 
-        expect(mockFileHistoryService.makeSnapshot).toHaveBeenCalledWith(
-          'prompt-file-history',
-        );
+        expect(
+          vi.mocked(mockConfig.makeFileHistorySnapshot),
+        ).toHaveBeenCalledWith('prompt-file-history');
       });
 
-      it('records the latest snapshot after a UserQuery snapshot', async () => {
-        await collectStream(SendMessageType.UserQuery);
-
-        expect(recordFileHistorySnapshot).toHaveBeenCalledWith(latestSnapshot);
-      });
-
-      it('does not call makeSnapshot for ToolResult and Retry turns', async () => {
+      it('does not call the Config checkpoint for ToolResult and Retry turns', async () => {
         await collectStream(SendMessageType.ToolResult, 'prompt-tool-result');
         await collectStream(SendMessageType.Retry, 'prompt-retry');
 
-        expect(mockFileHistoryService.makeSnapshot).not.toHaveBeenCalled();
+        expect(
+          vi.mocked(mockConfig.makeFileHistorySnapshot),
+        ).not.toHaveBeenCalled();
       });
 
-      it('swallows makeSnapshot rejection and still yields content', async () => {
-        mockFileHistoryService.makeSnapshot.mockRejectedValueOnce(
+      it('swallows the Config checkpoint rejection and still yields content', async () => {
+        vi.mocked(mockConfig.makeFileHistorySnapshot).mockRejectedValueOnce(
           new Error('snapshot failed'),
         );
-
-        const chunks = await collectStream(SendMessageType.UserQuery);
-
-        expect(chunks).toContainEqual({
-          type: LlmEventType.Content,
-          value: 'ok',
-        });
-      });
-
-      it('swallows recordFileHistorySnapshot errors and still yields content', async () => {
-        recordFileHistorySnapshot.mockImplementationOnce(() => {
-          throw new Error('record failed');
-        });
 
         const chunks = await collectStream(SendMessageType.UserQuery);
 

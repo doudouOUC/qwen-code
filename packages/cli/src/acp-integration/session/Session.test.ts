@@ -975,6 +975,7 @@ describe('Session', () => {
       getMonitorRegistry: vi.fn().mockReturnValue(mockMonitorRegistry),
       getWorkflowRunRegistry: vi.fn().mockReturnValue(mockWorkflowRunRegistry),
       getFileHistoryService: vi.fn().mockReturnValue(mockFileHistoryService),
+      makeFileHistorySnapshot: vi.fn().mockResolvedValue(undefined),
       getDisabledSkillNames: vi.fn().mockReturnValue(new Set<string>()),
       setSubSessionSpawner: vi.fn(),
       getSubSessionSpawner: vi.fn(),
@@ -8537,19 +8538,7 @@ describe('Session', () => {
       expect(observed).toEqual([rootContext, undefined, undefined]);
     });
 
-    it('records the latest file history snapshot after makeSnapshot', async () => {
-      const latestSnapshot = {
-        promptId: 'test-session-id########1',
-        timestamp: new Date('2026-06-13T00:00:00.000Z'),
-        trackedFileBackups: {
-          'a.txt': {
-            backupFileName: 'backup-a',
-            version: 1,
-            backupTime: new Date('2026-06-13T00:00:01.000Z'),
-          },
-        },
-      };
-      mockFileHistoryService.getSnapshots.mockReturnValue([latestSnapshot]);
+    it('delegates the actual user-turn checkpoint to Config', async () => {
       mockChat.sendMessageStream = vi
         .fn()
         .mockResolvedValue(createEmptyStream());
@@ -8559,12 +8548,10 @@ describe('Session', () => {
         prompt: [{ type: 'text', text: 'edit file' }],
       });
 
-      expect(mockFileHistoryService.makeSnapshot).toHaveBeenCalledWith(
+      expect(mockConfig.makeFileHistorySnapshot).toHaveBeenCalledWith(
         'test-session-id########1',
       );
-      expect(
-        mockChatRecordingService.recordFileHistorySnapshot,
-      ).toHaveBeenCalledWith(latestSnapshot);
+      expect(mockFileHistoryService.makeSnapshot).not.toHaveBeenCalled();
     });
 
     it('fires MessageDisplay with cumulative non-thought text and is_final on the ACP prompt path', async () => {

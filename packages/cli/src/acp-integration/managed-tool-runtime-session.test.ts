@@ -14,6 +14,7 @@ import type { ManagedToolV2Client } from '@qwen-code/acp-bridge/bridgeTypes';
 import { SERVE_CONTROL_EXT_METHODS as methods } from '@qwen-code/acp-bridge/status';
 import {
   dispatchManagedToolRuntimeRequest,
+  isManagedToolRuntimeDrainMethod,
   parseManagedToolRuntimeSessionId,
 } from './managed-tool-runtime-session.js';
 
@@ -83,6 +84,75 @@ function makeClient() {
 }
 
 describe('managed tool Runtime ACP request dispatch', () => {
+  it('dispatches strictly parsed file history methods and admits only snapshots during draining', async () => {
+    const state = { ownerSessionId: sessionId, revision: 0, snapshots: [] };
+    const binding = {
+      ownerSessionId: sessionId,
+      ownerRuntimeSessionId: sessionId,
+      executionCwd: process.cwd(),
+      snapshots: [],
+    };
+    const fileHistory = {
+      bind: vi.fn().mockResolvedValue(state),
+      checkpoint: vi.fn().mockResolvedValue(state),
+      snapshot: vi.fn().mockResolvedValue(state),
+    };
+    const client = { ...makeClient(), fileHistory };
+    for (const [method, fields] of [
+      [methods.sessionManagedToolV2BindHistory, { binding }],
+      [methods.sessionManagedToolV2Checkpoint, { promptId: 'parent-turn' }],
+      [methods.sessionManagedToolV2History, {}],
+    ] as const) {
+      await expect(
+        dispatchManagedToolRuntimeRequest(client, method, {
+          sessionId,
+          ...fields,
+        }),
+      ).resolves.toEqual(state);
+      expect(isManagedToolRuntimeDrainMethod(method)).toBe(
+        method === methods.sessionManagedToolV2History,
+      );
+    }
+    expect(fileHistory.bind).toHaveBeenCalledExactlyOnceWith(binding);
+    expect(fileHistory.checkpoint).toHaveBeenCalledExactlyOnceWith(
+      'parent-turn',
+    );
+    expect(fileHistory.snapshot).toHaveBeenCalledExactlyOnceWith();
+    for (const [method, fields] of [
+      [
+        methods.sessionManagedToolV2BindHistory,
+        { binding: { ...binding, extra: true } },
+      ],
+      [methods.sessionManagedToolV2Checkpoint, { promptId: '' }],
+      [methods.sessionManagedToolV2History, { binding }],
+    ] as const) {
+      await expect(
+        dispatchManagedToolRuntimeRequest(client, method, {
+          sessionId,
+          ...fields,
+        }),
+      ).rejects.toThrow();
+    }
+    expect(fileHistory.bind).toHaveBeenCalledOnce();
+    expect(fileHistory.checkpoint).toHaveBeenCalledOnce();
+    expect(fileHistory.snapshot).toHaveBeenCalledOnce();
+    fileHistory.snapshot.mockResolvedValueOnce({ ...state, revision: -1 });
+    await expect(
+      dispatchManagedToolRuntimeRequest(
+        client,
+        methods.sessionManagedToolV2History,
+        { sessionId },
+      ),
+    ).rejects.toThrow();
+    await expect(
+      dispatchManagedToolRuntimeRequest(
+        makeClient(),
+        methods.sessionManagedToolV2History,
+        { sessionId },
+      ),
+    ).rejects.toThrow('unavailable');
+  });
+
   it('awaits asynchronous clients and preserves all nine operation results', async () => {
     const client = makeClient();
     const dispatch = (method: string, fields = {}) =>

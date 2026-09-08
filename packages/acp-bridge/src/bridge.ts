@@ -45,6 +45,10 @@ import {
   canonicalSessionPrUrl,
   normalizeTurnResultError,
   normalizeSnapshotPayload,
+  parseManagedToolFileHistoryBinding,
+  parseManagedToolFileHistoryPromptId,
+  parseManagedToolFileHistoryState,
+  ManagedToolProtocolError,
   ShellExecutionService,
   type InvocationContextV1,
   type ShellOutputEvent,
@@ -12177,6 +12181,35 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
         );
       };
       return {
+        fileHistory: {
+          bind: async (binding) => {
+            const parsed = parseManagedToolFileHistoryBinding(binding);
+            const state = parseManagedToolFileHistoryState(
+              await call(
+                SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2BindHistory,
+                { binding: parsed },
+              ),
+            );
+            if (state.ownerSessionId !== parsed.ownerSessionId)
+              throw new ManagedToolProtocolError(
+                'Managed file history owner changed.',
+              );
+            return state;
+          },
+          checkpoint: async (promptId) =>
+            parseManagedToolFileHistoryState(
+              await call(
+                SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Checkpoint,
+                {
+                  promptId: parseManagedToolFileHistoryPromptId(promptId),
+                },
+              ),
+            ),
+          snapshot: async () =>
+            parseManagedToolFileHistoryState(
+              await call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2History),
+            ),
+        },
         manifest: () =>
           call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Manifest),
         beginTurn: async (identity) => {

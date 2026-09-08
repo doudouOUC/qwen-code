@@ -3397,20 +3397,7 @@ export class LlmClient {
 
         if (messageType === SendMessageType.UserQuery) {
           try {
-            await this.config.getFileHistoryService().makeSnapshot(prompt_id);
-            try {
-              const latestSnapshot = this.config
-                .getFileHistoryService()
-                .getSnapshots()
-                .at(-1);
-              if (latestSnapshot) {
-                this.config
-                  .getChatRecordingService()
-                  ?.recordFileHistorySnapshot(latestSnapshot);
-              }
-            } catch (e) {
-              debugLogger.error(`FileHistory: recordSnapshot failed: ${e}`);
-            }
+            await this.config.makeFileHistorySnapshot(prompt_id);
           } catch (e) {
             debugLogger.error(`FileHistory: makeSnapshot failed: ${e}`);
           }
