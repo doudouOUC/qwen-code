@@ -185,6 +185,7 @@ import type {
   SessionInfo,
   SessionUpdate,
   SessionModeState,
+  Stream,
   SetSessionConfigOptionRequest,
   SetSessionConfigOptionResponse,
   SetSessionModelRequest,
@@ -197,6 +198,7 @@ import {
   pickAuthMethodsForAuthRequired,
 } from './authMethods.js';
 import { AcpFileSystemService } from './service/filesystem.js';
+import { bindAcpConnectionLifetime } from './acp-connection-lifetime.js';
 import { ndJsonStream } from '@qwen-code/acp-bridge/ndJsonStream';
 import {
   ACP_EVENT_LOOP_STALL_RESTART_MS,
@@ -2678,16 +2680,27 @@ async function addRuntimeMcpServer(
   }
 }
 
-export async function runAcpAgent(
+export interface AcpAgentOptions {
+  privateParentCapability?: string;
+  externalToolGuardRequired?: boolean;
+  externalToolGuardProviderAttached?: boolean;
+}
+
+export interface AcpAgentHost {
+  connection: AgentSideConnection;
+  getActiveSessions(): Session[];
+  isTrustedManagedParent(): boolean;
+  dispose(reason: SessionEndReason): Promise<void>;
+}
+
+// The caller owns the transport: close it before awaiting host disposal.
+export async function createAcpAgentHost(
   config: Config,
   settings: LoadedSettings,
   argv: CliArgs,
-  options?: {
-    privateParentCapability?: string;
-    externalToolGuardRequired?: boolean;
-    externalToolGuardProviderAttached?: boolean;
-  },
-) {
+  createStream: () => Stream,
+  options: AcpAgentOptions = {},
+): Promise<AcpAgentHost> {
   // Freeze the restart-required writer protocol before the first await.
   // Per-request settings reloads must not mix leased and legacy writers
   // within one ACP process lifetime.
@@ -2695,14 +2708,7 @@ export async function runAcpAgent(
     typeof config.isSessionWriterLeaseEnabled === 'function'
       ? config.isSessionWriterLeaseEnabled()
       : settings.merged.experimental?.sessionWriterLease === true;
-  const privateParentCapability =
-    options === undefined
-      ? process.env[PRIVATE_ACP_CAPABILITY_ENV]
-      : options.privateParentCapability;
-  delete process.env[PRIVATE_ACP_CAPABILITY_ENV];
-  delete process.env[PRIVATE_EXTERNAL_TOOL_GUARD_ENV];
-  delete process.env[PRIVATE_EXTERNAL_TOOL_GUARD_PROVIDER_ENV];
-  delete process.env[EXTERNAL_TOOL_GUARD_TOKEN_ENV];
+  const privateParentCapability = options.privateParentCapability;
   const externalToolGuardRequired = options?.externalToolGuardRequired === true;
   const externalToolGuardProviderAttached =
     options?.externalToolGuardProviderAttached === true;
@@ -2712,183 +2718,18 @@ export async function runAcpAgent(
     );
   }
 
-  // Reverse tool channel (issue #5626, Phase 2). Runtime-MCP-add targets the
-  // BOOTSTRAP (workspace-level) config's `McpClientManager` — `this.config` in
-  // the `workspaceMcpRuntimeAdd` handler — so a client-hosted MCP server's SDK
-  // callback must be bound HERE, not only on per-session configs. The ACP
-  // `connection` doesn't exist until `new AgentSideConnection` runs below, so
-  // the sender is late-bound: it reads the connection lazily when the agent
-  // first drives the client-hosted server. Filled synchronously by the
-  // `AgentSideConnection` callback before any MCP frame can flow.
-  let acpConnection: AgentSideConnection | undefined;
-  const bootstrapClientMcpSender: SendSdkMcpMessage = (serverName, message) =>
-    deliverClientMcpMessage(acpConnection, serverName, message);
-
-  beginAcpBootstrapConfigProfiling();
-  try {
-    await config.initialize({
-      skipLlmInitialization: true,
-      // Bootstrap skips MCP discovery — each session runs its own
-      // pool-routed discovery, so bootstrap-level spawns would be
-      // redundant subprocess leaks (W119).
-      skipMcpDiscovery: true,
-      // Bind the workspace-level manager's SDK callback so a runtime-added
-      // client-hosted MCP server (#5626) round-trips over the parent WS.
-      sendSdkMcpMessage: bootstrapClientMcpSender,
-    });
-  } finally {
-    endAcpBootstrapConfigProfiling();
-  }
-  // The ACP path exits llm.tsx before its startup-warning printing runs,
-  // so config warnings (including initialize-time ones like the WebSearch
-  // enablement notice) would otherwise vanish. stderr lands in the client's
-  // logs without interfering with the ACP protocol on stdout.
-  // Defensive `typeof` for tests that stub Config without getWarnings.
-  const startupWarnings =
-    typeof config.getWarnings === 'function' ? config.getWarnings() : [];
-  for (const warning of startupWarnings) {
-    process.stderr.write(`${warning}\n`);
-  }
-  const eventLoopMonitor = startEventLoopLagMonitor({
-    suspendThresholdMs: ACP_EVENT_LOOP_STALL_RESTART_MS,
-    onNewMaxStall: (maxMs) => {
-      console.error(`[perf] acp agent event loop stall: max=${maxMs}ms`);
-    },
-  });
-
   let agentInstance: QwenAgent | undefined;
-  let connection: AgentSideConnection;
-  markAcpStartup('transportSetupStart');
-  try {
-    const stdout = Writable.toWeb(process.stdout) as WritableStream;
-    const stdin = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
+  const lifetime = new AbortController();
+  let initialized = false;
+  const drainPool = () => agentInstance?.shutdownMcpPool(8_000);
 
-    // Stdout is used to send messages to the client, so console.log/console.info
-    // messages to stderr so that they don't interfere with ACP.
-    console.log = console.error;
-    console.info = console.error;
-    console.debug = console.error;
-
-    let initializeRequestId: string | number | null | undefined;
-    const pendingNewSessionRequestIds = new Set<string | number | null>();
-    const stream = ndJsonStream(stdout, stdin, {
-      onMessageObserved: ({ direction, bytes, message }) => {
-        if (direction === 'sent') {
-          observeAcpToolResultWire(message, bytes);
-        }
-        if (
-          direction === 'received' &&
-          'id' in message &&
-          'method' in message
-        ) {
-          if (message.method === 'session/new') {
-            pendingNewSessionRequestIds.add(message.id);
-          } else if (message.method === 'initialize') {
-            initializeRequestId = message.id;
-          }
-          return;
-        }
-        if (
-          direction === 'sent' &&
-          'id' in message &&
-          !('method' in message) &&
-          pendingNewSessionRequestIds.delete(message.id) &&
-          'result' in message &&
-          typeof message.result === 'object' &&
-          message.result !== null &&
-          'sessionId' in message.result &&
-          typeof message.result.sessionId === 'string'
-        ) {
-          const sessionId = message.result.sessionId;
-          setImmediate(() => {
-            const session = agentInstance
-              ?.getActiveSessions()
-              .find((candidate) => candidate.getId() === sessionId);
-            if (!session) return;
-            void preloadContentGenerator(
-              session.getConfig().getContentGenerator(),
-            ).catch((error: unknown) => {
-              debugLogger.debug(
-                `[ACP] Session provider preload failed for ${sessionId}: ${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-            });
-          }).unref();
-        }
-        if (
-          direction !== 'sent' ||
-          initializeRequestId === undefined ||
-          !('id' in message) ||
-          'method' in message ||
-          message.id !== initializeRequestId
-        ) {
-          return;
-        }
-        initializeRequestId = undefined;
-        if ('result' in message) {
-          void initializeTelemetry(config).then(() => {
-            registerAcpEventLoopLagGauge(() => eventLoopMonitor.snapshot());
-          });
-        }
-      },
-    });
-    connection = new AgentSideConnection((conn) => {
-      acpConnection = conn;
-      const managedToolInvocationGuard = externalToolGuardRequired
-        ? createManagedExternalToolGuard(conn, {
-            externalProviderAttached: externalToolGuardProviderAttached,
-          })
-        : undefined;
-      agentInstance = new QwenAgent(
-        config,
-        settings,
-        argv,
-        conn,
-        privateParentCapability,
-        sessionWriterLeaseEnabledAtStartup,
-        managedToolInvocationGuard,
-        externalToolGuardProviderAttached,
-      );
-      return agentInstance;
-    }, stream);
-    markAcpStartup('transportSetupEnd');
-  } catch (err) {
-    eventLoopMonitor.dispose();
-    throw err;
-  }
-
-  // Both the SIGTERM handler and the IDE-initiated close path need
-  // to drain the MCP pool before runExitCleanup. Single helper
-  // closure keeps the timeout + log labels consistent.
-  const drainPoolBeforeExit = async (
-    label: string,
-    strict = false,
-  ): Promise<void> => {
-    if (!agentInstance) return;
-    try {
-      await agentInstance.shutdownMcpPool(8_000);
-    } catch (err) {
-      debugLogger.error(`[ACP] MCP pool drain (${label}) error:`, err);
-      if (strict) throw err;
-    }
-  };
-
-  // Handle SIGTERM/SIGINT for graceful shutdown.
-  // Without this, signal handlers registered elsewhere in the CLI
-  // (e.g., stdin raw mode restoration) override the default exit behavior,
-  // causing the ACP process to ignore termination signals.
-  let shuttingDown = false;
-  let managedShutdownPromise: Promise<void> | undefined;
   let sessionEndFired = false;
 
-  // Helper to fire SessionEnd hook once, preventing double-fire from both
-  // shutdown handler path and connection.closed path.
   const fireSessionEndOnce = async (
     reason: SessionEndReason,
     managedConfigs?: Config[],
   ) => {
-    if (sessionEndFired) return;
+    if (!initialized || sessionEndFired) return;
     sessionEndFired = true;
 
     const configs = new Set<Config>(managedConfigs ?? [config]);
@@ -2929,62 +2770,302 @@ export async function runAcpAgent(
     }
   };
 
-  const shutdownManagedAgent = (
+  const shutdownManagedAgent = async (
     reason: SessionEndReason,
-    label: string,
   ): Promise<void> => {
-    if (managedShutdownPromise) return managedShutdownPromise;
     const agent = agentInstance;
-    if (!agent?.isTrustedManagedParent()) {
-      return Promise.reject(
-        new Error('Managed shutdown requires a trusted private parent'),
+    if (!agent) return;
+    const terminal = agent.beginManagedShutdown();
+    const failures: unknown[] = [];
+    try {
+      await terminal.writerShutdown;
+    } catch (error) {
+      failures.push(error);
+      debugLogger.error('[ACP] Managed writer shutdown error:', error);
+      const retainedLockPaths = terminal.configs.flatMap((config) => {
+        if (
+          typeof config.getSessionRuntimeBaseDir !== 'function' ||
+          typeof config.getSessionId !== 'function'
+        ) {
+          return [];
+        }
+        return [
+          path.join(
+            config.getSessionRuntimeBaseDir(),
+            'tmp',
+            'session-writer-locks',
+            `${encodeURIComponent(config.getSessionId())}.lock`,
+          ),
+        ];
+      });
+      writeStderrLineSafe(
+        'qwen --acp: managed session writer shutdown failed; a writer lock may be retained for safety. ' +
+          'Verify that no previous writer is running before manual cleanup.' +
+          (retainedLockPaths.length > 0
+            ? ` Candidate lock paths: ${retainedLockPaths.join(', ')}`
+            : ''),
       );
     }
-    const terminal = agent.beginManagedShutdown();
-    managedShutdownPromise = (async () => {
+    try {
+      await fireSessionEndOnce(reason, terminal.configs);
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await agent.shutdownWorkspaceMcpDiscovery();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await agent.finishManagedShutdown(terminal.configs);
+    } catch (error) {
+      failures.push(error);
+      debugLogger.error('[ACP] Managed resource shutdown error:', error);
+    }
+    try {
+      await drainPool();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Managed ACP shutdown failed');
+    }
+  };
+
+  let disposePromise: Promise<void> | undefined;
+  const dispose = (reason: SessionEndReason): Promise<void> => {
+    lifetime.abort();
+    agentInstance?.stopAdmission();
+    disposePromise ??= (async () => {
+      if (agentInstance?.isTrustedManagedParent()) {
+        await shutdownManagedAgent(reason);
+        return;
+      }
+      const failures: unknown[] = [];
+      for (const cleanup of [
+        () => fireSessionEndOnce(reason),
+        () => agentInstance?.shutdownWorkspaceMcpDiscovery(),
+        () => agentInstance?.disposeSessions(),
+        () =>
+          config.shutdown({
+            shutdownTelemetry: false,
+            strictResourceCleanup: true,
+          }),
+        () => drainPool(),
+      ]) {
+        try {
+          await cleanup();
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (failures.length > 0) {
+        throw new AggregateError(failures, 'ACP host shutdown failed');
+      }
+    })();
+    return disposePromise;
+  };
+
+  try {
+    // Reverse tool channel (issue #5626, Phase 2). Runtime-MCP-add targets the
+    // BOOTSTRAP (workspace-level) config's `McpClientManager` — `this.config` in
+    // the `workspaceMcpRuntimeAdd` handler — so a client-hosted MCP server's SDK
+    // callback must be bound HERE, not only on per-session configs. The ACP
+    // `connection` doesn't exist until `new AgentSideConnection` runs below, so
+    // the sender is late-bound: it reads the connection lazily when the agent
+    // first drives the client-hosted server. Filled synchronously by the
+    // `AgentSideConnection` callback before any MCP frame can flow.
+    let acpConnection: AgentSideConnection | undefined;
+    const bootstrapClientMcpSender: SendSdkMcpMessage = (serverName, message) =>
+      deliverClientMcpMessage(acpConnection, serverName, message);
+
+    await config.initialize({
+      skipLlmInitialization: true,
+      // Bootstrap skips MCP discovery — each session runs its own
+      // pool-routed discovery, so bootstrap-level spawns would be
+      // redundant subprocess leaks (W119).
+      skipMcpDiscovery: true,
+      // Bind the workspace-level manager's SDK callback so a runtime-added
+      // client-hosted MCP server (#5626) round-trips over the parent WS.
+      sendSdkMcpMessage: bootstrapClientMcpSender,
+    });
+    initialized = true;
+    const connection = new AgentSideConnection((conn) => {
+      acpConnection = bindAcpConnectionLifetime(conn, lifetime.signal);
+      const managedToolInvocationGuard = externalToolGuardRequired
+        ? createManagedExternalToolGuard(acpConnection, {
+            externalProviderAttached: externalToolGuardProviderAttached,
+          })
+        : undefined;
+      agentInstance = new QwenAgent(
+        config,
+        settings,
+        argv,
+        acpConnection,
+        privateParentCapability,
+        sessionWriterLeaseEnabledAtStartup,
+        managedToolInvocationGuard,
+        externalToolGuardProviderAttached,
+      );
+      return agentInstance;
+    }, createStream());
+    void connection.closed.then(() => lifetime.abort());
+    return {
+      connection: acpConnection ?? connection,
+      getActiveSessions: () => agentInstance?.getActiveSessions() ?? [],
+      isTrustedManagedParent: () =>
+        agentInstance?.isTrustedManagedParent() ?? false,
+      dispose,
+    };
+  } catch (error) {
+    try {
+      await dispose(SessionEndReason.Other);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        'ACP host startup failed',
+      );
+    }
+    throw error;
+  }
+}
+
+export async function runAcpAgent(
+  config: Config,
+  settings: LoadedSettings,
+  argv: CliArgs,
+  options?: AcpAgentOptions,
+) {
+  const privateParentCapability =
+    options === undefined
+      ? process.env[PRIVATE_ACP_CAPABILITY_ENV]
+      : options.privateParentCapability;
+  delete process.env[PRIVATE_ACP_CAPABILITY_ENV];
+  delete process.env[PRIVATE_EXTERNAL_TOOL_GUARD_ENV];
+  delete process.env[PRIVATE_EXTERNAL_TOOL_GUARD_PROVIDER_ENV];
+  delete process.env[EXTERNAL_TOOL_GUARD_TOKEN_ENV];
+  let host: AcpAgentHost | undefined;
+  let eventLoopMonitor: ReturnType<typeof startEventLoopLagMonitor> | undefined;
+  beginAcpBootstrapConfigProfiling();
+  try {
+    host = await createAcpAgentHost(
+      config,
+      settings,
+      argv,
+      () => {
+        endAcpBootstrapConfigProfiling();
+        // The ACP path exits llm.tsx before its startup-warning printing runs,
+        // so config warnings (including initialize-time ones like the WebSearch
+        // enablement notice) would otherwise vanish. stderr lands in the client's
+        // logs without interfering with the ACP protocol on stdout.
+        // Defensive `typeof` for tests that stub Config without getWarnings.
+        const startupWarnings =
+          typeof config.getWarnings === 'function' ? config.getWarnings() : [];
+        for (const warning of startupWarnings) {
+          process.stderr.write(`${warning}\n`);
+        }
+        eventLoopMonitor = startEventLoopLagMonitor({
+          suspendThresholdMs: ACP_EVENT_LOOP_STALL_RESTART_MS,
+          onNewMaxStall: (maxMs) => {
+            console.error(`[perf] acp agent event loop stall: max=${maxMs}ms`);
+          },
+        });
+
+        markAcpStartup('transportSetupStart');
+        const stdout = Writable.toWeb(process.stdout) as WritableStream;
+        const stdin = Readable.toWeb(
+          process.stdin,
+        ) as ReadableStream<Uint8Array>;
+
+        // Stdout is used to send messages to the client, so console.log/console.info
+        // messages to stderr so that they don't interfere with ACP.
+        console.log = console.error;
+        console.info = console.error;
+        console.debug = console.error;
+
+        let initializeRequestId: string | number | null | undefined;
+        const pendingNewSessionRequestIds = new Set<string | number | null>();
+        const stream = ndJsonStream(stdout, stdin, {
+          onMessageObserved: ({ direction, bytes, message }) => {
+            if (direction === 'sent') {
+              observeAcpToolResultWire(message, bytes);
+            }
+            if (
+              direction === 'received' &&
+              'id' in message &&
+              'method' in message
+            ) {
+              if (message.method === 'session/new') {
+                pendingNewSessionRequestIds.add(message.id);
+              } else if (message.method === 'initialize') {
+                initializeRequestId = message.id;
+              }
+              return;
+            }
+            if (
+              direction === 'sent' &&
+              'id' in message &&
+              !('method' in message) &&
+              pendingNewSessionRequestIds.delete(message.id) &&
+              'result' in message &&
+              typeof message.result === 'object' &&
+              message.result !== null &&
+              'sessionId' in message.result &&
+              typeof message.result.sessionId === 'string'
+            ) {
+              const sessionId = message.result.sessionId;
+              setImmediate(() => {
+                const session = host
+                  ?.getActiveSessions()
+                  .find((candidate) => candidate.getId() === sessionId);
+                if (!session) return;
+                void preloadContentGenerator(
+                  session.getConfig().getContentGenerator(),
+                ).catch((error: unknown) => {
+                  debugLogger.debug(
+                    `[ACP] Session provider preload failed for ${sessionId}: ${
+                      error instanceof Error ? error.message : String(error)
+                    }`,
+                  );
+                });
+              }).unref();
+            }
+            if (
+              direction !== 'sent' ||
+              initializeRequestId === undefined ||
+              !('id' in message) ||
+              'method' in message ||
+              message.id !== initializeRequestId
+            ) {
+              return;
+            }
+            initializeRequestId = undefined;
+            if ('result' in message) {
+              void initializeTelemetry(config).then(() => {
+                registerAcpEventLoopLagGauge(() =>
+                  eventLoopMonitor!.snapshot(),
+                );
+              });
+            }
+          },
+        });
+        return stream;
+      },
+      { ...options, privateParentCapability },
+    );
+    markAcpStartup('transportSetupEnd');
+  } catch (error) {
+    endAcpBootstrapConfigProfiling();
+    eventLoopMonitor?.dispose();
+    throw error;
+  }
+
+  let processCleanupPromise: Promise<void> | undefined;
+  const dispose = (reason: SessionEndReason): Promise<void> => {
+    processCleanupPromise ??= (async () => {
       const failures: unknown[] = [];
       try {
-        await terminal.writerShutdown;
-      } catch (error) {
-        failures.push(error);
-        debugLogger.error('[ACP] Managed writer shutdown error:', error);
-        const retainedLockPaths = terminal.configs.flatMap((config) => {
-          if (
-            typeof config.getSessionRuntimeBaseDir !== 'function' ||
-            typeof config.getSessionId !== 'function'
-          ) {
-            return [];
-          }
-          return [
-            path.join(
-              config.getSessionRuntimeBaseDir(),
-              'tmp',
-              'session-writer-locks',
-              `${encodeURIComponent(config.getSessionId())}.lock`,
-            ),
-          ];
-        });
-        writeStderrLineSafe(
-          'qwen --acp: managed session writer shutdown failed; a writer lock may be retained for safety. ' +
-            'Verify that no previous writer is running before manual cleanup.' +
-            (retainedLockPaths.length > 0
-              ? ` Candidate lock paths: ${retainedLockPaths.join(', ')}`
-              : ''),
-        );
-      }
-      try {
-        await fireSessionEndOnce(reason, terminal.configs);
-      } catch (error) {
-        failures.push(error);
-      }
-      try {
-        await agent.finishManagedShutdown(terminal.configs);
-      } catch (error) {
-        failures.push(error);
-        debugLogger.error('[ACP] Managed resource shutdown error:', error);
-      }
-      try {
-        await drainPoolBeforeExit(label, true);
+        await host.dispose(reason);
       } catch (error) {
         failures.push(error);
       }
@@ -2998,95 +3079,51 @@ export async function runAcpAgent(
         throw new AggregateError(failures, 'Managed ACP shutdown failed');
       }
     })();
-    return managedShutdownPromise;
+    return processCleanupPromise;
   };
-
+  let shuttingDown = false;
   const shutdownHandler = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    debugLogger.debug('[ACP] Shutdown signal received, closing streams');
-
-    if (agentInstance?.isTrustedManagedParent()) {
-      let exitCode = 0;
-      try {
-        await shutdownManagedAgent(SessionEndReason.Other, 'signal');
-      } catch (err) {
-        exitCode = 1;
-        debugLogger.error('[ACP] Managed shutdown error:', err);
-      } finally {
-        eventLoopMonitor.dispose();
-      }
-      try {
-        process.stdin.destroy();
-        process.stdout.destroy();
-      } catch {
-        // streams may already be closed
-      }
-      process.exit(exitCode);
-      return;
-    }
-
+    let exitCode = 0;
     try {
-      // Fire SessionEnd hook for all active sessions (aligned with core path)
-      await fireSessionEndOnce(SessionEndReason.Other);
-      await agentInstance?.disposeSessions();
-
-      try {
-        process.stdin.destroy();
-      } catch {
-        // stdin may already be closed
-      }
-      try {
-        process.stdout.destroy();
-      } catch {
-        // stdout may already be closed
-      }
-      // Drain the workspace MCP pool BEFORE runExitCleanup so the
-      // descendant pid sweep can SIGTERM wrapper grandchildren.
-      await drainPoolBeforeExit('signal');
-    } catch (err) {
-      debugLogger.error('[ACP] Shutdown error:', err);
+      await dispose(SessionEndReason.Other);
+    } catch (error) {
+      if (host.isTrustedManagedParent()) exitCode = 1;
+      debugLogger.error('[ACP] Shutdown error:', error);
     } finally {
-      eventLoopMonitor.dispose();
+      eventLoopMonitor?.dispose();
     }
-    // Clean up child processes (MCP servers, etc.) and force exit.
-    // Without this, orphan subprocesses keep the Node.js event loop alive
-    // and the CLI process never terminates after the IDE disconnects.
-    runExitCleanup()
-      .catch((err) => {
-        debugLogger.error('[ACP] Cleanup error:', err);
-      })
-      .finally(() => {
-        process.exit(0);
-      });
+    try {
+      process.stdin.destroy();
+    } catch {
+      // stdin may already be closed
+    }
+    try {
+      process.stdout.destroy();
+    } catch {
+      // stdout may already be closed
+    }
+    process.exit(exitCode);
   };
   process.on('SIGTERM', shutdownHandler);
   process.on('SIGINT', shutdownHandler);
-
   try {
-    await connection.closed;
-    if (agentInstance?.isTrustedManagedParent()) {
+    await host.connection.closed;
+    if (host.isTrustedManagedParent()) {
       try {
-        await shutdownManagedAgent(
-          SessionEndReason.PromptInputExit,
-          'ide_close',
-        );
+        await dispose(SessionEndReason.PromptInputExit);
       } catch (error) {
         process.exitCode = 1;
         throw error;
       }
     } else {
-      // Connection closed by IDE - fire SessionEnd hook (aligned with core path)
-      await fireSessionEndOnce(SessionEndReason.PromptInputExit);
-      // Mirror the SIGTERM handler's pool drain on the IDE-initiated
-      // normal close path to avoid leaking shared MCP entries.
-      await drainPoolBeforeExit('ide_close');
-      await agentInstance?.disposeSessions();
+      await host.dispose(SessionEndReason.PromptInputExit);
     }
   } finally {
     process.off('SIGTERM', shutdownHandler);
     process.off('SIGINT', shutdownHandler);
-    eventLoopMonitor.dispose();
+    eventLoopMonitor?.dispose();
   }
 }
 
@@ -3457,6 +3494,11 @@ class QwenAgent implements Agent {
   private readonly detachedWorkflowRegistries = new Set<WorkflowRunRegistry>();
   private activePromptCalls = new Map<string, Set<ActivePromptCall>>();
   private workspaceMcpDiscoveryConfig: Config | undefined;
+  private workspaceMcpInitializingConfig: Config | undefined;
+  private readonly workspaceMcpCleanupErrors: unknown[] = [];
+  private readonly activeMcpControls = new Set<
+    Promise<Record<string, unknown>>
+  >();
   private workspaceMcpDiscoveryPromise: Promise<void> | undefined;
   private workspaceMcpDiscoveryError: string | undefined;
   private workspaceExtensionStatusRefreshPromise: Promise<void> | undefined;
@@ -3517,8 +3559,7 @@ class QwenAgent implements Agent {
    * Started at construction rather than on the first poll: the peaks that
    * matter include the ones reached before anyone asks.
    */
-  private readonly childHeapProbe: ChildHeapProbe | undefined =
-    shouldProbeChildHeap(process.env) ? startChildHeapProbe() : undefined;
+  private readonly childHeapProbe: ChildHeapProbe | undefined;
 
   /**
    * Workspace-shared MCP transport pool. Eagerly constructed; lazy
@@ -3542,6 +3583,13 @@ class QwenAgent implements Agent {
 
   isTrustedManagedParent(): boolean {
     return this.privateParentState === 'trusted';
+  }
+
+  stopAdmission(): void {
+    this.managedShuttingDown = true;
+    this.activeWorkReporter?.dispose();
+    this.activeWorkReporter = undefined;
+    this.childHeapProbe?.stop();
   }
 
   private assertManagedSessionAdmission(): void {
@@ -3622,7 +3670,7 @@ class QwenAgent implements Agent {
     if (!this.isTrustedManagedParent()) {
       throw new Error('Managed shutdown requires a trusted private parent');
     }
-    this.managedShuttingDown = true;
+    this.stopAdmission();
     for (const generation of this.generationControllers.values()) {
       generation.controller.abort();
     }
@@ -3769,10 +3817,12 @@ class QwenAgent implements Agent {
   ): Promise<void> {
     const errors: unknown[] = [];
     for (const config of this.getLiveMcpConfigs(serverName)) {
+      this.assertManagedSessionAdmission();
       try {
         const registry = config.getToolRegistry();
         if (operation === 'discover') {
           await registry?.discoverToolsForServer(serverName);
+          this.assertManagedSessionAdmission();
           const llmClient = config.getLlmClient?.();
           if (llmClient?.isInitialized?.()) {
             await llmClient.setTools?.();
@@ -3812,9 +3862,11 @@ class QwenAgent implements Agent {
     label: string,
     run: () => Promise<void>,
   ): { accepted: boolean } {
+    this.assertManagedSessionAdmission();
     const previous = this.workspaceMcpDiscoveryPromise ?? Promise.resolve();
     const tracked = previous
       .then(async () => {
+        this.assertManagedSessionAdmission();
         this.workspaceMcpDiscoveryError = undefined;
         await run();
       })
@@ -3861,8 +3913,10 @@ class QwenAgent implements Agent {
           buildDisabledSkillNamesProvider(settings),
         ),
       );
-      config.setMcpTransportPool(this.mcpPool);
+      this.workspaceMcpInitializingConfig = config;
       try {
+        this.assertManagedSessionAdmission();
+        config.setMcpTransportPool(this.mcpPool);
         await config.initialize({
           skipLlmInitialization: true,
           skipFileCheckpointing: true,
@@ -3871,11 +3925,13 @@ class QwenAgent implements Agent {
           skipMcpDiscovery: true,
           lenientToolWarmup: true,
         });
+        this.assertManagedSessionAdmission();
         const manager = config.getToolRegistry()?.getMcpClientManager();
         if (!manager) {
           throw new Error('MCP client manager is unavailable');
         }
         await manager.discoverAllMcpToolsIncremental(config);
+        this.assertManagedSessionAdmission();
         if (manager.getDiscoveryState() === MCPDiscoveryState.NOT_STARTED) {
           throw new Error(
             'MCP discovery did not start. The workspace may not be trusted.',
@@ -3884,13 +3940,52 @@ class QwenAgent implements Agent {
         this.workspaceMcpDiscoveryConfig = config;
       } catch (error) {
         try {
-          await config.getToolRegistry()?.stop();
-        } catch {
+          await config.shutdown({
+            shutdownTelemetry: false,
+            strictResourceCleanup: true,
+          });
+        } catch (cleanupError) {
+          this.workspaceMcpCleanupErrors.push(cleanupError);
           // Preserve the initialization failure that made this config unusable.
         }
         throw error;
+      } finally {
+        this.workspaceMcpInitializingConfig = undefined;
       }
     });
+  }
+
+  async shutdownWorkspaceMcpDiscovery(): Promise<void> {
+    const pending: Array<Promise<unknown>> = [...this.activeMcpControls];
+    if (this.workspaceMcpDiscoveryPromise) {
+      pending.push(this.workspaceMcpDiscoveryPromise);
+    }
+    const configs = [
+      this.workspaceMcpDiscoveryConfig,
+      this.workspaceMcpInitializingConfig,
+    ].filter((config): config is Config => config !== undefined);
+    const shutdown = () =>
+      Promise.allSettled(
+        [...new Set(configs)].map((config) =>
+          config.shutdown({
+            shutdownTelemetry: false,
+            strictResourceCleanup: true,
+          }),
+        ),
+      );
+    const results = await shutdown();
+    await Promise.allSettled(pending);
+    // In-flight discovery can finish opening a connection after the first stop.
+    // Drain it before the host disposes the bootstrap and session Configs.
+    if (pending.length > 0) results.push(...(await shutdown()));
+    this.workspaceMcpDiscoveryConfig = undefined;
+    const failures = results.flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : [],
+    );
+    failures.push(...this.workspaceMcpCleanupErrors);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, 'Workspace MCP shutdown failed');
+    }
   }
 
   private initializeWorkspaceMcpDiscovery(): { accepted: boolean } {
@@ -3921,6 +4016,7 @@ class QwenAgent implements Agent {
       ]);
       const syncErrors: unknown[] = [];
       for (const config of liveConfigs) {
+        this.assertManagedSessionAdmission();
         try {
           const cwd = config.getTargetDir();
           // Same bare/safe guard as registerMcpHotReload (config/hot-reload.ts)
@@ -3960,6 +4056,7 @@ class QwenAgent implements Agent {
           syncErrors.push(error);
         }
       }
+      this.assertManagedSessionAdmission();
       if (!discoveryConfig) {
         try {
           await this.createWorkspaceMcpDiscoveryConfig(settings);
@@ -3977,6 +4074,7 @@ class QwenAgent implements Agent {
         options.forceReconnectAll === true ||
         options.forceReconnectWhich !== undefined
       ) {
+        this.assertManagedSessionAdmission();
         await this.forceReconnectWorkspaceMcp(options.forceReconnectWhich);
       }
     });
@@ -4003,11 +4101,13 @@ class QwenAgent implements Agent {
       : [...serverNames];
     const errors: unknown[] = [];
     for (const serverName of selectedServerNames) {
+      this.assertManagedSessionAdmission();
       try {
         const poolHasEntries =
           (this.mcpPool?.getSnapshot().byName[serverName]?.entryCount ?? 0) > 0;
         if (this.mcpPool && poolHasEntries) {
           const results = await this.mcpPool.restartByName(serverName);
+          this.assertManagedSessionAdmission();
           const failed = results.find((result) => !result.restarted);
           if (failed) {
             throw new Error(
@@ -4442,8 +4542,7 @@ class QwenAgent implements Agent {
   }
 
   async disposeSessions(): Promise<void> {
-    this.activeWorkReporter?.dispose();
-    this.activeWorkReporter = undefined;
+    this.stopAdmission();
     for (const generation of this.generationControllers.values()) {
       generation.controller.abort();
     }
@@ -4460,9 +4559,14 @@ class QwenAgent implements Agent {
       ),
     );
     await Promise.allSettled(
-      [...this.pendingConfigCleanup.values()]
-        .flatMap((configs) => [...configs])
-        .map((config) => this.cleanupUnstoredConfig(config)),
+      [
+        ...new Set([
+          ...this.initializingConfigs,
+          ...[...this.pendingConfigCleanup.values()].flatMap((configs) => [
+            ...configs,
+          ]),
+        ]),
+      ].map((config) => this.cleanupUnstoredConfig(config)),
     );
     this.disposeTranscriptReplayConfigs();
   }
@@ -4508,6 +4612,9 @@ class QwenAgent implements Agent {
         budget: this.workspaceMcpBudget,
       });
     }
+    this.childHeapProbe = shouldProbeChildHeap(process.env)
+      ? startChildHeapProbe()
+      : undefined;
   }
 
   private runWithPinnedRuntimeBaseDir<T>(
@@ -4610,6 +4717,9 @@ class QwenAgent implements Agent {
   }
 
   async initialize(args: InitializeRequest): Promise<InitializeResponse> {
+    if (this.managedShuttingDown) {
+      throw new SessionWriterUnavailableError();
+    }
     markAcpStartup('initializeHandlerStart');
     if (this.privateParentState === 'rejected') {
       throw RequestError.invalidParams(
@@ -8180,6 +8290,16 @@ class QwenAgent implements Agent {
         typeof sessionId === 'string' && sessionId.length > 0
           ? this.sessions.get(sessionId)
           : undefined;
+      const dispatch = () => {
+        const isMcpControl =
+          method.startsWith('qwen/control/workspace/mcp/') ||
+          method.startsWith('qwen/control/session/mcp/');
+        if (isMcpControl) this.assertManagedSessionAdmission();
+        const pending = this.extMethodInternal(method, normalizedParams);
+        if (!isMcpControl) return pending;
+        this.activeMcpControls.add(pending);
+        return pending.finally(() => this.activeMcpControls.delete(pending));
+      };
       if (
         typeof sessionId === 'string' &&
         sessionId.length > 0 &&
@@ -8188,11 +8308,11 @@ class QwenAgent implements Agent {
       ) {
         return await sessionIdContext.run(
           session?.getConfig().getSessionId() ?? sessionId,
-          () => this.extMethodInternal(method, normalizedParams),
+          dispatch,
         );
       }
 
-      return await this.extMethodInternal(method, normalizedParams);
+      return await dispatch();
     } catch (error) {
       const writerError = getSessionWriterError(error);
       if (writerError) {
@@ -9244,9 +9364,11 @@ class QwenAgent implements Agent {
           poolSnapshot !== undefined &&
           (poolSnapshot.byName[serverName]?.entryCount ?? 0) > 0;
         if (this.mcpPool && poolHasEntries) {
+          this.assertManagedSessionAdmission();
           const restartResults = await this.mcpPool.restartByName(serverName, {
             ...(entryIndex !== undefined ? { entryIndex } : {}),
           });
+          this.assertManagedSessionAdmission();
           await Promise.all(
             this.getLiveMcpConfigs(serverName).map(async (liveConfig) => {
               const llmClient = liveConfig.getLlmClient?.();
@@ -11695,6 +11817,7 @@ class QwenAgent implements Agent {
           getRuntimeMcpManager(this.config),
           request,
         );
+        this.assertManagedSessionAdmission();
         await Promise.all(
           this.getActiveSessions().map(async (session) => {
             const sessionManager = session
@@ -13727,6 +13850,7 @@ class QwenAgent implements Agent {
         if (providerReloadRevision === this.modelProviderReloadRevision) break;
         forceAuthenticationRefresh = true;
       }
+      this.assertManagedSessionAdmission();
       options.beforeSessionPublish?.();
       options.primeSession?.(session);
       if (options.deferWorkspaceActivation !== true) {

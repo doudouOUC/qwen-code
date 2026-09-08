@@ -203,6 +203,7 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => ({
     acquire: vi.fn(),
     release: vi.fn(),
     shutdown: vi.fn().mockResolvedValue(undefined),
+    drainAll: vi.fn().mockResolvedValue({ drained: 0, forced: 0, errors: [] }),
     on: vi.fn(),
     off: vi.fn(),
   })),
@@ -417,6 +418,7 @@ describe('QwenAgent loadSession — Phase C worktree context restore', () => {
 
     mockConfig = {
       initialize: vi.fn().mockResolvedValue(undefined),
+      shutdown: vi.fn().mockResolvedValue(undefined),
       waitForMcpReady: vi.fn().mockResolvedValue(undefined),
       getHookSystem: vi.fn().mockReturnValue(undefined),
       getDisableAllHooks: vi.fn().mockReturnValue(false),
