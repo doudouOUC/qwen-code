@@ -163,3 +163,30 @@ implements opt-in automatic worker startup, workspace reuse, owned-worker fencin
 cancellation, and awaited cleanup. Its validation section records the macOS
 process checks and remaining platform/E2E limits. Fixed-URL and in-process
 providers remain available without the auto-local flag.
+
+## Live progress visibility
+
+The Managed transcript must have a bounded flex column around the shared
+MessageList. That list owns scrolling and follows new messages; letting it grow
+inside a block with hidden overflow clips new thinking, tool activity, and
+answers instead of scrolling them into view.
+
+A compact status above the composer shows submission/loading immediately, then
+the active Managed phase and elapsed time from admission. It remains visible
+while reading earlier messages and during silent model/tool intervals, explains
+why another prompt cannot be sent, and disappears when the turn finishes. Its
+state comes from the Managed session, independently of ordinary chat streaming
+and Runtime readiness. Existing transcript rows show thinking summaries and tool
+details; no second event stream or model request is needed.
+
+Regression checks must cover a long transcript in a real browser, first and
+continuation turns before any model content, incremental thought/tool rows,
+silent intervals, completion/cancellation, and session switching. A mocked
+MessageList alone cannot verify clipping or automatic scrolling.
+
+The 2026-09-08 macOS preview reproduced an 11,551px-tall message list clipped by
+a 660px block parent. After the fix, the parent and list both measured 660px;
+the list scrolled its 1,631px content to the bottom while the parent stayed
+unscrolled. The existing session and Runtime were preserved. Build, bundle,
+workspace package typechecks, and 26 focused Managed tests passed; root
+integration typechecking still reports the four known baseline errors above.

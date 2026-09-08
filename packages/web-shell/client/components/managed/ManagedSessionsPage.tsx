@@ -15,6 +15,7 @@ import {
   managedRequestId,
 } from './managed-session-storage';
 import { useManagedSession } from './use-managed-session';
+import { ManagedSessionProgress } from './ManagedSessionProgress';
 
 interface PendingPrompt {
   idempotencyKey: string;
@@ -375,7 +376,7 @@ export function ManagedSessionsPage({
               {summary.failure.message}
             </p>
           )}
-          <div className="min-h-32 flex-1 overflow-hidden">
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             <MessageList
               messages={messages}
               pendingApproval={null}
@@ -399,6 +400,13 @@ export function ManagedSessionsPage({
               {t('managed.uncertain')}
             </p>
           )}
+          <ManagedSessionProgress
+            summary={summary}
+            submitting={
+              busy && Boolean(pending) && pending?.sessionId === sessionId
+            }
+            loading={detail.loading}
+          />
           <form
             className="flex shrink-0 flex-col gap-2"
             onSubmit={(event) => {

@@ -29,6 +29,9 @@ const EN: Messages = {
   'managed.unavailable': 'Managed Agents is unavailable on this daemon.',
   'managed.send': 'Send',
   'managed.sending': 'Submitting…',
+  'managed.elapsed': (v) => `${v?.seconds ?? 0}s elapsed`,
+  'managed.runningHint':
+    'This turn is running. Sending another message is paused.',
   'managed.retry': 'Retry the same request',
   'managed.cancel': 'Cancel turn',
   'managed.uncertain':
@@ -3278,6 +3281,8 @@ const ZH: Messages = {
   'managed.unavailable': '当前 daemon 未启用托管 Agent。',
   'managed.send': '发送',
   'managed.sending': '提交中…',
+  'managed.elapsed': (v) => `已用时 ${v?.seconds ?? 0} 秒`,
+  'managed.runningHint': '本轮执行中，暂时不能发送新消息。',
   'managed.retry': '重试同一请求',
   'managed.cancel': '取消本轮',
   'managed.uncertain': '请求结果尚未确认。重试会确认或完成同一次提交。',

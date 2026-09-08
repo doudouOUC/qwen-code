@@ -251,6 +251,105 @@ describe('ManagedSessionsPage', () => {
     expect(container.textContent).not.toContain('Cancelled');
   });
 
+  it('shows submission and loading feedback before the first model event', async () => {
+    let accept!: (value: { sessionId: string; promptId: string }) => void;
+    mocks.client.createManagedSession.mockImplementationOnce(
+      () => new Promise((resolve) => (accept = resolve)),
+    );
+    await render();
+    await input('Inspect the workspace');
+    await click('Send');
+    expect(
+      container.querySelector('[data-managed-progress] span[role="status"]')
+        ?.textContent,
+    ).toBe('Submitting…');
+
+    let load!: (value: DaemonManagedSessionTranscript) => void;
+    mocks.client.getManagedSession.mockResolvedValue(
+      summary('s1', {
+        phase: 'admitted',
+        capabilities: { canSend: false, canCancel: true },
+      }),
+    );
+    mocks.client.getManagedSessionTranscript.mockImplementationOnce(
+      () => new Promise((resolve) => (load = resolve)),
+    );
+    await act(async () => {
+      accept({ sessionId: 's1', promptId: 'p1' });
+      await flush();
+    });
+    await render('s1');
+    expect(
+      container.querySelector('[data-managed-progress]')?.textContent,
+    ).toBe('Loading…');
+    await act(async () => {
+      load({
+        events: [
+          {
+            ...event(1, ''),
+            type: 'accepted',
+            data: { prompt: [{ type: 'text', text: 'Inspect the workspace' }] },
+          },
+          { ...event(2, ''), type: 'agent_started' },
+        ],
+        lastEventId: 2,
+      });
+      await flush();
+    });
+    expect(
+      container.querySelector('[data-managed-progress]')?.textContent,
+    ).toContain('Accepted');
+    expect(
+      container.querySelector('[data-managed-progress]')?.textContent,
+    ).toContain('This turn is running');
+    expect(container.querySelector('textarea')?.disabled).toBe(true);
+    expect(mocks.client.createManagedSession).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['completed', 'failed', 'cancelled'] as const)(
+    'keeps elapsed progress during silent intervals and removes it on %s',
+    async (phase) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(10_000);
+      mocks.client.getManagedSession.mockResolvedValue(
+        summary('s1', {
+          admittedAt: 8000,
+          phase: 'agent_running',
+          capabilities: { canSend: false, canCancel: true },
+        }),
+      );
+      mocks.client.getManagedSessionTranscript.mockResolvedValue({
+        events: [],
+        lastEventId: 0,
+      });
+      await render('s1', 'zh-CN');
+      expect(
+        container.querySelector('[data-managed-progress]')?.textContent,
+      ).toContain('已用时 2 秒');
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(
+        container.querySelector('[data-managed-progress]')?.textContent,
+      ).toContain('已用时 7 秒');
+      expect(
+        container.querySelector('[data-managed-progress]')?.textContent,
+      ).toContain('本轮执行中');
+      mocks.client.getManagedSession.mockResolvedValue(
+        summary('s1', {
+          phase,
+          runtimeState: 'starting',
+          runtimeReady: false,
+        }),
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(container.querySelector('[data-managed-progress]')).toBeNull();
+      expect(container.querySelector('textarea')?.disabled).toBe(false);
+    },
+  );
+
   it('preserves an uncertain attempt across a remount and restores its text after a definitive rejection', async () => {
     mocks.client.createManagedSession.mockRejectedValueOnce(
       new TypeError('Network failed'),
@@ -306,6 +405,7 @@ describe('ManagedSessionsPage', () => {
       await click('Send');
       await click('Task s2Completed');
       await render('s2');
+      expect(container.querySelector('[data-managed-progress]')).toBeNull();
       await act(async () => {
         if (outcome === 'accepted')
           resolveSubmission({ sessionId: 's1', promptId: 'p2' });
