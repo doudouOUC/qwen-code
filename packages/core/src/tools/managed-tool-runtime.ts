@@ -27,9 +27,13 @@ import {
   type ToolResult,
   type ToolResultDisplay,
 } from './tools.js';
+import { ToolNames } from './tool-names.js';
+import { isModifiableDeclarativeTool } from './modifiable-tool.js';
 import { ToolErrorType } from './tool-error.js';
 import {
   managedToolDigest,
+  parseManagedToolContentModification,
+  type ManagedToolContentModification,
   serializeManagedToolConfirmation,
   type ManagedToolCallIdentity,
   type ManagedToolInvocationReference,
@@ -255,13 +259,25 @@ export class ManagedToolRuntime {
     identity: ManagedToolCallIdentity,
     toolName: string,
     input: Record<string, unknown>,
+    modification?: ManagedToolContentModification,
   ): Promise<ManagedToolPrepareResponse> {
     this.assertCurrent(identity);
     managedToolDigest(input);
     identity = structuredClone(identity);
     const copied = structuredClone(input);
+    const contentModification =
+      modification === undefined
+        ? undefined
+        : parseManagedToolContentModification(modification);
     const inputDigest = managedToolDigest(
-      { identity, toolName, input: copied },
+      {
+        identity,
+        toolName,
+        input: copied,
+        ...(contentModification === undefined
+          ? {}
+          : { modification: contentModification }),
+      },
       1024 * 1024,
     );
     const key = JSON.stringify([identity.promptId, identity.callId]);
@@ -291,7 +307,14 @@ export class ManagedToolRuntime {
         await this.activePrompt.snapshot;
         this.assertCurrent(identity);
         const built = await this.scoped(identity, () =>
-          this.build(identity, toolName, copied, inputDigest),
+          this.build(
+            identity,
+            toolName,
+            copied,
+            inputDigest,
+            contentModification,
+            entry,
+          ),
         );
         slot.current = built;
         return built;
@@ -320,9 +343,40 @@ export class ManagedToolRuntime {
     toolName: string,
     input: Record<string, unknown>,
     inputDigest: string,
+    modification?: ManagedToolContentModification,
+    source?: Entry,
   ): Promise<Entry> {
     const tool = this.tools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error('Managed Runtime tool is unavailable.');
+    if (modification) {
+      if (
+        !source ||
+        this.get(modification.source) !== source ||
+        source.tool !== tool ||
+        tool.name !== ToolNames.NOTEBOOK_EDIT ||
+        !isModifiableDeclarativeTool(tool) ||
+        !source.controller.signal.aborted ||
+        source.execution ||
+        managedToolDigest(input) !== source.reference.argsDigest
+      )
+        throw new Error('Managed content modification source does not match.');
+      const details = await source.confirmation;
+      if (
+        details?.type !== 'edit' ||
+        typeof details.originalContent !== 'string'
+      )
+        throw new Error(
+          'Managed content modification requires an edit confirmation.',
+        );
+      this.assertCurrent(identity);
+      input = tool
+        .getModifyContext(this.lifetime.signal)
+        .createUpdatedParams(
+          details.originalContent,
+          modification.newContent,
+          source.invocation.params,
+        ) as Record<string, unknown>;
+    }
     const invocation = tool.build(input);
     const aware = invocation as {
       setCallId?: (id: string) => void;
@@ -723,6 +777,7 @@ export async function createBuiltinManagedToolRuntime(
     { ReadFileTool },
     { WriteFileTool },
     { EditTool },
+    { NotebookEditTool },
     { ShellTool },
     { GlobTool },
     { LSTool },
@@ -732,6 +787,7 @@ export async function createBuiltinManagedToolRuntime(
     import('./read-file.js'),
     import('./write-file.js'),
     import('./edit.js'),
+    import('./notebook-edit.js'),
     import('./shell.js'),
     import('./glob.js'),
     import('./ls.js'),
@@ -768,6 +824,7 @@ export async function createBuiltinManagedToolRuntime(
     ReadFileTool,
     WriteFileTool,
     EditTool,
+    NotebookEditTool,
     ShellTool,
     GlobTool,
     LSTool,

@@ -1352,6 +1352,87 @@ describe('CoreToolScheduler', () => {
       }
     });
 
+    it('reprepares full notebook content with unchanged cell arguments after draining', async () => {
+      const oldDrain = deferred<void>();
+      const params = {
+        notebook_path: '/repo/test.ipynb',
+        cell_id: 'a',
+        new_source: 'proposal',
+      };
+      const first = fixture({
+        name: ToolNames.NOTEBOOK_EDIT,
+        permission: 'ask',
+        edit: true,
+        params,
+        drain: () => oldDrain.promise,
+      });
+      const second = fixture({
+        name: ToolNames.NOTEBOOK_EDIT,
+        permission: 'ask',
+        edit: true,
+        params,
+      });
+      const modification = {
+        source: {
+          sessionId: 'c911c54f-ad76-420f-8c76-fb124c0ce623',
+          promptId: first.request.prompt_id,
+          callId: first.request.callId,
+          capabilityDigest: 'a'.repeat(64),
+          policyRevision: 'policy',
+          invocationId: 'old',
+          argsDigest: 'b'.repeat(64),
+        },
+        newContent: '{"cells":[]}',
+      };
+      first.managed.contentModification = vi.fn(() => modification);
+      vi.mocked(first.tool.build)
+        .mockReset()
+        .mockReturnValueOnce(first.invocation)
+        .mockReturnValueOnce(second.invocation);
+      const h = createSchedulerForLegacyToolTests({
+        toolsByName: new Map([[ToolNames.NOTEBOOK_EDIT, first.tool]]),
+        approvalMode: ApprovalMode.DEFAULT,
+      });
+      const signal = new AbortController().signal;
+      await h.scheduler.schedule({ ...first.request, args: params }, signal);
+      const old = (
+        h.onToolCallsUpdate.mock.calls.at(-1)![0][0] as WaitingToolCall
+      ).confirmationDetails;
+      const pending = old.onConfirm(ToolConfirmationOutcome.ProceedOnce, {
+        newContent: modification.newContent,
+      });
+      await vi.waitFor(() =>
+        expect(first.managed.cancelAndDrain).toHaveBeenCalledOnce(),
+      );
+      expect(first.managed.contentModification).toHaveBeenCalledWith(
+        modification.newContent,
+      );
+      expect(second.managed.prepare).not.toHaveBeenCalled();
+      oldDrain.resolve();
+      await pending;
+      expect(second.managed.prepare).toHaveBeenCalledWith(
+        signal,
+        { callId: first.request.callId, promptId: first.request.prompt_id },
+        modification,
+      );
+      const current = h.onToolCallsUpdate.mock.calls.at(
+        -1,
+      )![0][0] as WaitingToolCall;
+      expect(current.status).toBe('awaiting_approval');
+      expect(current.request.args).toEqual(params);
+      expect(first.onConfirm).not.toHaveBeenCalled();
+      await old.onConfirm(ToolConfirmationOutcome.ProceedOnce);
+      expect(second.invocation.execute).not.toHaveBeenCalled();
+      await current.confirmationDetails.onConfirm(
+        ToolConfirmationOutcome.ProceedOnce,
+      );
+      await vi.waitFor(() =>
+        expect(h.onAllToolCallsComplete).toHaveBeenCalledOnce(),
+      );
+      expect(first.invocation.execute).not.toHaveBeenCalled();
+      expect(second.invocation.execute).toHaveBeenCalledOnce();
+    });
+
     it.each(['inline', 'editor', 'permission hook'])(
       'reprepares %s modifications and confirms only the new reference',
       async (source) => {

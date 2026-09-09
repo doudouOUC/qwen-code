@@ -10,6 +10,7 @@ import type { Config } from '../config/config.js';
 import { getShellConfiguration } from '../utils/shell-utils.js';
 import {
   getEditToolDefinition,
+  getNotebookEditToolDefinition,
   getGlobToolDefinition,
   getGrepToolDefinition,
   getLSToolDefinition,
@@ -19,6 +20,7 @@ import {
 } from './builtin-tool-definitions.js';
 import { ReadFileTool } from './read-file.js';
 import { WriteFileTool } from './write-file.js';
+import { NotebookEditTool } from './notebook-edit.js';
 import { EditTool } from './edit.js';
 import { ShellTool } from './shell.js';
 import { GlobTool } from './glob.js';
@@ -104,6 +106,7 @@ describe('builtin tool definition compatibility', () => {
         new ReadFileTool(config),
         new WriteFileTool(config),
         new EditTool(config),
+        new NotebookEditTool(config),
         new ShellTool(config),
       ];
       const runtime = new ManagedToolRuntime(
@@ -115,6 +118,7 @@ describe('builtin tool definition compatibility', () => {
         getReadFileToolDefinition(),
         getWriteFileToolDefinition(),
         getEditToolDefinition(),
+        getNotebookEditToolDefinition(),
         getShellToolDefinition({
           shellConfiguration: getShellConfiguration(),
           platform,

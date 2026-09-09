@@ -397,8 +397,7 @@ export class LocalManagedRuntimeProvider implements ManagedRuntimeProvider {
         : undefined,
       manifest: () => call(() => client.manifest()),
       beginTurn: (identity) => call(() => client.beginTurn(identity)),
-      prepare: (identity, name, input) =>
-        call(() => client.prepare(identity, name, input)),
+      prepare: (...args) => call(() => client.prepare(...args)),
       confirmation: (reference) => call(() => client.confirmation(reference)),
       confirm: (reference, outcome, payload, phase) =>
         call(() => client.confirm(reference, outcome, payload, phase)),
@@ -1181,8 +1180,13 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
       beginTurn: async (identity) => {
         await call('begin-turn', { identity });
       },
-      prepare: (identity, toolName, input) =>
-        call('prepare', { identity, toolName, input }),
+      prepare: (identity, toolName, input, modification) =>
+        call('prepare', {
+          identity,
+          toolName,
+          input,
+          ...(modification === undefined ? {} : { modification }),
+        }),
       confirmation: (reference) => call('confirmation', { reference }),
       confirm: async (reference, outcome, payload, phase) => {
         await call('confirm', {

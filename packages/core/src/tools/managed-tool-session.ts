@@ -11,6 +11,7 @@ import {
   getEditToolDefinition,
   getGlobToolDefinition,
   getGrepToolDefinition,
+  getNotebookEditToolDefinition,
   getLSToolDefinition,
   getReadFileToolDefinition,
   getShellToolDefinition,
@@ -77,6 +78,12 @@ export function createManagedBuiltinTool(
     },
   };
   switch (name) {
+    case ToolNames.NOTEBOOK_EDIT:
+      return new RuntimeBackedTool({
+        ...shared,
+        descriptor: getNotebookEditToolDefinition(),
+        projectClassifierInput: () => '',
+      });
     case ToolNames.GREP:
       return new RuntimeBackedTool({
         ...shared,

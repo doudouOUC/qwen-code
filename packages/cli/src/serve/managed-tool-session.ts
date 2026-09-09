@@ -220,8 +220,7 @@ export function createManagedToolSessionFactory(options: {
               manifest: () => active(() => acquired.manifest()),
               beginTurn: (identity) =>
                 active(() => acquired.beginTurn(identity)),
-              prepare: (identity, name, input) =>
-                active(() => acquired.prepare(identity, name, input)),
+              prepare: (...args) => active(() => acquired.prepare(...args)),
               confirmation: (reference) =>
                 active(() => acquired.confirmation(reference)),
               confirm: (reference, outcome, payload, phase) =>

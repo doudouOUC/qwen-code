@@ -232,8 +232,7 @@ export class AutoLocalManagedRuntimeProvider implements ManagedRuntimeProvider {
             : undefined,
           manifest: () => call(() => client.manifest()),
           beginTurn: (identity) => call(() => client.beginTurn(identity)),
-          prepare: (identity, name, input) =>
-            call(() => client.prepare(identity, name, input)),
+          prepare: (...args) => call(() => client.prepare(...args)),
           confirmation: (reference) =>
             call(() => client.confirmation(reference)),
           confirm: (reference, outcome, payload, phase) =>

@@ -12,6 +12,7 @@ import {
   ToolNames,
   managedToolDigest,
   parseManagedToolCallIdentity,
+  parseManagedToolContentModification,
   parseManagedToolFileHistoryBinding,
   parseManagedToolFileHistoryPromptId,
   parseManagedToolFileHistoryState,
@@ -32,7 +33,7 @@ const methodKeys = new Map<string, readonly string[]>([
   [METHODS.sessionManagedToolV2BeginTurn, ['sessionId', 'identity']],
   [
     METHODS.sessionManagedToolV2Prepare,
-    ['sessionId', 'identity', 'toolName', 'input'],
+    ['sessionId', 'identity', 'toolName', 'input', 'modification'],
   ],
   [METHODS.sessionManagedToolV2Confirmation, ['sessionId', 'reference']],
   [
@@ -142,7 +143,15 @@ export async function dispatchManagedToolRuntimeRequest(
         'Managed Tool Runtime currently requires foreground Shell execution.',
       );
     }
-    return { ...(await runtime.prepare(identity, name, args)) };
+    const modification =
+      params['modification'] === undefined
+        ? undefined
+        : parseManagedToolContentModification(params['modification']);
+    return {
+      ...(await (modification === undefined
+        ? runtime.prepare(identity, name, args)
+        : runtime.prepare(identity, name, args, modification))),
+    };
   }
   const reference = parseManagedToolInvocationReference(params['reference']);
   if (reference.sessionId !== sessionId) throw new ManagedToolProtocolError();

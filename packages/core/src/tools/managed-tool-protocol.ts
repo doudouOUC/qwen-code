@@ -41,6 +41,11 @@ export interface ManagedToolInvocationReference
   readonly argsDigest: string;
 }
 
+export interface ManagedToolContentModification {
+  readonly source: ManagedToolInvocationReference;
+  readonly newContent: string;
+}
+
 export interface ManagedToolDescriptor {
   readonly name: string;
   readonly displayName: string;
@@ -270,6 +275,19 @@ export function parseManagedToolInvocationReference(
     ...identityFields(input),
     invocationId: boundedId(input['invocationId'], 128),
     argsDigest: digest(input['argsDigest']),
+  };
+}
+
+export function parseManagedToolContentModification(
+  value: unknown,
+): ManagedToolContentModification {
+  const input = jsonRecord(value);
+  assertKeys(input, ['source', 'newContent']);
+  if (typeof input['newContent'] !== 'string')
+    throw new ManagedToolProtocolError();
+  return {
+    source: parseManagedToolInvocationReference(input['source']),
+    newContent: input['newContent'],
   };
 }
 

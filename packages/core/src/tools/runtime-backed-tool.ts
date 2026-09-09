@@ -8,6 +8,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { PreToolUseHookResult } from '../core/toolHookTriggers.js';
 import {
   managedToolDigest,
+  parseManagedToolContentModification,
+  type ManagedToolContentModification,
   parseManagedToolInvocationReference,
   type ManagedToolDescriptor,
   type ManagedToolPrepareResponse,
@@ -157,7 +159,22 @@ class RuntimeBackedInvocation
     return this.ready().requiresUserInteraction;
   }
 
-  prepare(signal: AbortSignal, context: { callId: string; promptId: string }) {
+  contentModification(newContent: string): ManagedToolContentModification {
+    this.ready();
+    this.checkAdmission();
+    if (this.confirmationDetails?.type !== 'edit')
+      throw new Error('Managed tool has no editable confirmation.');
+    return parseManagedToolContentModification({
+      source: this.reference,
+      newContent,
+    });
+  }
+
+  prepare(
+    signal: AbortSignal,
+    context: { callId: string; promptId: string },
+    modification?: ManagedToolContentModification,
+  ) {
     if (
       this.context &&
       managedToolDigest(context) !== managedToolDigest(this.context)
@@ -167,6 +184,10 @@ class RuntimeBackedInvocation
       );
     }
     if (this.preparation) return this.preparation;
+    const contentModification =
+      modification === undefined
+        ? undefined
+        : parseManagedToolContentModification(modification);
     const callContext = { ...context };
     this.context = callContext;
     this.signal = signal;
@@ -206,7 +227,14 @@ class RuntimeBackedInvocation
       this.checkAdmission();
       this.identity = identity;
       this.recoverPreparation = () =>
-        client.prepare(identity, descriptor.name, this.input);
+        contentModification === undefined
+          ? client.prepare(identity, descriptor.name, this.input)
+          : client.prepare(
+              identity,
+              descriptor.name,
+              this.input,
+              contentModification,
+            );
       const prepared = await this.recoverPreparation();
       // Retain the reference before checking cancellation, so a late response
       // remains owned and is drained even when its caller has already aborted.

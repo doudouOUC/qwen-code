@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ToolCallConfirmationDetails } from './tools.js';
 import {
   managedToolDigest,
+  parseManagedToolContentModification,
   ManagedToolProtocolError,
   parseManagedToolCallIdentity,
   parseManagedToolConfirmationPayload,
@@ -303,6 +304,27 @@ describe('managed tool confirmation payloads', () => {
     { newContent: 'x'.repeat(256 * 1024) },
   ])('rejects malformed, extended or oversized payload %#', (value) => {
     expect(() => parseManagedToolConfirmationPayload(value)).toThrow(
+      ManagedToolProtocolError,
+    );
+  });
+});
+
+describe('managed notebook modification metadata', () => {
+  it('copies the full reference and accepts empty content for native validation', () => {
+    const input = { source: { ...reference }, newContent: '' };
+    const parsed = parseManagedToolContentModification(input);
+    input.source.callId = 'mutated';
+    expect(parsed).toEqual({ source: reference, newContent: '' });
+  });
+  it.each([
+    {},
+    { source: reference },
+    { source: reference, newContent: null },
+    { source: reference, newContent: '{}', approved: true },
+    { source: { ...reference, argsDigest: 'wrong' }, newContent: '{}' },
+    { source: reference, newContent: 'x'.repeat(256 * 1024) },
+  ])('rejects malformed or oversized metadata %#', (input) => {
+    expect(() => parseManagedToolContentModification(input)).toThrow(
       ManagedToolProtocolError,
     );
   });

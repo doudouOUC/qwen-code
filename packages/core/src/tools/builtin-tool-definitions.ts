@@ -537,3 +537,45 @@ export function projectShellToolClassifierInput(
   // Safety classification needs the full command.
   return { command: params.command, cwd: params.directory ?? cwd };
 }
+
+export function getNotebookEditToolDefinition(): ManagedToolDescriptor {
+  return defineTool(
+    ToolNames.NOTEBOOK_EDIT,
+    ToolDisplayNames.NOTEBOOK_EDIT,
+    `Edits a Jupyter notebook (.ipynb) safely at the cell level. Use this instead of ${ToolNames.EDIT} or ${ToolNames.WRITE_FILE} for notebook cells. Supports replacing, inserting, and deleting cells. Always read the notebook first with ${ToolNames.READ_FILE}; then use the cell IDs shown in that output.`,
+    Kind.Edit,
+    {
+      properties: {
+        notebook_path: {
+          description:
+            'Absolute path to the Jupyter notebook file to edit. Must end with .ipynb.',
+          type: 'string',
+        },
+        cell_id: {
+          description:
+            'Target cell ID from read_file output, or cell-N 0-based fallback. Required for replace and delete. For insert, the new cell is inserted after this cell; if omitted, inserted at the beginning.',
+          type: 'string',
+        },
+        new_source: {
+          description:
+            'New source content for replace and insert operations. Not required for delete.',
+          type: 'string',
+        },
+        cell_type: {
+          description:
+            'Cell type for inserted cells or type conversion on replace.',
+          type: 'string',
+          enum: ['code', 'markdown'],
+        },
+        edit_mode: {
+          description: 'Notebook edit operation. Defaults to replace.',
+          type: 'string',
+          enum: ['replace', 'insert', 'delete'],
+        },
+      },
+      required: ['notebook_path'],
+      additionalProperties: false,
+      type: 'object',
+    },
+  );
+}

@@ -23,6 +23,9 @@ const localConstruct = vi.hoisted(() =>
 );
 vi.mock('../tools/read-file.js', () => ({ ReadFileTool: localConstruct }));
 vi.mock('../tools/write-file.js', () => ({ WriteFileTool: localConstruct }));
+vi.mock('../tools/notebook-edit.js', () => ({
+  NotebookEditTool: localConstruct,
+}));
 vi.mock('../tools/edit.js', () => ({ EditTool: localConstruct }));
 vi.mock('../tools/shell.js', () => ({ ShellTool: localConstruct }));
 vi.mock('../tools/glob.js', () => ({ GlobTool: localConstruct }));
@@ -35,6 +38,7 @@ const names = [
   ToolNames.READ_FILE,
   ToolNames.WRITE_FILE,
   ToolNames.EDIT,
+  ToolNames.NOTEBOOK_EDIT,
   ToolNames.SHELL,
   ToolNames.GLOB,
   ToolNames.GREP,

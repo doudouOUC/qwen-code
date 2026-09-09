@@ -15,11 +15,15 @@ import type { VisionBridgeNoticeDisplay } from '../services/visionBridge/vision-
 import type { PreToolUseHookResult } from '../core/toolHookTriggers.js';
 import type { ManagedToolExecutionResult } from './managed-tool-runtime.js';
 
+import type { ManagedToolContentModification } from './managed-tool-protocol.js';
+
 export interface ManagedToolInvocationLifecycle {
   prepare(
     signal: AbortSignal,
     context: { callId: string; promptId: string },
+    modification?: ManagedToolContentModification,
   ): Promise<void>;
+  contentModification?(newContent: string): ManagedToolContentModification;
   preflight(): Promise<PreToolUseHookResult>;
   confirmPreflight(
     outcome: ToolConfirmationOutcome,

@@ -250,6 +250,28 @@ describe('managed runtime tool bridge', () => {
         file_path: '/scratch/proof',
         content: 'proof',
       });
+      const notebookInput = {
+        notebook_path: '/scratch/test.ipynb',
+        cell_id: 'a',
+        new_source: 'proposal',
+      };
+      const modification = { source: reference, newContent: '{"cells":[]}' };
+      await client.prepare(
+        identity,
+        'notebook_edit',
+        notebookInput,
+        modification,
+      );
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Prepare,
+        params: {
+          sessionId: session.sessionId,
+          identity,
+          toolName: 'notebook_edit',
+          input: notebookInput,
+          modification,
+        },
+      });
       await client.preflight(reference);
       await client.execute(reference);
       await client.status(reference, 4);

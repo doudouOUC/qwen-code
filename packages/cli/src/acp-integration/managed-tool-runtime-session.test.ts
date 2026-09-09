@@ -299,3 +299,42 @@ describe('managed tool Runtime ACP request dispatch', () => {
     ).toThrow();
   });
 });
+
+it('forwards notebook modification separately from input and rejects extension fields', async () => {
+  const client = makeClient();
+  const input = {
+    notebook_path: '/workspace/test.ipynb',
+    cell_id: 'a',
+    new_source: 'value',
+  };
+  const modification = { source: reference, newContent: '{"cells":[]}' };
+  const params = {
+    sessionId,
+    identity,
+    toolName: 'notebook_edit',
+    input,
+    modification,
+  };
+  await dispatchManagedToolRuntimeRequest(
+    client,
+    methods.sessionManagedToolV2Prepare,
+    params,
+  );
+  expect(client.prepare).toHaveBeenCalledWith(
+    identity,
+    'notebook_edit',
+    input,
+    modification,
+  );
+  await expect(
+    dispatchManagedToolRuntimeRequest(
+      client,
+      methods.sessionManagedToolV2Prepare,
+      {
+        ...params,
+        modification: { ...modification, approved: true },
+      },
+    ),
+  ).rejects.toThrow();
+  expect(client.prepare).toHaveBeenCalledOnce();
+});

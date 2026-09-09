@@ -6,6 +6,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { getNotebookEditToolDefinition } from './builtin-tool-definitions.js';
 import type { Config } from '../config/config.js';
 import { ApprovalMode } from '../config/config.js';
 import { detectLineEnding } from '../services/fileSystemService.js';
@@ -20,7 +21,6 @@ import type {
 import {
   BaseDeclarativeTool,
   BaseToolInvocation,
-  Kind,
   ToolConfirmationOutcome,
 } from './tools.js';
 import type { PermissionDecision } from '../permissions/types.js';
@@ -48,7 +48,7 @@ import {
   type NotebookCell,
   type NotebookCellType,
 } from '../utils/notebook.js';
-import { ToolDisplayNames, ToolNames } from './tool-names.js';
+import { ToolNames } from './tool-names.js';
 import { ToolErrorType } from './tool-error.js';
 import { StructuredToolError } from './priorReadEnforcement.js';
 import type {
@@ -744,44 +744,13 @@ export class NotebookEditTool
   >();
 
   constructor(private readonly config: Config) {
+    const definition = getNotebookEditToolDefinition();
     super(
-      NotebookEditTool.Name,
-      ToolDisplayNames.NOTEBOOK_EDIT,
-      `Edits a Jupyter notebook (.ipynb) safely at the cell level. Use this instead of ${ToolNames.EDIT} or ${ToolNames.WRITE_FILE} for notebook cells. Supports replacing, inserting, and deleting cells. Always read the notebook first with ${ToolNames.READ_FILE}; then use the cell IDs shown in that output.`,
-      Kind.Edit,
-      {
-        properties: {
-          notebook_path: {
-            description:
-              'Absolute path to the Jupyter notebook file to edit. Must end with .ipynb.',
-            type: 'string',
-          },
-          cell_id: {
-            description:
-              'Target cell ID from read_file output, or cell-N 0-based fallback. Required for replace and delete. For insert, the new cell is inserted after this cell; if omitted, inserted at the beginning.',
-            type: 'string',
-          },
-          new_source: {
-            description:
-              'New source content for replace and insert operations. Not required for delete.',
-            type: 'string',
-          },
-          cell_type: {
-            description:
-              'Cell type for inserted cells or type conversion on replace.',
-            type: 'string',
-            enum: ['code', 'markdown'],
-          },
-          edit_mode: {
-            description: 'Notebook edit operation. Defaults to replace.',
-            type: 'string',
-            enum: ['replace', 'insert', 'delete'],
-          },
-        },
-        required: ['notebook_path'],
-        additionalProperties: false,
-        type: 'object',
-      },
+      definition.name,
+      definition.displayName,
+      definition.description,
+      definition.kind,
+      definition.schema.parametersJsonSchema,
     );
   }
 

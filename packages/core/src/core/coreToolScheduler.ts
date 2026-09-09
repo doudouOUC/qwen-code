@@ -18,6 +18,7 @@ import type {
   AnyToolInvocation,
   ToolArtifact,
 } from '../tools/tools.js';
+import type { ManagedToolContentModification } from '../tools/managed-tool-protocol.js';
 import type { EditorType } from '../utils/editor.js';
 import type { Config } from '../config/config.js';
 import type { ToolRegistry } from '../tools/tool-registry.js';
@@ -1762,6 +1763,7 @@ export class CoreToolScheduler {
     targetCallId: string,
     args: unknown,
     signal: AbortSignal,
+    modification?: ManagedToolContentModification,
   ): Promise<boolean> {
     const call = this.toolCalls.find(
       (current) => current.request.callId === targetCallId,
@@ -1805,6 +1807,7 @@ export class CoreToolScheduler {
             request,
             signal,
             call.tool,
+            modification,
           ),
         );
       } catch (error) {
@@ -1859,14 +1862,17 @@ export class CoreToolScheduler {
     call: WaitingToolCall | ValidatingToolCall,
     args: Record<string, unknown>,
     signal: AbortSignal,
+    modification?: ManagedToolContentModification,
   ): Promise<boolean> {
     if (
-      isDeepStrictEqual(args, call.request.args) ||
-      isDeepStrictEqual(args, call.invocation.params)
+      !modification &&
+      (isDeepStrictEqual(args, call.request.args) ||
+        isDeepStrictEqual(args, call.invocation.params))
     )
       return false;
     const callId = call.request.callId;
-    if (!(await this.setArgsInternal(callId, args, signal))) return true;
+    if (!(await this.setArgsInternal(callId, args, signal, modification)))
+      return true;
     if (this.cancelPreExecutionIfAborted(callId, signal)) return true;
     this.bouncedAwaitingApproval.delete(callId);
     this.bouncedToolUseId.delete(callId);
@@ -1883,6 +1889,7 @@ export class CoreToolScheduler {
 
   private managedModifyContext(
     call: WaitingToolCall,
+    onModification: (modification: ManagedToolContentModification) => void,
   ): ModifyContext<Record<string, unknown>> {
     const details = call.confirmationDetails;
     if (details.type !== 'edit')
@@ -1891,15 +1898,22 @@ export class CoreToolScheduler {
       getFilePath: () => details.filePath,
       getCurrentContent: async () => details.originalContent ?? '',
       getProposedContent: async () => details.newContent,
-      createUpdatedParams: (original, updated, params) =>
-        updated === details.newContent
-          ? params
-          : createManagedToolEditParams(
-              call.request.name,
-              params,
-              original,
-              updated,
-            ),
+      createUpdatedParams: (original, updated, params) => {
+        if (updated === details.newContent) return params;
+        if (canonicalToolName(call.request.name) === ToolNames.NOTEBOOK_EDIT) {
+          const managed = call.invocation.managed;
+          if (!managed?.contentModification)
+            throw new Error('Managed tool cannot modify notebook content.');
+          onModification(managed.contentModification(updated));
+          return call.invocation.params as Record<string, unknown>;
+        }
+        return createManagedToolEditParams(
+          call.request.name,
+          params,
+          original,
+          updated,
+        );
+      },
     };
   }
 
@@ -2218,6 +2232,7 @@ export class CoreToolScheduler {
     request: ToolCallRequestInfo,
     signal: AbortSignal,
     tool: AnyDeclarativeTool,
+    modification?: ManagedToolContentModification,
   ): Promise<AnyToolInvocation> {
     if (!invocation.managed) return invocation;
     this.managedInvocations.add(invocation);
@@ -2245,10 +2260,10 @@ export class CoreToolScheduler {
       this.managedInvocations.add(invocation);
     }
     try {
-      await invocation.managed.prepare(signal, {
-        callId: request.callId,
-        promptId: request.prompt_id,
-      });
+      const context = { callId: request.callId, promptId: request.prompt_id };
+      if (modification === undefined)
+        await invocation.managed.prepare(signal, context);
+      else await invocation.managed.prepare(signal, context, modification);
       signal.throwIfAborted();
       return invocation;
     } catch (error) {
@@ -4084,9 +4099,12 @@ export class CoreToolScheduler {
         payload?.newContent !== undefined ||
         payload?.updatedInput !== undefined)
     ) {
+      let modification: ManagedToolContentModification | undefined;
       let args = payload?.updatedInput;
       if (!args) {
-        const context = this.managedModifyContext(toolCall);
+        const context = this.managedModifyContext(toolCall, (value) => {
+          modification = value;
+        });
         if (outcome === ToolConfirmationOutcome.ModifyWithEditor) {
           const editor = this.getPreferredEditor();
           if (!editor) return;
@@ -4112,7 +4130,15 @@ export class CoreToolScheduler {
       }
       if (shouldSwitchToDefault)
         this.config.setApprovalMode(ApprovalMode.DEFAULT);
-      if (await this.reprepareManagedToolCall(toolCall, args, signal)) return;
+      if (
+        await this.reprepareManagedToolCall(
+          toolCall,
+          args,
+          signal,
+          modification,
+        )
+      )
+        return;
       if (this.cancelPreExecutionIfAborted(callId, signal)) return;
       if (outcome === ToolConfirmationOutcome.ModifyWithEditor) {
         this.setStatusInternal(callId, 'awaiting_approval', {
