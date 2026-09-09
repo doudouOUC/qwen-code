@@ -60,6 +60,45 @@ export function getGlobToolDefinition(): ManagedToolDescriptor {
   );
 }
 
+export function getGrepToolDefinition(): ManagedToolDescriptor {
+  return {
+    ...defineTool(
+      ToolNames.GREP,
+      ToolDisplayNames.GREP,
+      'Search file contents using the available search backend.\n- Use Grep for content searches instead of invoking grep or rg through Bash.\n- Accepts regular expression patterns; syntax and case handling depend on the available backend.\n- Filter files with glob patterns such as "*.js" or "**/*.tsx".\n- Use the Agent tool for open-ended searches requiring multiple rounds.',
+      Kind.Search,
+      {
+        properties: {
+          pattern: {
+            type: 'string',
+            description:
+              'The regular expression pattern to search for in file contents',
+          },
+          glob: {
+            type: 'string',
+            description:
+              'Glob pattern to filter files (e.g. "*.js", "*.{ts,tsx}")',
+          },
+          path: {
+            type: 'string',
+            description:
+              'Directory to search in; file paths are also supported by the ripgrep backend. Defaults to the workspace directories.',
+          },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            description:
+              'Maximum matching lines to return. Must be a positive integer. Configured output limits still apply when omitted.',
+          },
+        },
+        required: ['pattern'],
+        type: 'object',
+      },
+    ),
+    maxOutputChars: 20_000,
+  };
+}
+
 export function getLSToolDefinition(): ManagedToolDescriptor {
   return defineTool(
     ToolNames.LS,

@@ -11,6 +11,7 @@ import { getShellConfiguration } from '../utils/shell-utils.js';
 import {
   getEditToolDefinition,
   getGlobToolDefinition,
+  getGrepToolDefinition,
   getLSToolDefinition,
   getReadFileToolDefinition,
   getShellToolDefinition,
@@ -22,6 +23,8 @@ import { EditTool } from './edit.js';
 import { ShellTool } from './shell.js';
 import { GlobTool } from './glob.js';
 import { LSTool } from './ls.js';
+import { GrepTool } from './grep.js';
+import { RipGrepTool } from './ripGrep.js';
 import { managedToolDigest } from './managed-tool-protocol.js';
 import { ManagedToolRuntime } from './managed-tool-runtime.js';
 
@@ -31,6 +34,26 @@ afterEach(() => {
 });
 
 describe('builtin tool definition compatibility', () => {
+  it('shares the Grep schema and descriptor across both real backends', () => {
+    const config = {} as Config;
+    for (const tool of [new GrepTool(config), new RipGrepTool(config)]) {
+      const runtime = new ManagedToolRuntime(
+        config,
+        () => [tool],
+        () => 'policy',
+      );
+      expect(runtime.manifest().tools).toEqual([getGrepToolDefinition()]);
+      expect(tool.toAutoClassifierInput({ pattern: 'needle' })).toBe('');
+      expect(tool.schema.parametersJsonSchema).toEqual(
+        expect.objectContaining({
+          required: ['pattern'],
+          properties: expect.objectContaining({
+            limit: expect.objectContaining({ type: 'integer', minimum: 1 }),
+          }),
+        }),
+      );
+    }
+  });
   it('preserves the existing Glob and LS declarations and classifier inputs', () => {
     const config = {} as Config;
     const local = [new GlobTool(config), new LSTool(config)] as const;

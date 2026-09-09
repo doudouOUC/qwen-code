@@ -3923,7 +3923,9 @@ describe('owned foreground process groups', () => {
     'refuses promotion and drains the original group, PTY=%s',
     async (usePty) => {
       const run = await start(usePty);
-      run.abort.abort({ kind: 'background' });
+      const reason = { kind: 'background' };
+      run.abort.abort(reason);
+      reason.kind = 'cancel';
       await vi.advanceTimersByTimeAsync(500);
       expect(run.settled).not.toHaveBeenCalled();
       expect(mockProcessKill).toHaveBeenCalledWith(-pid, 'SIGKILL');

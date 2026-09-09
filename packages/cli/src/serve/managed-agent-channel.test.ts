@@ -149,6 +149,11 @@ describe('managed Agent channel', () => {
         respectQwenIgnore: true,
       }),
       isLsToolEnabled: () => false,
+      getUseRipgrep: () => true,
+      getUseBuiltinRipgrep: () => true,
+      getTruncateToolOutputThreshold: () => 25000,
+      getTruncateToolOutputLines: () => 1000,
+      isTruncateToolOutputThresholdExplicit: () => false,
     } as unknown as Config);
     await session.close();
     expect(acquire).not.toHaveBeenCalled();

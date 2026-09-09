@@ -123,6 +123,11 @@ describe('managed tool Session binding', () => {
         respectQwenIgnore: true,
       }),
       isLsToolEnabled: () => false,
+      getUseRipgrep: () => true,
+      getUseBuiltinRipgrep: () => true,
+      getTruncateToolOutputThreshold: () => 25000,
+      getTruncateToolOutputLines: () => 1000,
+      isTruncateToolOutputThresholdExplicit: () => false,
       getSessionId: () => id,
       getFileHistoryService: () => service,
       getChatRecordingService: () => ({
@@ -166,6 +171,8 @@ describe('managed tool Session binding', () => {
       workspaceDirectories: [cwd],
       memoryBaseDir: join(cwd, 'memory-base'),
       lsToolEnabled: false,
+      grepOptions: { useRipgrep: true, useBuiltinRipgrep: true },
+      outputLimits: { chars: 25000, lines: 1000, charsExplicit: false },
       fileFilteringOptions: {
         respectGitIgnore: true,
         respectQwenIgnore: true,
@@ -315,6 +322,8 @@ describe('managed tool Session binding', () => {
       workspaceDirectories: [],
       memoryBaseDir: join(cwd, 'child-memory'),
       lsToolEnabled: true,
+      grepOptions: { useRipgrep: true, useBuiltinRipgrep: true },
+      outputLimits: { chars: 25000, lines: 1000, charsExplicit: false },
       fileFilteringOptions: {
         respectGitIgnore: false,
         respectQwenIgnore: true,

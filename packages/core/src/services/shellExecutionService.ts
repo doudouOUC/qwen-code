@@ -7,7 +7,7 @@
 import stripAnsi from 'strip-ansi';
 import type { PtyImplementation } from '../utils/getPty.js';
 import { getPty } from '../utils/getPty.js';
-import { execFile, spawn as cpSpawn, spawnSync } from 'node:child_process';
+import { spawn as cpSpawn, spawnSync } from 'node:child_process';
 import { TextDecoder } from 'node:util';
 import os from 'node:os';
 import type { IPty } from '@lydell/node-pty';
@@ -30,6 +30,10 @@ import { formatMemoryUsage } from '../utils/formatters.js';
 import { getShellContextEnvVars } from './shellContextEnv.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import { getShellPagerEnv } from '../utils/shell-pager-env.js';
+import {
+  ownProcessGroup,
+  type OwnedProcessGroup,
+} from '../utils/owned-process-group.js';
 
 const debugLogger = createDebugLogger('SHELL_EXECUTION');
 
@@ -252,217 +256,6 @@ export interface ShellExecutionConfig {
   maxBufferedOutputBytes?: number;
   // Used for testing
   disableDynamicLineTrimming?: boolean;
-}
-
-interface OwnedShellProcessGroup {
-  exited: Promise<void>;
-  killSync(): void;
-  promotionRequested(): boolean;
-}
-
-interface ShellGroupMember {
-  pid: number;
-  pgid: number;
-  identity: string;
-  zombie: boolean;
-}
-
-const GROUP_PS_ARGS = [
-  '-A',
-  '-o',
-  'pid=',
-  '-o',
-  'pgid=',
-  '-o',
-  'lstart=',
-  '-o',
-  'stat=',
-];
-const GROUP_PS_OPTIONS = {
-  encoding: 'utf8' as const,
-  timeout: 1000,
-  maxBuffer: 4 * 1024 * 1024,
-};
-
-function parseShellProcessGroup(output: string): ShellGroupMember[] {
-  const members: ShellGroupMember[] = [];
-  for (const line of output.split('\n')) {
-    if (!line.trim()) continue;
-    const match = /^\s*(\d+)\s+(\d+)\s+(.+?)\s+(\S+)\s*$/.exec(line);
-    if (!match) throw new Error('Cannot parse shell process group snapshot.');
-    members.push({
-      pid: Number(match[1]),
-      pgid: Number(match[2]),
-      identity: `${match[1]}:${match[3]}`,
-      zombie: match[4].startsWith('Z'),
-    });
-  }
-  if (members.length === 0)
-    throw new Error('Shell process snapshot was unexpectedly empty.');
-  return members;
-}
-
-function readShellProcessGroupSync(): ShellGroupMember[] {
-  const result = spawnSync('/bin/ps', GROUP_PS_ARGS, {
-    ...GROUP_PS_OPTIONS,
-    env: { ...process.env, LC_ALL: 'C' },
-  });
-  if (result.error || result.status !== 0)
-    throw result.error ?? new Error('Cannot inspect shell process group.');
-  return parseShellProcessGroup(result.stdout);
-}
-
-function readShellProcessGroup(): Promise<ShellGroupMember[]> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      '/bin/ps',
-      GROUP_PS_ARGS,
-      { ...GROUP_PS_OPTIONS, env: { ...process.env, LC_ALL: 'C' } },
-      (error, stdout) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        try {
-          resolve(parseShellProcessGroup(stdout));
-        } catch (error) {
-          reject(error);
-        }
-      },
-    );
-  });
-}
-
-function ownShellProcessGroup(
-  pgid: number,
-  signal: AbortSignal,
-): OwnedShellProcessGroup {
-  let resolveExit!: () => void;
-  const exited = new Promise<void>((resolve) => {
-    resolveExit = resolve;
-  });
-  let closed = false;
-  let anchored = false;
-  let uncertain = false;
-  let known = new Set<string>();
-  let cancelRequested = signal.aborted;
-  let promotion =
-    signal.aborted && getShellAbortReasonKind(signal.reason) === 'background';
-  let termSentAt: number | undefined;
-  let killSent = false;
-  let warning: string | undefined;
-  const onAbort = () => {
-    cancelRequested = true;
-    promotion = getShellAbortReasonKind(signal.reason) === 'background';
-  };
-  signal.addEventListener('abort', onAbort, { once: true });
-  const close = () => {
-    closed = true;
-    signal.removeEventListener('abort', onAbort);
-    resolveExit();
-  };
-  const observe = (snapshot: ShellGroupMember[]): boolean => {
-    if (closed) return false;
-    const initialLeader =
-      !anchored && !uncertain
-        ? snapshot.find((member) => member.pid === pgid)
-        : undefined;
-    if (initialLeader) known.add(initialLeader.identity);
-    // Unobserved setsid/detached children are outside this group contract.
-    // An observed member moving groups is not proof that our work stopped.
-    if (
-      snapshot.some(
-        (member) =>
-          known.has(member.identity) && member.pgid !== pgid && !member.zombie,
-      )
-    ) {
-      uncertain = true;
-      throw new Error(
-        'An owned shell process moved outside its process group.',
-      );
-    }
-    const members = snapshot.filter((member) => member.pgid === pgid);
-    if (!members.some((member) => !member.zombie)) {
-      close();
-      return false;
-    }
-    // A continuous member identity prevents a reused PGID from acquiring the
-    // previous command's kill authority. Lost continuity remains uncontained.
-    if (
-      uncertain ||
-      !(anchored
-        ? members.some((member) => known.has(member.identity))
-        : members.some((member) => member.pid === pgid))
-    ) {
-      uncertain = true;
-      throw new Error('Shell process group ownership continuity was lost.');
-    }
-    anchored = true;
-    known = new Set(members.map((member) => member.identity));
-    return true;
-  };
-  const send = (kind: NodeJS.Signals) => {
-    try {
-      process.kill(-pgid, kind);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
-        // Never signal this PGID again after observing its disappearance.
-        // A fresh snapshot must still exclude an observed member escaping.
-        uncertain = true;
-        return;
-      }
-      throw error;
-    }
-  };
-  const report = (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message !== warning)
-      debugLogger.warn(
-        `Shell process group ${pgid} remains uncontained: ${message}`,
-      );
-    warning = message;
-  };
-  // Capture before yielding to leader-exit callbacks, while its PID is still
-  // ours. Later probes must retain an identity from this process group.
-  try {
-    observe(readShellProcessGroupSync());
-  } catch (error) {
-    uncertain = true;
-    report(error);
-  }
-  void (async () => {
-    while (!closed) {
-      try {
-        if (observe(await readShellProcessGroup()) && cancelRequested) {
-          if (termSentAt === undefined) {
-            send('SIGTERM');
-            termSentAt = Date.now();
-          } else if (
-            !killSent &&
-            Date.now() - termSentAt >= SIGKILL_TIMEOUT_MS
-          ) {
-            send('SIGKILL');
-            killSent = true;
-          }
-        }
-      } catch (error) {
-        report(error);
-      }
-      if (!closed) await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  })();
-  return {
-    exited,
-    promotionRequested: () => promotion,
-    killSync() {
-      if (closed) return;
-      try {
-        if (observe(readShellProcessGroupSync())) send('SIGKILL');
-      } catch (error) {
-        report(error);
-      }
-    },
-  };
 }
 
 function getMaxBufferedOutputBytes(config: ShellExecutionConfig): number {
@@ -874,7 +667,7 @@ const getCleanupStrategy = () =>
 export class ShellExecutionService {
   private static activePtys = new Map<number, ActivePty>();
   private static activeChildProcesses = new Set<number>();
-  private static ownedProcessGroups = new Map<number, OwnedShellProcessGroup>();
+  private static ownedProcessGroups = new Map<number, OwnedProcessGroup>();
 
   static cleanup() {
     const strategy = getCleanupStrategy();
@@ -910,7 +703,10 @@ export class ShellExecutionService {
   ): ShellExecutionHandle {
     if (!required || handle.pid === undefined) return handle;
     const pid = handle.pid;
-    const group = ownShellProcessGroup(pid, signal);
+    let promotion = false;
+    const group = ownProcessGroup(pid, signal, (reason) => {
+      promotion = getShellAbortReasonKind(reason) === 'background';
+    });
     this.ownedProcessGroups.set(pid, group);
     return {
       pid,
@@ -919,7 +715,7 @@ export class ShellExecutionService {
         await group.exited;
         if (this.ownedProcessGroups.get(pid) === group)
           this.ownedProcessGroups.delete(pid);
-        if (group.promotionRequested()) {
+        if (promotion) {
           return {
             ...result,
             aborted: true,

@@ -1719,6 +1719,11 @@ export type DerivedConfigOverrides = Partial<
     | 'getFileFilteringOptions'
     | 'getMemoryBaseDir'
     | 'isLsToolEnabled'
+    | 'getUseRipgrep'
+    | 'getUseBuiltinRipgrep'
+    | 'getTruncateToolOutputThreshold'
+    | 'isTruncateToolOutputThresholdExplicit'
+    | 'getTruncateToolOutputLines'
     | 'getToolRegistry'
     | 'getPermissionManager'
     | 'getApprovalMode'
@@ -9457,12 +9462,23 @@ export class Config {
     });
 
     // --- Grep / RipGrep (conditional) ---
-    if (this.getUseRipgrep()) {
+    if (this.managedToolSessionFactory) {
+      await registerLazy(ToolNames.GREP, async () => {
+        throw new Error('Managed Grep requires a Runtime proxy.');
+      });
+    } else if (this.getUseRipgrep()) {
       let useRipgrep = false;
       let errorString: undefined | string = undefined;
       recordStartupEvent('config_initialize_ripgrep_probe_start');
       try {
-        useRipgrep = await canUseRipgrep(this.getUseBuiltinRipgrep());
+        useRipgrep =
+          this.sessionSourceType === 'managed-gateway' &&
+          this.sessionSourceId === this.getSessionId()
+            ? await canUseRipgrep(this.getUseBuiltinRipgrep(), {
+                requireProcessGroupExit: true,
+                cwd: this.getTargetDir(),
+              })
+            : await canUseRipgrep(this.getUseBuiltinRipgrep());
       } catch (error: unknown) {
         errorString = getErrorMessage(error);
       }

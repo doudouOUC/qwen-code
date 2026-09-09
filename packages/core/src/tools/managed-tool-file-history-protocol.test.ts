@@ -7,12 +7,14 @@
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  captureManagedToolExecutionContext,
   parseManagedToolFileHistoryBinding,
   type ManagedToolExecutionContext,
   parseManagedToolFileHistoryPromptId,
   parseManagedToolFileHistoryState,
 } from './managed-tool-file-history-protocol.js';
 import { managedToolDigest } from './managed-tool-protocol.js';
+import type { Config } from '../config/config.js';
 
 const ownerSessionId = '550e8400-e29b-41d4-a716-446655440108';
 const ownerRuntimeSessionId = '550e8400-e29b-41d4-a716-446655440109';
@@ -64,6 +66,62 @@ describe('managed file history protocol', () => {
         executionContext: { ...context, workspaceDirectories: [] },
       }).executionContext?.workspaceDirectories,
     ).toEqual([]);
+  });
+
+  it.each([null, 17.5])(
+    'round trips explicit output limits (%s) and backend preferences',
+    (chars) => {
+      const config = {
+        getWorkspaceContext: () => ({
+          getDirectories: () => context.workspaceDirectories,
+        }),
+        getMemoryBaseDir: () => context.memoryBaseDir,
+        isLsToolEnabled: () => context.lsToolEnabled,
+        getFileFilteringOptions: () => context.fileFilteringOptions,
+        getUseRipgrep: () => false,
+        getUseBuiltinRipgrep: () => true,
+        getTruncateToolOutputThreshold: () => chars ?? Infinity,
+        getTruncateToolOutputLines: () => Infinity,
+        isTruncateToolOutputThresholdExplicit: () => true,
+      } as unknown as Config;
+      const captured = captureManagedToolExecutionContext(config);
+      expect(captured.grepOptions).toEqual({
+        useRipgrep: false,
+        useBuiltinRipgrep: true,
+      });
+      expect(captured.outputLimits).toEqual({
+        chars,
+        lines: null,
+        charsExplicit: true,
+      });
+      const parsed = parseManagedToolFileHistoryBinding(
+        JSON.parse(JSON.stringify({ ...binding, executionContext: captured })),
+      );
+      expect(parsed.executionContext).toEqual(captured);
+      captured.grepOptions!.useRipgrep = true;
+      captured.outputLimits!.lines = 3;
+      expect(parsed.executionContext?.grepOptions?.useRipgrep).toBe(false);
+      expect(parsed.executionContext?.outputLimits?.lines).toBeNull();
+    },
+  );
+
+  it.each([
+    { grepOptions: {} },
+    { grepOptions: { useRipgrep: 'true', useBuiltinRipgrep: true } },
+    { grepOptions: { useRipgrep: true, useBuiltinRipgrep: true, extra: true } },
+    { outputLimits: { chars: 0, lines: 1, charsExplicit: false } },
+    { outputLimits: { chars: 1, lines: -1, charsExplicit: false } },
+    { outputLimits: { chars: Infinity, lines: 1, charsExplicit: false } },
+    { outputLimits: { chars: NaN, lines: 1, charsExplicit: false } },
+    { outputLimits: { chars: null, lines: null } },
+    { outputLimits: { chars: null, lines: null, charsExplicit: 'false' } },
+  ])('rejects invalid search preferences and limits', (extra) => {
+    expect(() =>
+      parseManagedToolFileHistoryBinding({
+        ...binding,
+        executionContext: { ...context, ...extra },
+      }),
+    ).toThrow();
   });
 
   it.each([

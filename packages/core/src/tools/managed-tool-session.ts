@@ -10,6 +10,7 @@ import type { ShellConfiguration } from '../utils/shell-utils.js';
 import {
   getEditToolDefinition,
   getGlobToolDefinition,
+  getGrepToolDefinition,
   getLSToolDefinition,
   getReadFileToolDefinition,
   getShellToolDefinition,
@@ -76,6 +77,12 @@ export function createManagedBuiltinTool(
     },
   };
   switch (name) {
+    case ToolNames.GREP:
+      return new RuntimeBackedTool({
+        ...shared,
+        descriptor: getGrepToolDefinition(),
+        projectClassifierInput: () => '',
+      });
     case ToolNames.GLOB:
       return new RuntimeBackedTool({
         ...shared,

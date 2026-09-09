@@ -5,6 +5,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { canUseRipgrep } from '../utils/ripgrepUtils.js';
 import type { Config } from '../config/config.js';
 import {
   firePreToolUseHook,
@@ -725,6 +726,8 @@ export async function createBuiltinManagedToolRuntime(
     { ShellTool },
     { GlobTool },
     { LSTool },
+    { GrepTool },
+    { RipGrepTool },
   ] = await Promise.all([
     import('./read-file.js'),
     import('./write-file.js'),
@@ -732,6 +735,8 @@ export async function createBuiltinManagedToolRuntime(
     import('./shell.js'),
     import('./glob.js'),
     import('./ls.js'),
+    import('./grep.js'),
+    import('./ripGrep.js'),
   ]);
   const registry = config.getToolRegistry();
   if (
@@ -770,6 +775,29 @@ export async function createBuiltinManagedToolRuntime(
     (Constructor) => Constructor !== LSTool || toolConfig.isLsToolEnabled(),
   );
   const revision = randomUUID();
+  const admittedGrep = registry.getTool(GrepTool.Name);
+  let grep: AnyDeclarativeTool | undefined;
+  if (
+    admittedGrep?.constructor === GrepTool ||
+    admittedGrep?.constructor === RipGrepTool
+  ) {
+    let useRipgrep = false;
+    if (toolConfig.getUseRipgrep()) {
+      try {
+        useRipgrep = await canUseRipgrep(toolConfig.getUseBuiltinRipgrep(), {
+          requireProcessGroupExit: true,
+          cwd: toolConfig.getTargetDir(),
+        });
+      } catch (error) {
+        if (
+          (error as NodeJS.ErrnoException).code ===
+          'ERR_OWNED_COMMAND_UNSUPPORTED'
+        )
+          throw error;
+      }
+    }
+    grep = useRipgrep ? new RipGrepTool(toolConfig) : new GrepTool(toolConfig);
+  }
   const boundTools =
     toolConfig === config
       ? undefined
@@ -781,16 +809,21 @@ export async function createBuiltinManagedToolRuntime(
         });
   return new ManagedToolRuntime(
     toolConfig,
-    () =>
-      boundTools?.filter(
+    () => [
+      ...(boundTools?.filter(
         (tool) =>
           config.getToolRegistry().getTool(tool.name)?.constructor ===
           tool.constructor,
       ) ??
-      constructors.flatMap((Constructor): AnyDeclarativeTool[] => {
-        const tool = config.getToolRegistry().getTool(Constructor.Name);
-        return tool?.constructor === Constructor ? [tool] : [];
-      }),
+        constructors.flatMap((Constructor): AnyDeclarativeTool[] => {
+          const tool = config.getToolRegistry().getTool(Constructor.Name);
+          return tool?.constructor === Constructor ? [tool] : [];
+        })),
+      ...(grep &&
+      config.getToolRegistry().getTool(GrepTool.Name) === admittedGrep
+        ? [grep]
+        : []),
+    ],
     () => revision,
     fileHistory,
   );

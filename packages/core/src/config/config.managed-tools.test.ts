@@ -14,6 +14,7 @@ import type { PermissionManager } from '../permissions/permission-manager.js';
 import type { ManagedToolSession } from '../tools/managed-tool-session.js';
 import { RuntimeBackedTool } from '../tools/runtime-backed-tool.js';
 import { ToolNames } from '../tools/tool-names.js';
+import { canUseRipgrep } from '../utils/ripgrepUtils.js';
 
 const localConstruct = vi.hoisted(() =>
   vi.fn(() => {
@@ -26,6 +27,9 @@ vi.mock('../tools/edit.js', () => ({ EditTool: localConstruct }));
 vi.mock('../tools/shell.js', () => ({ ShellTool: localConstruct }));
 vi.mock('../tools/glob.js', () => ({ GlobTool: localConstruct }));
 vi.mock('../tools/ls.js', () => ({ LSTool: localConstruct }));
+vi.mock('../tools/grep.js', () => ({ GrepTool: localConstruct }));
+vi.mock('../tools/ripGrep.js', () => ({ RipGrepTool: localConstruct }));
+vi.mock('../utils/ripgrepUtils.js', () => ({ canUseRipgrep: vi.fn() }));
 
 const names = [
   ToolNames.READ_FILE,
@@ -33,6 +37,7 @@ const names = [
   ToolNames.EDIT,
   ToolNames.SHELL,
   ToolNames.GLOB,
+  ToolNames.GREP,
 ];
 
 describe('Config managed tool registration', () => {
@@ -53,6 +58,7 @@ describe('Config managed tool registration', () => {
     getClient.mockReset().mockRejectedValue(new Error('Runtime not ready'));
     close.mockReset().mockResolvedValue(undefined);
     localConstruct.mockClear();
+    vi.mocked(canUseRipgrep).mockClear();
     childSessions.length = 0;
     const makeChild = (): ManagedToolSession => {
       const session: ManagedToolSession = {
@@ -93,7 +99,7 @@ describe('Config managed tool registration', () => {
       model: 'test',
       telemetry: { enabled: false },
       usageStatisticsEnabled: false,
-      useRipgrep: false,
+      useRipgrep: true,
       managedToolSessionFactory: () => rootSession,
     });
     vi.spyOn(config, 'getPermissionManager').mockReturnValue({
@@ -126,6 +132,7 @@ describe('Config managed tool registration', () => {
       ).toBe(true);
     }
     expect(localConstruct).not.toHaveBeenCalled();
+    expect(canUseRipgrep).not.toHaveBeenCalled();
     expect(getClient).not.toHaveBeenCalled();
     const invocation = registry
       .getTool(ToolNames.READ_FILE)!

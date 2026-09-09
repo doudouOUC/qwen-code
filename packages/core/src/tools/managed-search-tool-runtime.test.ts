@@ -12,11 +12,19 @@ import { Config, deriveConfig } from '../config/config.js';
 import type { PermissionManager } from '../permissions/permission-manager.js';
 import { GlobTool } from './glob.js';
 import { LSTool } from './ls.js';
+import { GrepTool } from './grep.js';
+import { RipGrepTool } from './ripGrep.js';
+import { canUseRipgrep } from '../utils/ripgrepUtils.js';
 import {
   createBuiltinManagedToolRuntime,
   type ManagedToolRuntime,
 } from './managed-tool-runtime.js';
 import { ToolRegistry } from './tool-registry.js';
+
+vi.mock('../utils/ripgrepUtils.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/ripgrepUtils.js')>()),
+  canUseRipgrep: vi.fn(),
+}));
 
 describe('managed search Runtime context', () => {
   let root: string;
@@ -47,6 +55,7 @@ describe('managed search Runtime context', () => {
       getToolRegistrationStatus: registration,
     } as unknown as PermissionManager);
     runtime = undefined;
+    vi.mocked(canUseRipgrep).mockReset().mockResolvedValue(true);
   });
   afterEach(async () => {
     await runtime?.dispose();
@@ -154,5 +163,57 @@ describe('managed search Runtime context', () => {
         );
       }
     }
+  });
+
+  it.each([
+    { useRipgrep: false, healthy: true, selected: GrepTool },
+    { useRipgrep: true, healthy: false, selected: GrepTool },
+    { useRipgrep: true, healthy: true, selected: RipGrepTool },
+  ])(
+    'selects only the bound Grep backend ($useRipgrep / $healthy)',
+    async ({ useRipgrep, healthy, selected }) => {
+      registry.registerTool(new RipGrepTool(config));
+      vi.mocked(canUseRipgrep).mockResolvedValue(healthy);
+      const view = deriveConfig(config, {
+        getUseRipgrep: () => useRipgrep,
+        getUseBuiltinRipgrep: () => false,
+      });
+      const fallbackBuild = vi.spyOn(GrepTool.prototype, 'build');
+      const ripgrepBuild = vi.spyOn(RipGrepTool.prototype, 'build');
+      runtime = await createBuiltinManagedToolRuntime(config, undefined, view);
+      const manifest = runtime.manifest();
+      expect(manifest.tools.map((tool) => tool.name)).toEqual([GrepTool.Name]);
+      const call = {
+        sessionId: config.getSessionId(),
+        promptId: 'grep-turn',
+        callId: 'grep-call',
+        capabilityDigest: manifest.capabilityDigest,
+        policyRevision: manifest.policyRevision,
+      };
+      await runtime.beginTurn(call);
+      await runtime.prepare(call, GrepTool.Name, { pattern: 'needle' });
+      expect(fallbackBuild).toHaveBeenCalledTimes(
+        selected === GrepTool ? 1 : 0,
+      );
+      expect(ripgrepBuild).toHaveBeenCalledTimes(
+        selected === RipGrepTool ? 1 : 0,
+      );
+      if (useRipgrep)
+        expect(canUseRipgrep).toHaveBeenCalledWith(false, {
+          requireProcessGroupExit: true,
+          cwd: root,
+        });
+      else expect(canUseRipgrep).not.toHaveBeenCalled();
+      registry.registerTool(new RipGrepTool(config));
+      expect(runtime.manifest().tools).toEqual([]);
+    },
+  );
+
+  it('does not probe or admit a missing or replaced Grep implementation', async () => {
+    class CustomGrep extends GrepTool {}
+    registry.registerTool(new CustomGrep(config));
+    runtime = await createBuiltinManagedToolRuntime(config);
+    expect(runtime.manifest().tools).toEqual([]);
+    expect(canUseRipgrep).not.toHaveBeenCalled();
   });
 });

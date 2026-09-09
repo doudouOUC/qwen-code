@@ -217,6 +217,7 @@ describe('owned Runtime activation', () => {
       managedWorkerEnvironment({
         HOME: '/home/test',
         PATH: '/bin',
+        WSL_INTEROP: '/run/WSL/123_interop',
         QWEN_HOME: '/config',
         QWEN_CODE_TRUSTED_FOLDERS_PATH: '/trust',
         OPENAI_API_KEY: 'secret',
@@ -228,6 +229,7 @@ describe('owned Runtime activation', () => {
     ).toEqual({
       HOME: '/home/test',
       PATH: '/bin',
+      WSL_INTEROP: '/run/WSL/123_interop',
       QWEN_HOME: '/config',
       QWEN_CODE_TRUSTED_FOLDERS_PATH: '/trust',
     });

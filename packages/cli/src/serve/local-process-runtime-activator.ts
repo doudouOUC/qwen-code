@@ -60,7 +60,7 @@ export function managedWorkerEnvironment(
   const result: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(source)) {
     if (
-      /^(PATH|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|SystemRoot|WINDIR|COMSPEC|PATHEXT|TMP|TEMP|TMPDIR|LANG|LC_[A-Z_]+|TZ|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|HTTPS?_PROXY|ALL_PROXY|NO_PROXY|https?_proxy|all_proxy|no_proxy|QWEN_HOME|QWEN_CODE_TRUSTED_FOLDERS_PATH)$/.test(
+      /^(PATH|HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|SystemRoot|WINDIR|COMSPEC|PATHEXT|TMP|TEMP|TMPDIR|LANG|LC_[A-Z_]+|TZ|WSL_INTEROP|SSL_CERT_FILE|SSL_CERT_DIR|NODE_EXTRA_CA_CERTS|HTTPS?_PROXY|ALL_PROXY|NO_PROXY|https?_proxy|all_proxy|no_proxy|QWEN_HOME|QWEN_CODE_TRUSTED_FOLDERS_PATH)$/.test(
         key,
       )
     )

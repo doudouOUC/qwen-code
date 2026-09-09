@@ -107,6 +107,8 @@ export function createManagedToolSessionFactory(options: {
       Object.freeze(executionContext.workspaceDirectories);
       Object.freeze(executionContext.fileFilteringOptions.customIgnoreFiles);
       Object.freeze(executionContext.fileFilteringOptions);
+      Object.freeze(executionContext.grepOptions);
+      Object.freeze(executionContext.outputLimits);
       Object.freeze(executionContext);
       const contextDigest = managedToolDigest(executionContext);
       const request: ManagedRuntimePrepareRequest = Object.freeze({

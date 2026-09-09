@@ -140,6 +140,23 @@ export class ManagedToolFileHistorySessions {
               getFileFilteringOptions: () =>
                 structuredClone(context.fileFilteringOptions),
               isLsToolEnabled: () => context.lsToolEnabled,
+              ...(context.grepOptions
+                ? {
+                    getUseRipgrep: () => context.grepOptions!.useRipgrep,
+                    getUseBuiltinRipgrep: () =>
+                      context.grepOptions!.useBuiltinRipgrep,
+                  }
+                : {}),
+              ...(context.outputLimits
+                ? {
+                    getTruncateToolOutputThreshold: () =>
+                      context.outputLimits!.chars ?? Number.POSITIVE_INFINITY,
+                    getTruncateToolOutputLines: () =>
+                      context.outputLimits!.lines ?? Number.POSITIVE_INFINITY,
+                    isTruncateToolOutputThresholdExplicit: () =>
+                      context.outputLimits!.charsExplicit,
+                  }
+                : {}),
             })
           : (view?.config ?? config);
       config.bindSharedFileHistoryService(owner.service);

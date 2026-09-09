@@ -20,6 +20,15 @@ export interface ManagedToolExecutionContext {
   workspaceDirectories: string[];
   memoryBaseDir: string;
   lsToolEnabled: boolean;
+  grepOptions?: {
+    useRipgrep: boolean;
+    useBuiltinRipgrep: boolean;
+  };
+  outputLimits?: {
+    chars: number | null;
+    lines: number | null;
+    charsExplicit: boolean;
+  };
   fileFilteringOptions: {
     respectGitIgnore: boolean;
     respectQwenIgnore: boolean;
@@ -35,6 +44,15 @@ export function captureManagedToolExecutionContext(
     workspaceDirectories: [...config.getWorkspaceContext().getDirectories()],
     memoryBaseDir: config.getMemoryBaseDir(),
     lsToolEnabled: config.isLsToolEnabled(),
+    grepOptions: {
+      useRipgrep: config.getUseRipgrep(),
+      useBuiltinRipgrep: config.getUseBuiltinRipgrep(),
+    },
+    outputLimits: {
+      chars: encodeOutputLimit(config.getTruncateToolOutputThreshold()),
+      lines: encodeOutputLimit(config.getTruncateToolOutputLines()),
+      charsExplicit: config.isTruncateToolOutputThresholdExplicit(),
+    },
     fileFilteringOptions: {
       respectGitIgnore: filtering.respectGitIgnore,
       respectQwenIgnore: filtering.respectQwenIgnore,
@@ -179,12 +197,53 @@ function absolutePath(value: unknown): string {
   return result;
 }
 
+function encodeOutputLimit(value: number): number | null {
+  return value === Number.POSITIVE_INFINITY ? null : value;
+}
+
+function outputLimit(value: unknown): number | null {
+  if (value === null) return null;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)
+    throw new ManagedToolProtocolError();
+  return value;
+}
+
+function grepOptions(
+  value: unknown,
+): ManagedToolExecutionContext['grepOptions'] {
+  const input = record(value, ['useRipgrep', 'useBuiltinRipgrep']);
+  if (
+    typeof input['useRipgrep'] !== 'boolean' ||
+    typeof input['useBuiltinRipgrep'] !== 'boolean'
+  )
+    throw new ManagedToolProtocolError();
+  return {
+    useRipgrep: input['useRipgrep'],
+    useBuiltinRipgrep: input['useBuiltinRipgrep'],
+  };
+}
+
+function outputLimits(
+  value: unknown,
+): ManagedToolExecutionContext['outputLimits'] {
+  const input = record(value, ['chars', 'lines', 'charsExplicit']);
+  if (typeof input['charsExplicit'] !== 'boolean')
+    throw new ManagedToolProtocolError();
+  return {
+    chars: outputLimit(input['chars']),
+    lines: outputLimit(input['lines']),
+    charsExplicit: input['charsExplicit'],
+  };
+}
+
 function executionContext(value: unknown): ManagedToolExecutionContext {
   const input = record(value, [
     'workspaceDirectories',
     'memoryBaseDir',
     'fileFilteringOptions',
     'lsToolEnabled',
+    'grepOptions',
+    'outputLimits',
   ]);
   const filtering = record(input['fileFilteringOptions'], [
     'respectGitIgnore',
@@ -214,6 +273,12 @@ function executionContext(value: unknown): ManagedToolExecutionContext {
     workspaceDirectories: directories,
     memoryBaseDir: absolutePath(input['memoryBaseDir']),
     lsToolEnabled: input['lsToolEnabled'],
+    ...('grepOptions' in input
+      ? { grepOptions: grepOptions(input['grepOptions']) }
+      : {}),
+    ...('outputLimits' in input
+      ? { outputLimits: outputLimits(input['outputLimits']) }
+      : {}),
     fileFilteringOptions: {
       respectGitIgnore: filtering['respectGitIgnore'],
       respectQwenIgnore: filtering['respectQwenIgnore'],

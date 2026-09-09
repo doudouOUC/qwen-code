@@ -140,6 +140,8 @@ describe('owned Runtime shared file history', () => {
       workspaceDirectories: [cwd, gatewayExtra],
       memoryBaseDir: join(cwd, 'gateway-memory-not-created'),
       lsToolEnabled: true,
+      grepOptions: { useRipgrep: false, useBuiltinRipgrep: false },
+      outputLimits: { chars: null, lines: 7, charsExplicit: true },
       fileFilteringOptions: {
         respectGitIgnore: false,
         respectQwenIgnore: true,
@@ -156,6 +158,8 @@ describe('owned Runtime shared file history', () => {
           ...context,
           workspaceDirectories: [cwd],
           lsToolEnabled: false,
+          grepOptions: { useRipgrep: true, useBuiltinRipgrep: false },
+          outputLimits: { chars: 123, lines: null, charsExplicit: true },
         },
       },
       find,
@@ -181,6 +185,20 @@ describe('owned Runtime shared file history', () => {
     );
     expect(parentBinding.toolConfig.isLsToolEnabled()).toBe(true);
     expect(childBinding.toolConfig.isLsToolEnabled()).toBe(false);
+    expect(parentBinding.toolConfig.getUseRipgrep()).toBe(false);
+    expect(childBinding.toolConfig.getUseRipgrep()).toBe(true);
+    expect(childBinding.toolConfig.getUseBuiltinRipgrep()).toBe(false);
+    expect(parentBinding.toolConfig.getTruncateToolOutputThreshold()).toBe(
+      Infinity,
+    );
+    expect(parentBinding.toolConfig.getTruncateToolOutputLines()).toBe(7);
+    expect(childBinding.toolConfig.getTruncateToolOutputThreshold()).toBe(123);
+    expect(childBinding.toolConfig.getTruncateToolOutputLines()).toBe(Infinity);
+    expect(
+      childBinding.toolConfig.isTruncateToolOutputThresholdExplicit(),
+    ).toBe(true);
+    expect(child.getUseBuiltinRipgrep()).toBe(true);
+    expect(child.isTruncateToolOutputThresholdExplicit()).toBe(false);
     expect(childBinding.toolConfig.getFileFilteringOptions()).toEqual(
       context.fileFilteringOptions,
     );
@@ -188,6 +206,10 @@ describe('owned Runtime shared file history', () => {
     expect(readCache).not.toBe(parentBinding.toolConfig.getFileReadCache());
     expect(readCache).toBe(childBinding.toolConfig.getFileReadCache());
     context.memoryBaseDir = join(cwd, 'changed');
+    context.grepOptions.useRipgrep = true;
+    context.outputLimits.lines = 999;
+    expect(parentBinding.toolConfig.getUseRipgrep()).toBe(false);
+    expect(parentBinding.toolConfig.getTruncateToolOutputLines()).toBe(7);
     expect(parentBinding.toolConfig.getMemoryBaseDir()).not.toBe(
       context.memoryBaseDir,
     );
