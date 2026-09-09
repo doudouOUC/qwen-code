@@ -9,6 +9,8 @@ import type { PreToolUseHookResult } from '../core/toolHookTriggers.js';
 import {
   managedToolDigest,
   parseManagedToolContentModification,
+  parseManagedToolMediaContext,
+  type ManagedToolMediaContext,
   type ManagedToolContentModification,
   parseManagedToolInvocationReference,
   type ManagedToolDescriptor,
@@ -37,6 +39,7 @@ export interface RuntimeBackedToolOptions {
   descriptor: ManagedToolDescriptor;
   sessionId: string;
   getClient: () => Promise<ManagedToolV2Client>;
+  getMediaContext?: () => ManagedToolMediaContext;
   projectClassifierInput: (
     params: Record<string, unknown>,
   ) => Record<string, unknown> | string | undefined;
@@ -200,6 +203,9 @@ class RuntimeBackedInvocation
       signal.removeEventListener('abort', onAbort);
     this.preparation = (async () => {
       this.checkAdmission();
+      const mediaContext = this.options.getMediaContext
+        ? parseManagedToolMediaContext(this.options.getMediaContext())
+        : undefined;
       const client = await this.options.getClient();
       this.client = client;
       this.checkAdmission();
@@ -227,14 +233,22 @@ class RuntimeBackedInvocation
       this.checkAdmission();
       this.identity = identity;
       this.recoverPreparation = () =>
-        contentModification === undefined
-          ? client.prepare(identity, descriptor.name, this.input)
-          : client.prepare(
+        mediaContext !== undefined
+          ? client.prepare(
               identity,
               descriptor.name,
               this.input,
               contentModification,
-            );
+              mediaContext,
+            )
+          : contentModification === undefined
+            ? client.prepare(identity, descriptor.name, this.input)
+            : client.prepare(
+                identity,
+                descriptor.name,
+                this.input,
+                contentModification,
+              );
       const prepared = await this.recoverPreparation();
       // Retain the reference before checking cancellation, so a late response
       // remains owned and is drained even when its caller has already aborted.

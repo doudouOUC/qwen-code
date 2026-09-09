@@ -201,6 +201,50 @@ describe('RuntimeBackedTool', () => {
     await invocation.managed.cancelAndDrain();
   });
 
+  it('snapshots media before Runtime warmup and retains it when recovering a lost preparation', async () => {
+    const media = { inputModalities: { image: true } };
+    const getMediaContext = vi.fn(() => media);
+    const ready = deferred<ManagedToolV2Client>();
+    const mediaProxy = new RuntimeBackedTool({
+      descriptor: runtime.manifest().tools[0],
+      sessionId,
+      getClient: () => ready.promise,
+      getMediaContext,
+      projectClassifierInput: () => '',
+    });
+    client.prepare = vi.fn<ManagedToolV2Client['prepare']>(
+      async (identity, name, input) => runtime.prepare(identity, name, input),
+    );
+    vi.mocked(client.prepare).mockImplementationOnce(
+      async (identity, name, input) => {
+        await runtime.prepare(identity, name, input);
+        throw new Error('lost media preparation response');
+      },
+    );
+    const invocation = mediaProxy.build({ value: 'first' });
+    const preparing = invocation.managed.prepare(controller.signal, context);
+    expect(getMediaContext).toHaveBeenCalledOnce();
+    media.inputModalities.image = false;
+    ready.resolve(client);
+    await expect(preparing).rejects.toThrow('lost media preparation');
+    await invocation.managed.cancelAndDrain();
+    expect(client.prepare).toHaveBeenCalledTimes(2);
+    for (const call of vi.mocked(client.prepare).mock.calls) {
+      expect(call[4]).toEqual({ inputModalities: { image: true } });
+    }
+    const next = mediaProxy.build({ value: 'next' });
+    await next.managed.prepare(controller.signal, {
+      ...context,
+      callId: 'next',
+    });
+    expect(getMediaContext).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(client.prepare).mock.calls[2][4]).toEqual({
+      inputModalities: { image: false },
+    });
+    await next.managed.cancelAndDrain();
+    expect(real.executeSpy).not.toHaveBeenCalled();
+  });
+
   it('preserves output budgets, deferred discovery and historical classifier projection without preparing tools', () => {
     expect(proxy.maxOutputChars).toBe(Infinity);
     expect(proxy.truncateKeep).toBe('head');

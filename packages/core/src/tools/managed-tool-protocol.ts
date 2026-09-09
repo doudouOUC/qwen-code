@@ -7,6 +7,7 @@
 import { createHash } from 'node:crypto';
 import type { FunctionDeclaration } from '@google/genai';
 import type { PermissionDecision } from '../permissions/types.js';
+import type { InputModalities } from '../core/contentGenerator.js';
 import type {
   Kind,
   ToolCallConfirmationDetails,
@@ -44,6 +45,10 @@ export interface ManagedToolInvocationReference
 export interface ManagedToolContentModification {
   readonly source: ManagedToolInvocationReference;
   readonly newContent: string;
+}
+
+export interface ManagedToolMediaContext {
+  readonly inputModalities: Readonly<InputModalities>;
 }
 
 export interface ManagedToolDescriptor {
@@ -289,6 +294,21 @@ export function parseManagedToolContentModification(
     source: parseManagedToolInvocationReference(input['source']),
     newContent: input['newContent'],
   };
+}
+
+export function parseManagedToolMediaContext(
+  value: unknown,
+): ManagedToolMediaContext {
+  const input = jsonRecord(value);
+  assertKeys(input, ['inputModalities']);
+  const modalities = record(input['inputModalities']);
+  assertKeys(modalities, ['image', 'pdf', 'audio', 'video']);
+  if (
+    Object.values(modalities).some((enabled) => typeof enabled !== 'boolean')
+  ) {
+    throw new ManagedToolProtocolError();
+  }
+  return { inputModalities: modalities as InputModalities };
 }
 
 export function serializeManagedToolConfirmation(

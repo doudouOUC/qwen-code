@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { canUseRipgrep } from '../utils/ripgrepUtils.js';
-import type { Config } from '../config/config.js';
+import { deriveConfig, type Config } from '../config/config.js';
 import {
   firePreToolUseHook,
   firePostToolUseHook,
@@ -33,6 +33,8 @@ import { ToolErrorType } from './tool-error.js';
 import {
   managedToolDigest,
   parseManagedToolContentModification,
+  parseManagedToolMediaContext,
+  type ManagedToolMediaContext,
   type ManagedToolContentModification,
   serializeManagedToolConfirmation,
   type ManagedToolCallIdentity,
@@ -142,6 +144,10 @@ export class ManagedToolRuntime {
     private readonly tools: () => AnyDeclarativeTool[],
     private readonly policyRevision: () => string,
     private readonly sharedFileHistory?: ManagedToolRuntimeFileHistory,
+    private readonly bindMediaTool?: (
+      tool: AnyDeclarativeTool,
+      context: ManagedToolMediaContext,
+    ) => AnyDeclarativeTool,
   ) {}
 
   manifest(): {
@@ -260,11 +266,16 @@ export class ManagedToolRuntime {
     toolName: string,
     input: Record<string, unknown>,
     modification?: ManagedToolContentModification,
+    mediaContext?: ManagedToolMediaContext,
   ): Promise<ManagedToolPrepareResponse> {
     this.assertCurrent(identity);
     managedToolDigest(input);
     identity = structuredClone(identity);
     const copied = structuredClone(input);
+    const media =
+      mediaContext === undefined
+        ? undefined
+        : parseManagedToolMediaContext(mediaContext);
     const contentModification =
       modification === undefined
         ? undefined
@@ -274,6 +285,7 @@ export class ManagedToolRuntime {
         identity,
         toolName,
         input: copied,
+        ...(media === undefined ? {} : { mediaContext: media }),
         ...(contentModification === undefined
           ? {}
           : { modification: contentModification }),
@@ -314,6 +326,7 @@ export class ManagedToolRuntime {
             inputDigest,
             contentModification,
             entry,
+            media,
           ),
         );
         slot.current = built;
@@ -345,9 +358,15 @@ export class ManagedToolRuntime {
     inputDigest: string,
     modification?: ManagedToolContentModification,
     source?: Entry,
+    mediaContext?: ManagedToolMediaContext,
   ): Promise<Entry> {
-    const tool = this.tools().find((candidate) => candidate.name === toolName);
+    let tool = this.tools().find((candidate) => candidate.name === toolName);
     if (!tool) throw new Error('Managed Runtime tool is unavailable.');
+    if (mediaContext !== undefined) {
+      if (!this.bindMediaTool)
+        throw new Error('Managed Runtime tool does not support media context.');
+      tool = this.bindMediaTool(tool, mediaContext);
+    }
     if (modification) {
       if (
         !source ||
@@ -783,6 +802,7 @@ export async function createBuiltinManagedToolRuntime(
     { LSTool },
     { GrepTool },
     { RipGrepTool },
+    { ZoomImageTool },
   ] = await Promise.all([
     import('./read-file.js'),
     import('./write-file.js'),
@@ -793,8 +813,10 @@ export async function createBuiltinManagedToolRuntime(
     import('./ls.js'),
     import('./grep.js'),
     import('./ripGrep.js'),
+    import('./zoom-image.js'),
   ]);
   const registry = config.getToolRegistry();
+  await registry.ensureTool(ZoomImageTool.Name);
   if (
     toolConfig !== config &&
     toolConfig.isLsToolEnabled() &&
@@ -828,6 +850,7 @@ export async function createBuiltinManagedToolRuntime(
     ShellTool,
     GlobTool,
     LSTool,
+    ZoomImageTool,
   ].filter(
     (Constructor) => Constructor !== LSTool || toolConfig.isLsToolEnabled(),
   );
@@ -883,5 +906,19 @@ export async function createBuiltinManagedToolRuntime(
     ],
     () => revision,
     fileHistory,
+    (tool, context) => {
+      const Constructor = [ReadFileTool, ZoomImageTool].find(
+        (candidate) => tool.constructor === candidate,
+      );
+      if (!Constructor) {
+        throw new Error('Managed Runtime tool does not support media context.');
+      }
+      const view = deriveConfig(toolConfig, {
+        getEffectiveInputModalities: () => ({ ...context.inputModalities }),
+        getFileReadCache: () => toolConfig.getFileReadCache(),
+        getFileService: () => toolConfig.getFileService(),
+      });
+      return new Constructor(view);
+    },
   );
 }

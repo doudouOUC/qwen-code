@@ -549,6 +549,21 @@ describe('Managed Runtime providers', () => {
       await connected.prepare(identity, 'read_file', {
         file_path: 'proof.txt',
       });
+      const mediaContext = { inputModalities: { image: true, pdf: false } };
+      await connected.prepare(
+        identity,
+        'read_file',
+        { file_path: 'image.png' },
+        undefined,
+        mediaContext,
+      );
+      expect(client.prepare).toHaveBeenLastCalledWith(
+        identity,
+        'read_file',
+        { file_path: 'image.png' },
+        undefined,
+        mediaContext,
+      );
       await connected.confirmation(invocation);
       await connected.confirm(invocation, 'proceed_once' as never);
       await connected.confirm(
@@ -572,6 +587,30 @@ describe('Managed Runtime providers', () => {
       ]);
       expect(client.execute).toHaveBeenCalledExactlyOnceWith(invocation);
       expect(client.status).toHaveBeenCalledExactlyOnceWith(invocation, 0);
+      const data = Buffer.alloc(7 * 1024 * 1024, 1).toString('base64');
+      const mediaResult = {
+        executionStatus: 'success',
+        result: {
+          llmContent: [{ inlineData: { mimeType: 'image/jpeg', data } }],
+          returnDisplay: 'image',
+        },
+      };
+      const mediaStatus = {
+        state: 'settled',
+        result: mediaResult,
+        progress: [],
+        cancelRequested: false,
+        firstAvailableSeq: 1,
+        lastSeq: 0,
+        progressGap: false,
+      };
+      client.execute.mockResolvedValueOnce(mediaResult);
+      client.status.mockResolvedValueOnce(mediaStatus);
+      client.cancel.mockResolvedValueOnce(mediaStatus);
+      expect(data.length).toBeGreaterThan(8 * 1024 * 1024);
+      await expect(connected.execute(invocation)).resolves.toEqual(mediaResult);
+      await expect(connected.status(invocation)).resolves.toEqual(mediaStatus);
+      await expect(connected.cancel(invocation)).resolves.toEqual(mediaStatus);
       await expect(
         remote.getToolV2Client({ ...prepareRequest, tenantId: 'other' }),
       ).rejects.toThrow();
@@ -587,6 +626,104 @@ describe('Managed Runtime providers', () => {
     } finally {
       remote.dispose();
       local.dispose();
+    }
+  });
+
+  it('applies the media exception only to valid v2 inline bytes over a chunked HTTP response', async () => {
+    let responseText = '';
+    const server = createServer((req, res) => {
+      req.resume();
+      res.setHeader('content-type', 'application/json');
+      if (req.url?.endsWith('/v1/prepare')) {
+        res.end(JSON.stringify({ protocolVersion: 1, ready: true }));
+        return;
+      }
+      for (let start = 0; start < responseText.length; start += 256 * 1024) {
+        res.write(responseText.slice(start, start + 256 * 1024));
+      }
+      res.end();
+    });
+    servers.push(server);
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: `http://127.0.0.1:${await listen(server)}`,
+      token,
+      lease: ownedBoot(),
+    });
+    try {
+      const connected = await remote.getToolV2Client(prepareRequest);
+      const data = 'AAAA'.repeat(2300 * 1024);
+      const media = {
+        executionStatus: 'success',
+        result: {
+          llmContent: [{ inlineData: { mimeType: 'image/jpeg', data } }],
+          returnDisplay: 'image',
+        },
+      };
+      const valid = JSON.stringify({ protocolVersion: 2, result: media });
+      responseText = valid;
+      await expect(connected.execute(invocation)).resolves.toEqual(media);
+      for (const makeResponse of [
+        () =>
+          JSON.stringify({
+            protocolVersion: 2,
+            result: {
+              executionStatus: 'success',
+              result: { llmContent: data },
+            },
+          }),
+        () =>
+          JSON.stringify({
+            protocolVersion: 2,
+            result: { ...media, postHook: { text: data } },
+          }),
+        () =>
+          `{"result":${JSON.stringify(media)},"protocolVersion":2,"result":{"executionStatus":"success"}}`,
+        () => valid + ' '.repeat(8 * 1024 * 1024),
+        () => valid.replace(data, '\\u0041'.repeat(data.length)),
+      ]) {
+        responseText = makeResponse();
+        await expect(connected.execute(invocation)).rejects.toThrow(
+          'control response exceeded',
+        );
+      }
+      responseText = JSON.stringify({
+        protocolVersion: 2,
+        result: {
+          ...media,
+          result: {
+            llmContent: [
+              { inlineData: { mimeType: 'image/jpeg', data: 'AR==' } },
+            ],
+          },
+        },
+      });
+      await expect(connected.execute(invocation)).rejects.toThrow(
+        'invalid inline media',
+      );
+      responseText = JSON.stringify({
+        protocolVersion: 2,
+        result: { state: 'executing', result: media },
+      });
+      await expect(connected.status(invocation)).rejects.toThrow(
+        'control response exceeded',
+      );
+      responseText = JSON.stringify({
+        protocolVersion: 2,
+        result: { source: data },
+      });
+      await expect(connected.fileHistory!.snapshot()).rejects.toThrow(
+        'size limit',
+      );
+      responseText = JSON.stringify({ protocolVersion: 1, result: media });
+      await expect(
+        remote
+          .prepare(prepareRequest)
+          .execute({} as never, new AbortController().signal),
+      ).rejects.toThrow('size limit');
+      responseText = valid + ' '.repeat(64 * 1024 * 1024);
+      await expect(connected.execute(invocation)).rejects.toThrow('size limit');
+    } finally {
+      remote.dispose();
     }
   });
 

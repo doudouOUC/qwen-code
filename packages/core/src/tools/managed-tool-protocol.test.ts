@@ -10,6 +10,7 @@ import type { ToolCallConfirmationDetails } from './tools.js';
 import {
   managedToolDigest,
   parseManagedToolContentModification,
+  parseManagedToolMediaContext,
   ManagedToolProtocolError,
   parseManagedToolCallIdentity,
   parseManagedToolConfirmationPayload,
@@ -29,6 +30,41 @@ const reference = {
   invocationId: 'invocation-1',
   argsDigest: 'b'.repeat(64),
 };
+
+describe('managed media context', () => {
+  it('copies only explicit resolved input capabilities', () => {
+    const input = {
+      inputModalities: { image: true, pdf: false, audio: true, video: false },
+    };
+    const parsed = parseManagedToolMediaContext(input);
+    expect(parsed).toEqual(input);
+    input.inputModalities.image = false;
+    expect(parsed.inputModalities.image).toBe(true);
+    expect(parseManagedToolMediaContext({ inputModalities: {} })).toEqual({
+      inputModalities: {},
+    });
+  });
+
+  it.each([
+    undefined,
+    null,
+    [],
+    {},
+    { inputModalities: null },
+    { inputModalities: [] },
+    { inputModalities: { image: 'true' } },
+    { inputModalities: { pdf: 1 } },
+    { inputModalities: { image: undefined } },
+    { inputModalities: { text: true } },
+    { inputModalities: {}, model: 'worker-model' },
+    { inputModalities: {}, prompt: 'worker-prompt' },
+    { inputModalities: {}, apiKey: 'credential' },
+  ])('rejects malformed or expanded context %#', (input) => {
+    expect(() => parseManagedToolMediaContext(input)).toThrow(
+      ManagedToolProtocolError,
+    );
+  });
+});
 
 describe('managed tool identities', () => {
   it('normalizes session UUIDs and preserves the complete invocation binding', () => {

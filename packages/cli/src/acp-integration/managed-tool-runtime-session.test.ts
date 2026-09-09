@@ -84,6 +84,43 @@ function makeClient() {
 }
 
 describe('managed tool Runtime ACP request dispatch', () => {
+  it('forwards a strictly parsed media snapshot separately from model arguments', async () => {
+    const client = makeClient();
+    const input = { file_path: '/runtime/image.png' };
+    const mediaContext = { inputModalities: { image: true, pdf: false } };
+    await dispatchManagedToolRuntimeRequest(
+      client,
+      methods.sessionManagedToolV2Prepare,
+      { sessionId, identity, toolName: 'read_file', input, mediaContext },
+    );
+    expect(client.prepare).toHaveBeenCalledExactlyOnceWith(
+      identity,
+      'read_file',
+      input,
+      undefined,
+      mediaContext,
+    );
+    for (const invalid of [
+      null,
+      { inputModalities: { image: 'true' } },
+      { ...mediaContext, model: 'untrusted' },
+    ]) {
+      await expect(
+        dispatchManagedToolRuntimeRequest(
+          client,
+          methods.sessionManagedToolV2Prepare,
+          {
+            sessionId,
+            identity,
+            toolName: 'read_file',
+            input,
+            mediaContext: invalid,
+          },
+        ),
+      ).rejects.toThrow();
+    }
+    expect(client.prepare).toHaveBeenCalledOnce();
+  });
   it('dispatches strictly parsed file history methods and admits only snapshots during draining', async () => {
     const state = { ownerSessionId: sessionId, revision: 0, snapshots: [] };
     const binding = {

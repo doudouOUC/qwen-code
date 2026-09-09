@@ -246,6 +246,24 @@ describe('managed runtime tool bridge', () => {
       });
       await client.manifest();
       await client.beginTurn(identity);
+      const mediaContext = { inputModalities: { image: true, pdf: false } };
+      await client.prepare(
+        identity,
+        'read_file',
+        { file_path: '/runtime/image.png' },
+        undefined,
+        mediaContext,
+      );
+      expect(calls).toContainEqual({
+        method: SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Prepare,
+        params: {
+          sessionId: session.sessionId,
+          identity,
+          toolName: 'read_file',
+          input: { file_path: '/runtime/image.png' },
+          mediaContext,
+        },
+      });
       await client.prepare(identity, 'write_file', {
         file_path: '/scratch/proof',
         content: 'proof',

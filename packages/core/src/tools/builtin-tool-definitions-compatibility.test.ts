@@ -17,8 +17,10 @@ import {
   getReadFileToolDefinition,
   getShellToolDefinition,
   getWriteFileToolDefinition,
+  getZoomImageToolDefinition,
 } from './builtin-tool-definitions.js';
 import { ReadFileTool } from './read-file.js';
+import { ZoomImageTool } from './zoom-image.js';
 import { WriteFileTool } from './write-file.js';
 import { NotebookEditTool } from './notebook-edit.js';
 import { EditTool } from './edit.js';
@@ -36,6 +38,28 @@ afterEach(() => {
 });
 
 describe('builtin tool definition compatibility', () => {
+  it('preserves the native Zoom declaration, deferred discovery and classifier input', () => {
+    const config = {} as Config;
+    const zoom = new ZoomImageTool(config);
+    const runtime = new ManagedToolRuntime(
+      config,
+      () => [zoom],
+      () => 'policy',
+    );
+    expect(runtime.manifest().tools).toEqual([getZoomImageToolDefinition()]);
+    expect(managedToolDigest(getZoomImageToolDefinition())).toBe(
+      'b314b94cffca7695f102611653da26ec9902065e669f794bc447d8aa4cd776bf',
+    );
+    expect(
+      zoom.toAutoClassifierInput({
+        file_path: '/workspace/image.png',
+        x1: 0,
+        y1: 0,
+        x2: 500,
+        y2: 500,
+      }),
+    ).toBe('');
+  });
   it('shares the Grep schema and descriptor across both real backends', () => {
     const config = {} as Config;
     for (const tool of [new GrepTool(config), new RipGrepTool(config)]) {

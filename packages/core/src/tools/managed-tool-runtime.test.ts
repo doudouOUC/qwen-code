@@ -285,7 +285,10 @@ describe('ManagedToolRuntime', () => {
       name === ReadFileTool.Name ? parentRead : tool,
     );
     config.getToolRegistry = () =>
-      ({ getTool }) as unknown as ReturnType<Config['getToolRegistry']>;
+      ({
+        getTool,
+        ensureTool: vi.fn(async () => undefined),
+      }) as unknown as ReturnType<Config['getToolRegistry']>;
     config.isLsToolEnabled = () => false;
     const childConfig = Object.assign(Object.create(config) as Config, {
       getTargetDir: () => '/managed-child',

@@ -12217,12 +12217,13 @@ export function createAcpSessionBridge(opts: BridgeOptions): AcpSessionBridge {
             identity,
           });
         },
-        prepare: (identity, toolName, input, modification) =>
+        prepare: (identity, toolName, input, modification, mediaContext) =>
           call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Prepare, {
             identity,
             toolName,
             input,
             ...(modification === undefined ? {} : { modification }),
+            ...(mediaContext === undefined ? {} : { mediaContext }),
           }),
         confirmation: (reference) =>
           call(SERVE_CONTROL_EXT_METHODS.sessionManagedToolV2Confirmation, {

@@ -16,6 +16,7 @@ import {
   getReadFileToolDefinition,
   getShellToolDefinition,
   getWriteFileToolDefinition,
+  getZoomImageToolDefinition,
   projectEditToolClassifierInput,
   projectReadFileToolClassifierInput,
   projectShellToolClassifierInput,
@@ -106,7 +107,19 @@ export function createManagedBuiltinTool(
       return new RuntimeBackedTool({
         ...shared,
         descriptor: getReadFileToolDefinition(),
+        getMediaContext: () => ({
+          inputModalities: config.getEffectiveInputModalities(),
+        }),
         projectClassifierInput: projectReadFileToolClassifierInput,
+      });
+    case ToolNames.ZOOM_IMAGE:
+      return new RuntimeBackedTool({
+        ...shared,
+        descriptor: getZoomImageToolDefinition(),
+        getMediaContext: () => ({
+          inputModalities: config.getEffectiveInputModalities(),
+        }),
+        projectClassifierInput: () => '',
       });
     case ToolNames.WRITE_FILE:
       return new RuntimeBackedTool({

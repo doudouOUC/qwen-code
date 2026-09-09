@@ -204,6 +204,7 @@ class ReadFileToolInvocation extends BaseToolInvocation<
         offset: this.params.offset,
         limit: this.params.limit,
         pages: this.params.pages,
+        inputModalities: this.config.getEffectiveInputModalities?.(),
         preserveUnsupportedImage: prepareForVisionBridge,
         preparePdfForVisionBridge: prepareForVisionBridge,
         signal,

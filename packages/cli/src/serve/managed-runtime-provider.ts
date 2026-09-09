@@ -16,6 +16,11 @@ import {
   type RuntimeFinishReason,
 } from './managed-runtime-activator.js';
 import type { AcpSessionBridge } from './acp-session-bridge.js';
+import {
+  isManagedMediaOperation,
+  managedToolResponseMediaBytes,
+  MAX_MANAGED_MEDIA_RESPONSE_BYTES,
+} from '../acp-integration/managed-tool-media.js';
 import { isLoopbackBind } from './loopback-binds.js';
 import type { ManagedGatewayToolRuntime } from './managed-gateway-model-runtime.js';
 import {
@@ -1104,7 +1109,9 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
         ]),
         operation === 'manifest'
           ? MAX_REMOTE_MANIFEST_BYTES
-          : MAX_REMOTE_TOOL_RESULT_BYTES,
+          : isManagedMediaOperation(operation)
+            ? MAX_MANAGED_MEDIA_RESPONSE_BYTES
+            : MAX_REMOTE_TOOL_RESULT_BYTES,
         2,
       );
       const empty = operation === 'begin-turn' || operation === 'confirm';
@@ -1184,12 +1191,13 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
       beginTurn: async (identity) => {
         await call('begin-turn', { identity });
       },
-      prepare: (identity, toolName, input, modification) =>
+      prepare: (identity, toolName, input, modification, mediaContext) =>
         call('prepare', {
           identity,
           toolName,
           input,
           ...(modification === undefined ? {} : { modification }),
+          ...(mediaContext === undefined ? {} : { mediaContext }),
         }),
       confirmation: (reference) => call('confirmation', { reference }),
       confirm: async (reference, outcome, payload, phase) => {
@@ -1439,11 +1447,24 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
       throw new Error('Managed Runtime response exceeded its size limit.');
     }
     const text = await readBoundedResponseText(response, maxResponseBytes);
+    let parsed: T;
     try {
-      return JSON.parse(text) as T;
+      parsed = JSON.parse(text) as T;
     } catch {
       throw new Error('Managed Runtime returned invalid JSON.');
     }
+    if (protocolVersion === 2 && isManagedMediaOperation(operation)) {
+      const mediaBytes = managedToolResponseMediaBytes(
+        (parsed as { result?: unknown } | null)?.result,
+        operation,
+      );
+      if (Buffer.byteLength(text) - mediaBytes > MAX_REMOTE_TOOL_RESULT_BYTES) {
+        throw new Error(
+          'Managed Runtime control response exceeded its size limit.',
+        );
+      }
+    }
+    return parsed;
   }
 
   private async postIdempotentJson<T>(

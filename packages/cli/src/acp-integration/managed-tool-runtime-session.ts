@@ -13,6 +13,7 @@ import {
   managedToolDigest,
   parseManagedToolCallIdentity,
   parseManagedToolContentModification,
+  parseManagedToolMediaContext,
   parseManagedToolFileHistoryBinding,
   parseManagedToolFileHistoryPromptId,
   parseManagedToolFileHistoryState,
@@ -23,6 +24,7 @@ import {
 import { SERVE_CONTROL_EXT_METHODS } from '@qwen-code/acp-bridge/status';
 import type { ManagedToolV2Client } from '@qwen-code/acp-bridge/bridgeTypes';
 import { parseCallerSuppliedSessionId } from '../config/session-id.js';
+import { managedToolResponseMediaBytes } from './managed-tool-media.js';
 
 const METHODS = SERVE_CONTROL_EXT_METHODS;
 const methodKeys = new Map<string, readonly string[]>([
@@ -33,7 +35,14 @@ const methodKeys = new Map<string, readonly string[]>([
   [METHODS.sessionManagedToolV2BeginTurn, ['sessionId', 'identity']],
   [
     METHODS.sessionManagedToolV2Prepare,
-    ['sessionId', 'identity', 'toolName', 'input', 'modification'],
+    [
+      'sessionId',
+      'identity',
+      'toolName',
+      'input',
+      'modification',
+      'mediaContext',
+    ],
   ],
   [METHODS.sessionManagedToolV2Confirmation, ['sessionId', 'reference']],
   [
@@ -147,10 +156,16 @@ export async function dispatchManagedToolRuntimeRequest(
       params['modification'] === undefined
         ? undefined
         : parseManagedToolContentModification(params['modification']);
+    const mediaContext =
+      params['mediaContext'] === undefined
+        ? undefined
+        : parseManagedToolMediaContext(params['mediaContext']);
     return {
-      ...(await (modification === undefined
-        ? runtime.prepare(identity, name, args)
-        : runtime.prepare(identity, name, args, modification))),
+      ...(await (mediaContext !== undefined
+        ? runtime.prepare(identity, name, args, modification, mediaContext)
+        : modification === undefined
+          ? runtime.prepare(identity, name, args)
+          : runtime.prepare(identity, name, args, modification))),
     };
   }
   const reference = parseManagedToolInvocationReference(params['reference']);
@@ -180,8 +195,11 @@ export async function dispatchManagedToolRuntimeRequest(
     }
     case METHODS.sessionManagedToolV2Preflight:
       return { ...(await runtime.preflight(reference)) };
-    case METHODS.sessionManagedToolV2Execute:
-      return { ...(await runtime.execute(reference)) };
+    case METHODS.sessionManagedToolV2Execute: {
+      const result = { ...(await runtime.execute(reference)) };
+      managedToolResponseMediaBytes(result, 'execute');
+      return result;
+    }
     case METHODS.sessionManagedToolV2Status: {
       const afterSeq =
         params['afterSeq'] === undefined ? 0 : params['afterSeq'];
@@ -191,10 +209,15 @@ export async function dispatchManagedToolRuntimeRequest(
         afterSeq < 0
       )
         throw new ManagedToolProtocolError();
-      return { ...(await runtime.status(reference, afterSeq)) };
+      const result = { ...(await runtime.status(reference, afterSeq)) };
+      managedToolResponseMediaBytes(result, 'status');
+      return result;
     }
-    case METHODS.sessionManagedToolV2Cancel:
-      return { ...(await runtime.cancel(reference)) };
+    case METHODS.sessionManagedToolV2Cancel: {
+      const result = { ...(await runtime.cancel(reference)) };
+      managedToolResponseMediaBytes(result, 'cancel');
+      return result;
+    }
     default:
       throw new ManagedToolProtocolError();
   }

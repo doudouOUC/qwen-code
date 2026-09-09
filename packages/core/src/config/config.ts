@@ -1716,6 +1716,8 @@ export type DerivedConfigOverrides = Partial<
     | 'getPlanFilePath'
     | 'getWorkspaceContext'
     | 'getFileService'
+    | 'getFileReadCache'
+    | 'getEffectiveInputModalities'
     | 'getFileFilteringOptions'
     | 'getMemoryBaseDir'
     | 'isLsToolEnabled'

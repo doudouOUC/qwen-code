@@ -1045,6 +1045,7 @@ export function isCacheableReadResult(
 }
 
 export interface ProcessSingleFileContentOptions {
+  inputModalities?: Readonly<InputModalities>;
   offset?: number;
   limit?: number;
   pages?: string;
@@ -1221,7 +1222,9 @@ export async function processSingleFileContent(
     // Use optional call (`?.()`) so mock Configs that don't implement
     // getContentGeneratorConfig still work for non-media file types.
     const modalities: InputModalities =
-      config.getContentGeneratorConfig?.()?.modalities ?? {};
+      options.inputModalities ??
+      config.getContentGeneratorConfig?.()?.modalities ??
+      {};
 
     // Vision-capable main model, explicit read (not `@`-reference): when text
     // extraction overflows or fails, render pages to images for the model
