@@ -14,6 +14,7 @@
 import type {
   ApprovalMode,
   DaemonBridgeTelemetryMetrics,
+  SessionExecutionEngine,
 } from '@qwen-code/qwen-code-core';
 import { MAX_SUB_SESSION_PROMPT_CHARS } from '@qwen-code/qwen-code-core/subSessionConstants';
 import type { ChannelFactory } from './channel.js';
@@ -23,6 +24,23 @@ import type { ServePreflightCell, ServeWorkspaceEnvStatus } from './status.js';
 import type { BridgeFileSystem } from './bridgeFileSystem.js';
 import type { JournalGrowthSessionLimit } from './replayWindowLimits.js';
 import type { PromptLedgerRecord } from './prompt-ledger.js';
+import type {
+  BridgeSpawnRequest,
+  BridgeRestoreSessionRequest,
+} from './bridgeTypes.js';
+
+export type BridgeExecutionSelection = {
+  readonly daemonOwnedStandalone: boolean;
+} & (
+  | {
+      readonly operation: 'spawn';
+      readonly request: Readonly<BridgeSpawnRequest>;
+    }
+  | {
+      readonly operation: 'load' | 'resume';
+      readonly request: Readonly<BridgeRestoreSessionRequest>;
+    }
+);
 
 /**
  * Sink for serve-level diagnostic lines (set by the cli daemon logger).
@@ -236,6 +254,14 @@ export interface BridgeOptions {
   sessionScope?: 'single' | 'thread';
   /** Channel factory; defaults to spawning `qwen --acp` as a child process. */
   channelFactory?: ChannelFactory;
+  /** Server-owned routing; mutually exclusive with the generic channelFactory. */
+  executionEngines?: {
+    legacy: ChannelFactory;
+    managed: ChannelFactory;
+    select(
+      context: BridgeExecutionSelection,
+    ): SessionExecutionEngine | Promise<SessionExecutionEngine>;
+  };
   /** How long to wait for the child's `initialize` reply before giving up. */
   initializeTimeoutMs?: number;
   /**
