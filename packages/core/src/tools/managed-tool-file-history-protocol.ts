@@ -5,6 +5,8 @@
  */
 
 import * as path from 'node:path';
+import type { Config } from '../config/config.js';
+import { normalizeQwenCustomIgnoreFileNames } from '../utils/qwenIgnoreParser.js';
 import type { SerializedFileHistorySnapshot } from '../services/fileHistoryService.js';
 import type { ManagedToolFileHistoryState } from './managed-tool-file-history.js';
 import {
@@ -14,10 +16,40 @@ import {
 
 export const MANAGED_TOOL_FILE_HISTORY_MAX_BYTES = 8 * 1024 * 1024;
 
+export interface ManagedToolExecutionContext {
+  workspaceDirectories: string[];
+  memoryBaseDir: string;
+  lsToolEnabled: boolean;
+  fileFilteringOptions: {
+    respectGitIgnore: boolean;
+    respectQwenIgnore: boolean;
+    customIgnoreFiles: string[];
+  };
+}
+
+export function captureManagedToolExecutionContext(
+  config: Config,
+): ManagedToolExecutionContext {
+  const filtering = config.getFileFilteringOptions();
+  return {
+    workspaceDirectories: [...config.getWorkspaceContext().getDirectories()],
+    memoryBaseDir: config.getMemoryBaseDir(),
+    lsToolEnabled: config.isLsToolEnabled(),
+    fileFilteringOptions: {
+      respectGitIgnore: filtering.respectGitIgnore,
+      respectQwenIgnore: filtering.respectQwenIgnore,
+      customIgnoreFiles: normalizeQwenCustomIgnoreFileNames(
+        filtering.customIgnoreFiles,
+      ),
+    },
+  };
+}
+
 export interface ManagedToolFileHistoryBinding {
   ownerSessionId: string;
   ownerRuntimeSessionId: string;
   executionCwd: string;
+  executionContext?: ManagedToolExecutionContext;
   snapshots: SerializedFileHistorySnapshot[];
 }
 
@@ -140,6 +172,56 @@ function snapshots(value: unknown): SerializedFileHistorySnapshot[] {
   });
 }
 
+function absolutePath(value: unknown): string {
+  const result = text(value, 4096);
+  if (!path.isAbsolute(result) || path.normalize(result) !== result)
+    throw new ManagedToolProtocolError();
+  return result;
+}
+
+function executionContext(value: unknown): ManagedToolExecutionContext {
+  const input = record(value, [
+    'workspaceDirectories',
+    'memoryBaseDir',
+    'fileFilteringOptions',
+    'lsToolEnabled',
+  ]);
+  const filtering = record(input['fileFilteringOptions'], [
+    'respectGitIgnore',
+    'respectQwenIgnore',
+    'customIgnoreFiles',
+  ]);
+  if (
+    !Array.isArray(input['workspaceDirectories']) ||
+    !Array.isArray(filtering['customIgnoreFiles']) ||
+    typeof filtering['respectGitIgnore'] !== 'boolean' ||
+    typeof filtering['respectQwenIgnore'] !== 'boolean' ||
+    typeof input['lsToolEnabled'] !== 'boolean'
+  )
+    throw new ManagedToolProtocolError();
+  const directories = input['workspaceDirectories'].map(absolutePath);
+  if (new Set(directories).size !== directories.length)
+    throw new ManagedToolProtocolError();
+  const customIgnoreFiles = filtering['customIgnoreFiles'].map((value) =>
+    text(value, 4096),
+  );
+  if (
+    JSON.stringify(normalizeQwenCustomIgnoreFileNames(customIgnoreFiles)) !==
+    JSON.stringify(customIgnoreFiles)
+  )
+    throw new ManagedToolProtocolError();
+  return {
+    workspaceDirectories: directories,
+    memoryBaseDir: absolutePath(input['memoryBaseDir']),
+    lsToolEnabled: input['lsToolEnabled'],
+    fileFilteringOptions: {
+      respectGitIgnore: filtering['respectGitIgnore'],
+      respectQwenIgnore: filtering['respectQwenIgnore'],
+      customIgnoreFiles,
+    },
+  };
+}
+
 export function parseManagedToolFileHistoryBinding(
   value: unknown,
 ): ManagedToolFileHistoryBinding {
@@ -148,6 +230,7 @@ export function parseManagedToolFileHistoryBinding(
     'ownerSessionId',
     'ownerRuntimeSessionId',
     'executionCwd',
+    'executionContext',
     'snapshots',
   ]);
   const executionCwd = text(input['executionCwd'], 4096);
@@ -160,6 +243,9 @@ export function parseManagedToolFileHistoryBinding(
     ownerSessionId: uuid(input['ownerSessionId']),
     ownerRuntimeSessionId: uuid(input['ownerRuntimeSessionId']),
     executionCwd,
+    ...('executionContext' in input
+      ? { executionContext: executionContext(input['executionContext']) }
+      : {}),
     snapshots: snapshots(input['snapshots']),
   };
 }

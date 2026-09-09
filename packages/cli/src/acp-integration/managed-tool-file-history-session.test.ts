@@ -94,6 +94,107 @@ describe('owned Runtime shared file history', () => {
     await registry.dispose(parent);
   });
 
+  it('preserves custom ignore rules in a different child execution directory', async () => {
+    const parent = config();
+    const child = config();
+    vi.spyOn(child, 'getFileFilteringOptions').mockReturnValue({
+      respectGitIgnore: true,
+      respectQwenIgnore: true,
+      customIgnoreFiles: ['.searchignore'],
+    });
+    const binding = input(parent);
+    await registry.bind(parent, binding, find, available);
+    const childCwd = join(cwd, 'search-child');
+    await mkdir(childCwd);
+    await writeFile(join(childCwd, '.searchignore'), 'private.txt\n');
+    await writeFile(join(childCwd, 'private.txt'), 'hidden');
+    await writeFile(join(childCwd, 'public.txt'), 'visible');
+    const childBinding = await registry.bind(
+      child,
+      { ...binding, executionCwd: childCwd },
+      find,
+      available,
+    );
+    expect(
+      childBinding.toolConfig
+        .getFileService()
+        .filterFiles(
+          ['private.txt', 'public.txt'],
+          childBinding.toolConfig.getFileFilteringOptions(),
+        ),
+    ).toEqual(['public.txt']);
+    await registry.dispose(child);
+    await registry.dispose(parent);
+  });
+
+  it('binds exact same-cwd directory views and memory roots without mutating the Runtime Config', async () => {
+    const parent = config();
+    const child = config();
+    const workerExtra = join(cwd, 'worker-extra');
+    const gatewayExtra = join(cwd, 'gateway-extra');
+    await mkdir(workerExtra);
+    await mkdir(gatewayExtra);
+    parent.getWorkspaceContext().addDirectory(workerExtra);
+    child.getWorkspaceContext().addDirectory(workerExtra);
+    const context = {
+      workspaceDirectories: [cwd, gatewayExtra],
+      memoryBaseDir: join(cwd, 'gateway-memory-not-created'),
+      lsToolEnabled: true,
+      fileFilteringOptions: {
+        respectGitIgnore: false,
+        respectQwenIgnore: true,
+        customIgnoreFiles: [],
+      },
+    };
+    const binding = { ...input(parent), executionContext: context };
+    const parentBinding = await registry.bind(parent, binding, find, available);
+    const childBinding = await registry.bind(
+      child,
+      {
+        ...binding,
+        executionContext: {
+          ...context,
+          workspaceDirectories: [cwd],
+          lsToolEnabled: false,
+        },
+      },
+      find,
+      available,
+    );
+    expect(parentBinding.toolConfig).not.toBe(parent);
+    expect(
+      parentBinding.toolConfig.getWorkspaceContext().getDirectories(),
+    ).toEqual([cwd, gatewayExtra]);
+    expect(
+      childBinding.toolConfig.getWorkspaceContext().getDirectories(),
+    ).toEqual([cwd]);
+    expect(parent.getWorkspaceContext().getDirectories()).toEqual([
+      cwd,
+      workerExtra,
+    ]);
+    expect(child.getWorkspaceContext().getDirectories()).toEqual([
+      cwd,
+      workerExtra,
+    ]);
+    expect(childBinding.toolConfig.getMemoryBaseDir()).toBe(
+      context.memoryBaseDir,
+    );
+    expect(parentBinding.toolConfig.isLsToolEnabled()).toBe(true);
+    expect(childBinding.toolConfig.isLsToolEnabled()).toBe(false);
+    expect(childBinding.toolConfig.getFileFilteringOptions()).toEqual(
+      context.fileFilteringOptions,
+    );
+    const readCache = childBinding.toolConfig.getFileReadCache();
+    expect(readCache).not.toBe(parentBinding.toolConfig.getFileReadCache());
+    expect(readCache).toBe(childBinding.toolConfig.getFileReadCache());
+    context.memoryBaseDir = join(cwd, 'changed');
+    expect(parentBinding.toolConfig.getMemoryBaseDir()).not.toBe(
+      context.memoryBaseDir,
+    );
+    await registry.dispose(child);
+    await registry.dispose(parent);
+  });
+
   it('restores backup bytes under the durable parent id after execution UUID replacement', async () => {
     const parent = config();
     const binding = input(parent);

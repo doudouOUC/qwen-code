@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   FileHistoryService,
+  ToolConfirmationOutcome,
   type Config,
   type ManagedToolFileHistoryBinding,
   type ManagedToolFileHistoryState,
@@ -48,6 +49,16 @@ describe('managed tool Session binding', () => {
   function clientFor(sessionId: string): ManagedToolV2Client {
     let state: ManagedToolFileHistoryState;
     const client = {
+      manifest: vi.fn().mockResolvedValue({
+        tools: [],
+        capabilityDigest: 'digest',
+        policyRevision: 'policy',
+      }),
+      beginTurn: vi.fn().mockResolvedValue(undefined),
+      prepare: vi.fn().mockResolvedValue({}),
+      confirmation: vi.fn().mockResolvedValue({}),
+      confirm: vi.fn().mockResolvedValue(undefined),
+      preflight: vi.fn().mockResolvedValue({ shouldProceed: true }),
       execute: vi.fn().mockResolvedValue({
         executionStatus: 'success',
         result: { llmContent: 'ok', returnDisplay: 'ok' },
@@ -105,6 +116,13 @@ describe('managed tool Session binding', () => {
     const record = vi.fn().mockResolvedValue(undefined);
     const config = {
       getTargetDir: () => cwd,
+      getWorkspaceContext: () => ({ getDirectories: () => [cwd] }),
+      getMemoryBaseDir: () => join(cwd, 'memory-base'),
+      getFileFilteringOptions: () => ({
+        respectGitIgnore: true,
+        respectQwenIgnore: true,
+      }),
+      isLsToolEnabled: () => false,
       getSessionId: () => id,
       getFileHistoryService: () => service,
       getChatRecordingService: () => ({
@@ -138,6 +156,69 @@ describe('managed tool Session binding', () => {
     expect(getClient).not.toHaveBeenCalled();
     expect(release).not.toHaveBeenCalled();
     expect(() => session.getClient()).toThrow('closing');
+  });
+
+  it('captures each actual scope and refuses active RPCs after its context changes while cleanup remains available', async () => {
+    const { session, config } = create();
+    const remote = await session.getClient();
+    const binding = bindings.get(session.sessionId)!;
+    expect(binding.executionContext).toEqual({
+      workspaceDirectories: [cwd],
+      memoryBaseDir: join(cwd, 'memory-base'),
+      lsToolEnabled: false,
+      fileFilteringOptions: {
+        respectGitIgnore: true,
+        respectQwenIgnore: true,
+        customIgnoreFiles: ['.agentignore', '.aiignore'],
+      },
+    });
+    await remote.manifest();
+    const rawClient = clients.get(session.sessionId)!;
+    expect(rawClient.manifest).toHaveBeenCalledOnce();
+    const ref: ManagedToolInvocationReference = {
+      sessionId: session.sessionId,
+      promptId: 'prompt',
+      callId: 'call',
+      invocationId: 'invocation',
+      capabilityDigest: 'capability',
+      policyRevision: 'policy',
+      argsDigest: 'args',
+    };
+    await remote.confirm(
+      ref,
+      ToolConfirmationOutcome.ProceedOnce,
+      undefined,
+      'permission',
+    );
+    expect(rawClient.confirm).toHaveBeenCalledWith(
+      ref,
+      ToolConfirmationOutcome.ProceedOnce,
+      undefined,
+      'permission',
+    );
+    config.getFileFilteringOptions = () => ({
+      respectGitIgnore: false,
+      respectQwenIgnore: true,
+    });
+    for (const operation of [
+      () => remote.manifest(),
+      () => remote.beginTurn(ref),
+      () => remote.prepare(ref, 'glob', { pattern: '*.txt' }),
+      () => remote.confirmation(ref),
+      () => remote.confirm(ref, ToolConfirmationOutcome.ProceedOnce),
+      () => remote.preflight(ref),
+      () => remote.execute(ref),
+    ])
+      await expect(operation()).rejects.toThrow('execution context changed');
+    expect(rawClient.execute).not.toHaveBeenCalled();
+    expect(rawClient.prepare).not.toHaveBeenCalled();
+    await remote.status(ref);
+    await remote.cancel(ref);
+    await session.flushFileHistory!();
+    await session.close();
+    expect(rawClient.status).toHaveBeenCalledWith(ref, undefined);
+    expect(rawClient.cancel).toHaveBeenCalledWith(ref);
+    expect(release).toHaveBeenCalledOnce();
   });
 
   it('coalesces acquisition and keeps independently owned execution identities', async () => {
@@ -208,6 +289,38 @@ describe('managed tool Session binding', () => {
         }),
       }),
     ]);
+    await child.close();
+    await session.close();
+  });
+
+  it('captures a same-directory child scope independently of its parent', async () => {
+    const { session, config } = create();
+    const childConfig = {
+      ...config,
+      getWorkspaceContext: () => ({ getDirectories: () => [] }),
+      getFileFilteringOptions: () => ({
+        respectGitIgnore: false,
+        respectQwenIgnore: true,
+        customIgnoreFiles: [],
+      }),
+      getMemoryBaseDir: () => join(cwd, 'child-memory'),
+      isLsToolEnabled: () => true,
+    } as unknown as Config;
+    const child = session.createChild!(childConfig);
+    await child.getClient();
+    expect(
+      bindings.get(session.sessionId)?.executionContext?.workspaceDirectories,
+    ).toEqual([cwd]);
+    expect(bindings.get(child.sessionId)?.executionContext).toEqual({
+      workspaceDirectories: [],
+      memoryBaseDir: join(cwd, 'child-memory'),
+      lsToolEnabled: true,
+      fileFilteringOptions: {
+        respectGitIgnore: false,
+        respectQwenIgnore: true,
+        customIgnoreFiles: [],
+      },
+    });
     await child.close();
     await session.close();
   });

@@ -7,6 +7,7 @@
 import { realpath } from 'node:fs/promises';
 import {
   deriveAgentConfig,
+  deriveConfig,
   managedToolDigest,
   ManagedToolFileHistory,
   ManagedToolProtocolError,
@@ -41,6 +42,7 @@ export class ManagedToolFileHistorySessions {
     assertAvailable: (config: Config) => void,
   ): Promise<Binding> {
     const digest = managedToolDigest(input, 8 * 1024 * 1024);
+    input = structuredClone(input);
     const previous = this.bindings.get(config);
     const pending = this.pending.get(config);
     if (
@@ -61,6 +63,15 @@ export class ManagedToolFileHistorySessions {
         throw new ManagedToolProtocolError(
           'Managed execution directory is not canonical.',
         );
+      const context = input.executionContext;
+      if (context) {
+        for (const directory of context.workspaceDirectories) {
+          if ((await realpath(directory)) !== directory)
+            throw new ManagedToolProtocolError(
+              'Managed search directory is not canonical.',
+            );
+        }
+      }
       assertAvailable(config);
       let owner: ManagedToolFileHistory;
       if (config.getSessionId() === input.ownerRuntimeSessionId) {
@@ -112,10 +123,25 @@ export class ManagedToolFileHistorySessions {
         throw new ManagedToolProtocolError(
           'Managed file history owner was released.',
         );
+      const view =
+        context || input.executionCwd !== config.getTargetDir()
+          ? deriveAgentConfig(config, input.executionCwd, {
+              customIgnoreFiles:
+                context?.fileFilteringOptions.customIgnoreFiles ??
+                config.getFileFilteringOptions().customIgnoreFiles,
+            })
+          : undefined;
+      if (context && view)
+        view.workspaceContext.setDirectories(context.workspaceDirectories);
       const toolConfig =
-        input.executionCwd === config.getTargetDir()
-          ? config
-          : deriveAgentConfig(config, input.executionCwd).config;
+        context && view
+          ? deriveConfig(view.config, {
+              getMemoryBaseDir: () => context.memoryBaseDir,
+              getFileFilteringOptions: () =>
+                structuredClone(context.fileFilteringOptions),
+              isLsToolEnabled: () => context.lsToolEnabled,
+            })
+          : (view?.config ?? config);
       config.bindSharedFileHistoryService(owner.service);
       toolConfig.bindSharedFileHistoryService(owner.service);
       const binding: Binding = {

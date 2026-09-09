@@ -718,14 +718,57 @@ export async function createBuiltinManagedToolRuntime(
   fileHistory?: ManagedToolRuntimeFileHistory,
   toolConfig: Config = config,
 ): Promise<ManagedToolRuntime> {
-  const [{ ReadFileTool }, { WriteFileTool }, { EditTool }, { ShellTool }] =
-    await Promise.all([
-      import('./read-file.js'),
-      import('./write-file.js'),
-      import('./edit.js'),
-      import('./shell.js'),
-    ]);
-  const constructors = [ReadFileTool, WriteFileTool, EditTool, ShellTool];
+  const [
+    { ReadFileTool },
+    { WriteFileTool },
+    { EditTool },
+    { ShellTool },
+    { GlobTool },
+    { LSTool },
+  ] = await Promise.all([
+    import('./read-file.js'),
+    import('./write-file.js'),
+    import('./edit.js'),
+    import('./shell.js'),
+    import('./glob.js'),
+    import('./ls.js'),
+  ]);
+  const registry = config.getToolRegistry();
+  if (
+    toolConfig !== config &&
+    toolConfig.isLsToolEnabled() &&
+    !config.isLsToolEnabled() &&
+    !registry.getAllToolNames().includes(LSTool.Name)
+  ) {
+    const permissionManager = config.getPermissionManager();
+    if (!permissionManager)
+      throw new Error(
+        'Managed LS registration requires initialized permissions.',
+      );
+    const status = await permissionManager.getToolRegistrationStatus(
+      LSTool.Name,
+    );
+    if (
+      status !== 'disabled' &&
+      !registry.getAllToolNames().includes(LSTool.Name)
+    ) {
+      const factory = async () => new LSTool(config);
+      if (status === 'deferred')
+        registry.registerPermissionDeferredFactory(LSTool.Name, factory);
+      else registry.registerFactory(LSTool.Name, factory);
+      await registry.ensureTool(LSTool.Name);
+    }
+  }
+  const constructors = [
+    ReadFileTool,
+    WriteFileTool,
+    EditTool,
+    ShellTool,
+    GlobTool,
+    LSTool,
+  ].filter(
+    (Constructor) => Constructor !== LSTool || toolConfig.isLsToolEnabled(),
+  );
   const revision = randomUUID();
   const boundTools =
     toolConfig === config

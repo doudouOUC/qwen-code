@@ -267,6 +267,7 @@ import {
   type DebugLogger,
 } from '../utils/debugLogger.js';
 import {
+  getMemoryBaseDir,
   getAutoMemoryRoot,
   getAutoMemoryIndexPath,
   getTeamAutoMemoryRoot,
@@ -1715,6 +1716,9 @@ export type DerivedConfigOverrides = Partial<
     | 'getPlanFilePath'
     | 'getWorkspaceContext'
     | 'getFileService'
+    | 'getFileFilteringOptions'
+    | 'getMemoryBaseDir'
+    | 'isLsToolEnabled'
     | 'getToolRegistry'
     | 'getPermissionManager'
     | 'getApprovalMode'
@@ -7894,6 +7898,10 @@ export class Config {
   }
   getFileFilteringRespectQwenIgnore(): boolean {
     return this.fileFiltering.respectQwenIgnore;
+  }
+
+  getMemoryBaseDir(): string {
+    return getMemoryBaseDir();
   }
 
   getFileFilteringOptions(): FileFilteringOptions {

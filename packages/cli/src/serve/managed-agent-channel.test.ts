@@ -140,7 +140,16 @@ describe('managed Agent channel', () => {
       vi.mocked(createAcpAgentHost).mock.calls[0][4]?.managedToolSessionFactory;
     expect(bootstrap).toBeTypeOf('function');
     expect(host).toBe(bootstrap);
-    const session = host!({ getTargetDir: () => cwd } as Config);
+    const session = host!({
+      getTargetDir: () => cwd,
+      getWorkspaceContext: () => ({ getDirectories: () => [cwd] }),
+      getMemoryBaseDir: () => join(root, 'output'),
+      getFileFilteringOptions: () => ({
+        respectGitIgnore: true,
+        respectQwenIgnore: true,
+      }),
+      isLsToolEnabled: () => false,
+    } as unknown as Config);
     await session.close();
     expect(acquire).not.toHaveBeenCalled();
     await channel.kill();

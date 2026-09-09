@@ -24,12 +24,15 @@ vi.mock('../tools/read-file.js', () => ({ ReadFileTool: localConstruct }));
 vi.mock('../tools/write-file.js', () => ({ WriteFileTool: localConstruct }));
 vi.mock('../tools/edit.js', () => ({ EditTool: localConstruct }));
 vi.mock('../tools/shell.js', () => ({ ShellTool: localConstruct }));
+vi.mock('../tools/glob.js', () => ({ GlobTool: localConstruct }));
+vi.mock('../tools/ls.js', () => ({ LSTool: localConstruct }));
 
 const names = [
   ToolNames.READ_FILE,
   ToolNames.WRITE_FILE,
   ToolNames.EDIT,
   ToolNames.SHELL,
+  ToolNames.GLOB,
 ];
 
 describe('Config managed tool registration', () => {
@@ -79,7 +82,7 @@ describe('Config managed tool registration', () => {
     status
       .mockReset()
       .mockImplementation(async (name) =>
-        names.includes(name as (typeof names)[number])
+        name === ToolNames.LS || names.includes(name as (typeof names)[number])
           ? 'registered'
           : 'disabled',
       );
@@ -134,6 +137,23 @@ describe('Config managed tool registration', () => {
       }),
     ).rejects.toThrow('Runtime not ready');
     expect(getClient).toHaveBeenCalledOnce();
+    await registry.stop();
+  });
+
+  it('registers an explicitly allowlisted LS as a proxy without local construction', async () => {
+    vi.spyOn(config, 'getCoreTools').mockReturnValue([ToolNames.LS]);
+    const registry = await config.createToolRegistry(undefined, {
+      skipDiscovery: true,
+    });
+    await registry.warmAll({ strict: true });
+    expect(registry.getTool(ToolNames.LS)).toBeInstanceOf(RuntimeBackedTool);
+    expect(
+      registry
+        .getFunctionDeclarations()
+        .some((schema) => schema.name === ToolNames.LS),
+    ).toBe(true);
+    expect(localConstruct).not.toHaveBeenCalled();
+    expect(getClient).not.toHaveBeenCalled();
     await registry.stop();
   });
 

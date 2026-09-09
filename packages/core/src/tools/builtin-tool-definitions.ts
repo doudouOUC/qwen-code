@@ -36,6 +36,74 @@ function defineTool(
   };
 }
 
+export function getGlobToolDefinition(): ManagedToolDescriptor {
+  return defineTool(
+    ToolNames.GLOB,
+    ToolDisplayNames.GLOB,
+    'Fast file pattern matching tool that works with any codebase size\n- Supports glob patterns like "**/*.js" or "src/**/*.ts"\n- Returns matching file paths sorted by modification time\n- Use this tool when you need to find files by name patterns\n- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches as a batch that are potentially useful.',
+    Kind.Search,
+    {
+      properties: {
+        pattern: {
+          description: 'The glob pattern to match files against',
+          type: 'string',
+        },
+        path: {
+          description:
+            'The directory to search in. If not specified, the current working directory will be used. IMPORTANT: Omit this field to use the default directory. DO NOT enter "undefined" or "null" - simply omit it for the default behavior. Must be a valid directory path if provided.',
+          type: 'string',
+        },
+      },
+      required: ['pattern'],
+      type: 'object',
+    },
+  );
+}
+
+export function getLSToolDefinition(): ManagedToolDescriptor {
+  return defineTool(
+    ToolNames.LS,
+    ToolDisplayNames.LS,
+    'Lists the names of files and subdirectories directly within a specified directory path. Can optionally ignore entries matching provided glob patterns.',
+    Kind.Search,
+    {
+      properties: {
+        path: {
+          description:
+            'The absolute path to the directory to list (must be absolute, not relative)',
+          type: 'string',
+        },
+        ignore: {
+          description: 'List of glob patterns to ignore',
+          items: {
+            type: 'string',
+          },
+          type: 'array',
+        },
+        file_filtering_options: {
+          description:
+            'Optional: Whether to respect ignore patterns from .gitignore, .qwenignore, and configured custom Qwen ignore files',
+          type: 'object',
+          properties: {
+            respect_git_ignore: {
+              description:
+                'Optional: Whether to respect .gitignore patterns when listing files. Only available in git repositories. Defaults to true.',
+              type: 'boolean',
+            },
+            respect_qwen_ignore: {
+              description:
+                'Optional: Whether to respect .qwenignore and configured custom Qwen ignore file patterns when listing files. Defaults to true.',
+              type: 'boolean',
+            },
+          },
+        },
+      },
+      required: ['path'],
+      type: 'object',
+    },
+  );
+}
+
 export function getReadFileToolDefinition(): ManagedToolDescriptor {
   return {
     ...defineTool(

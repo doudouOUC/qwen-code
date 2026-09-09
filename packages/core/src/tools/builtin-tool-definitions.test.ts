@@ -7,6 +7,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   getEditToolDefinition,
+  getGlobToolDefinition,
+  getLSToolDefinition,
   getReadFileToolDefinition,
   getShellToolDefinition,
   getWriteFileToolDefinition,
@@ -55,6 +57,8 @@ describe('offline builtin tool definitions', () => {
         },
         platform: 'linux',
       }),
+      getGlobToolDefinition(),
+      getLSToolDefinition(),
     ];
     const tools = definitions.map(
       (descriptor) =>
@@ -71,6 +75,8 @@ describe('offline builtin tool definitions', () => {
       ToolNames.WRITE_FILE,
       ToolNames.EDIT,
       ToolNames.SHELL,
+      ToolNames.GLOB,
+      ToolNames.LS,
     ]);
     for (const tool of tools) {
       expect(tool.description.length).toBeGreaterThan(0);

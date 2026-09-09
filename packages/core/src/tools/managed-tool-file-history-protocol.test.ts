@@ -8,6 +8,7 @@ import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   parseManagedToolFileHistoryBinding,
+  type ManagedToolExecutionContext,
   parseManagedToolFileHistoryPromptId,
   parseManagedToolFileHistoryState,
 } from './managed-tool-file-history-protocol.js';
@@ -34,6 +35,84 @@ const binding = {
 };
 
 describe('managed file history protocol', () => {
+  const context: ManagedToolExecutionContext = {
+    workspaceDirectories: [
+      binding.executionCwd,
+      path.resolve('additional-workspace'),
+    ],
+    memoryBaseDir: path.resolve('gateway-memory'),
+    lsToolEnabled: true,
+    fileFilteringOptions: {
+      respectGitIgnore: false,
+      respectQwenIgnore: true,
+      customIgnoreFiles: [],
+    },
+  };
+
+  it('copies the exact execution scope without adding directories or default ignore files', () => {
+    const input = { ...binding, executionContext: structuredClone(context) };
+    const parsed = parseManagedToolFileHistoryBinding(input);
+    expect(parsed).toEqual(input);
+    input.executionContext.workspaceDirectories.reverse();
+    input.executionContext.fileFilteringOptions.customIgnoreFiles.push(
+      '.laterignore',
+    );
+    expect(parsed.executionContext).toEqual(context);
+    expect(
+      parseManagedToolFileHistoryBinding({
+        ...binding,
+        executionContext: { ...context, workspaceDirectories: [] },
+      }).executionContext?.workspaceDirectories,
+    ).toEqual([]);
+  });
+
+  it.each([
+    { ...context, extra: true },
+    { ...context, workspaceDirectories: ['relative'] },
+    {
+      ...context,
+      workspaceDirectories: [binding.executionCwd, binding.executionCwd],
+    },
+    { ...context, memoryBaseDir: 'relative' },
+    { ...context, lsToolEnabled: 'true' },
+    {
+      ...context,
+      fileFilteringOptions: { ...context.fileFilteringOptions, extra: true },
+    },
+    {
+      ...context,
+      fileFilteringOptions: {
+        ...context.fileFilteringOptions,
+        respectGitIgnore: 'true',
+      },
+    },
+    {
+      ...context,
+      fileFilteringOptions: {
+        ...context.fileFilteringOptions,
+        customIgnoreFiles: ['../parent'],
+      },
+    },
+    {
+      ...context,
+      fileFilteringOptions: {
+        ...context.fileFilteringOptions,
+        customIgnoreFiles: ['.qwenignore'],
+      },
+    },
+    {
+      ...context,
+      fileFilteringOptions: {
+        ...context.fileFilteringOptions,
+        customIgnoreFiles: ['.custom', '.custom'],
+      },
+    },
+  ])('rejects malformed execution context', (executionContext) => {
+    expect(() =>
+      parseManagedToolFileHistoryBinding({ ...binding, executionContext }),
+    ).toThrow();
+  });
+
   it('accepts accumulated history above 1 MiB without widening tool input limits', () => {
     const trackedFileBackups = Object.fromEntries(
       Array.from({ length: 100 }, (_, i) => [

@@ -9,6 +9,8 @@ import { ApprovalMode } from '../config/approval-mode.js';
 import type { ShellConfiguration } from '../utils/shell-utils.js';
 import {
   getEditToolDefinition,
+  getGlobToolDefinition,
+  getLSToolDefinition,
   getReadFileToolDefinition,
   getShellToolDefinition,
   getWriteFileToolDefinition,
@@ -74,6 +76,18 @@ export function createManagedBuiltinTool(
     },
   };
   switch (name) {
+    case ToolNames.GLOB:
+      return new RuntimeBackedTool({
+        ...shared,
+        descriptor: getGlobToolDefinition(),
+        projectClassifierInput: () => '',
+      });
+    case ToolNames.LS:
+      return new RuntimeBackedTool({
+        ...shared,
+        descriptor: getLSToolDefinition(),
+        projectClassifierInput: () => '',
+      });
     case ToolNames.READ_FILE:
       return new RuntimeBackedTool({
         ...shared,

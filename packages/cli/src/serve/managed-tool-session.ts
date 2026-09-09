@@ -8,6 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
+  captureManagedToolExecutionContext,
+  managedToolDigest,
   deserializeSnapshots,
   serializeSnapshot,
   type Config,
@@ -101,6 +103,12 @@ export function createManagedToolSessionFactory(options: {
       raw: () => Promise<ManagedToolV2Client>;
     } => {
       const executionCwd = config.getTargetDir();
+      const executionContext = captureManagedToolExecutionContext(config);
+      Object.freeze(executionContext.workspaceDirectories);
+      Object.freeze(executionContext.fileFilteringOptions.customIgnoreFiles);
+      Object.freeze(executionContext.fileFilteringOptions);
+      Object.freeze(executionContext);
+      const contextDigest = managedToolDigest(executionContext);
       const request: ManagedRuntimePrepareRequest = Object.freeze({
         protocolVersion: 1,
         tenantId,
@@ -130,6 +138,11 @@ export function createManagedToolSessionFactory(options: {
           rootConfig.getTargetDir() !== workspaceCwd
         )
           throw new Error('Managed tool Session workspace binding changed.');
+        if (
+          managedToolDigest(captureManagedToolExecutionContext(config)) !==
+          contextDigest
+        )
+          throw new Error('Managed tool Session execution context changed.');
       };
       const sync = async () => {
         if (historyBound && !released && client?.fileHistory)
@@ -168,6 +181,7 @@ export function createManagedToolSessionFactory(options: {
               ownerSessionId: rootConfig.getSessionId(),
               ownerRuntimeSessionId: root.session.sessionId,
               executionCwd,
+              executionContext,
               snapshots,
             }),
           );
@@ -193,8 +207,27 @@ export function createManagedToolSessionFactory(options: {
             const acquired = await raw();
             await historyTail;
             assertOpen();
+            const active = async <T>(
+              operation: () => T | Promise<T>,
+            ): Promise<T> => {
+              assertOpen();
+              return operation();
+            };
             wrapped ??= {
               ...acquired,
+              manifest: () => active(() => acquired.manifest()),
+              beginTurn: (identity) =>
+                active(() => acquired.beginTurn(identity)),
+              prepare: (identity, name, input) =>
+                active(() => acquired.prepare(identity, name, input)),
+              confirmation: (reference) =>
+                active(() => acquired.confirmation(reference)),
+              confirm: (reference, outcome, payload, phase) =>
+                active(() =>
+                  acquired.confirm(reference, outcome, payload, phase),
+                ),
+              preflight: (reference) =>
+                active(() => acquired.preflight(reference)),
               execute: (reference) => {
                 const pending = (async () => {
                   await historyTail;
