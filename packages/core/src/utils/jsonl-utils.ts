@@ -146,7 +146,7 @@ export function _recoverObjectsFromLine<T = unknown>(line: string): T[] {
  * forwarding scalars or arrays would trip property accesses in callers
  * (`record.type`, `record.uuid`).
  */
-function parseLineTolerantWithIntegrity<T>(
+export function parseLineTolerantWithIntegrity<T>(
   line: string,
   filePath: string,
 ): ParsedJsonlLine<T> {

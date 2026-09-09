@@ -6,7 +6,15 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Mock } from 'vitest';
-import { mkdir, mkdtemp, open, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import type { ConfigParameters, SandboxConfig } from './config.js';
 import {
@@ -107,7 +115,14 @@ import type {
   ChatRecord,
   ChatRecordingFailureEvent,
 } from '../services/chatRecordingService.js';
-import type { ResumedSessionData } from '../services/sessionService.js';
+import {
+  SessionService,
+  type ResumedSessionData,
+} from '../services/sessionService.js';
+import type {
+  SessionExecutionEngine,
+  SessionExecutionEngineState,
+} from '../services/session-execution-engine.js';
 import {
   GoalPersistenceUnavailableError,
   type GoalTurnHost,
@@ -122,6 +137,25 @@ import {
 import * as jsonl from '../utils/jsonl-utils.js';
 import { checkPriorRead } from '../tools/priorReadEnforcement.js';
 import { ToolErrorType } from '../tools/tool-error.js';
+
+function executionEngineProof(
+  sessionId: string,
+  engine: SessionExecutionEngine = 'legacy',
+): SessionExecutionEngineState {
+  return {
+    status: 'verified',
+    sessionId,
+    engine,
+    recorded: true,
+    snapshot: {
+      filePath: `/tmp/${sessionId}.jsonl`,
+      dev: 1,
+      ino: 1,
+      size: 1,
+      lastUpdated: new Date(0).toISOString(),
+    },
+  };
+}
 
 function createToolMock(toolName: string) {
   const ToolMock = vi.fn();
@@ -2788,6 +2822,7 @@ describe('Server Config (config.ts)', () => {
       );
 
       config.startNewSession(sessionId, {
+        executionEngine: executionEngineProof(sessionId),
         conversation: { messages: [] },
       } as unknown as ResumedSessionData);
 
@@ -2863,6 +2898,7 @@ describe('Server Config (config.ts)', () => {
       vi.mocked(logStartSession).mockClear();
 
       config.startNewSession('resumed-session-id', {
+        executionEngine: executionEngineProof('resumed-session-id'),
         conversation: { messages: [] },
       } as unknown as ResumedSessionData);
 
@@ -2909,11 +2945,12 @@ describe('Server Config (config.ts)', () => {
 
     const resumedGoalSession = (
       status: 'active' | 'paused',
+      sessionId = 'resumed-session',
     ): ResumedSessionData => {
       const record: ChatRecord = {
         uuid: `goal-${status}`,
         parentUuid: null,
-        sessionId: 'resumed-session',
+        sessionId,
         timestamp: new Date(0).toISOString(),
         type: 'system',
         subtype: 'goal_state',
@@ -2942,8 +2979,9 @@ describe('Server Config (config.ts)', () => {
         },
       };
       return {
+        executionEngine: executionEngineProof(sessionId),
         conversation: {
-          sessionId: 'resumed-session',
+          sessionId,
           projectHash: 'test',
           startTime: new Date(0).toISOString(),
           lastUpdated: new Date(0).toISOString(),
@@ -2976,6 +3014,7 @@ describe('Server Config (config.ts)', () => {
         },
       } as unknown as ChatRecord;
       return {
+        executionEngine: executionEngineProof('resumed-session'),
         conversation: {
           sessionId: 'resumed-session',
           projectHash: 'test',
@@ -3001,6 +3040,7 @@ describe('Server Config (config.ts)', () => {
         chatRecording: true,
         experimentalZedIntegration: true,
         sessionWriterLeaseEnabled: true,
+        sessionId: 'resumed-session',
         sessionData: legacyGoalSession(),
       });
       const recorder = config.getChatRecordingService();
@@ -3050,6 +3090,7 @@ describe('Server Config (config.ts)', () => {
         chatRecording: true,
         experimentalZedIntegration: true,
         sessionWriterLeaseEnabled: true,
+        sessionId: 'resumed-session',
         sessionData: legacyGoalSession(),
       });
       const ready = config.getGoalRuntimeReady();
@@ -3064,6 +3105,7 @@ describe('Server Config (config.ts)', () => {
       const config = new Config({
         ...baseParams,
         chatRecording: true,
+        sessionId: 'resumed-session',
         sessionData: resumedGoalSession('paused'),
       });
 
@@ -3075,7 +3117,7 @@ describe('Server Config (config.ts)', () => {
 
       config.startNewSession(
         'replacement-session',
-        resumedGoalSession('active'),
+        resumedGoalSession('active', 'replacement-session'),
       );
       const replacement = await config.getGoalRuntimeReady();
       expect(replacement).not.toBe(initial);
@@ -3087,7 +3129,9 @@ describe('Server Config (config.ts)', () => {
       const config = new Config({
         ...baseParams,
         chatRecording: true,
+        sessionId: 'resumed-session',
         sessionRestoreProjection: {
+          executionEngine: executionEngineProof('resumed-session'),
           sessionId: 'resumed-session',
           filePath: '/tmp/resumed-session.jsonl',
           startTime: new Date(0).toISOString(),
@@ -3134,7 +3178,9 @@ describe('Server Config (config.ts)', () => {
       const config = new Config({
         ...baseParams,
         chatRecording: true,
+        sessionId: 'resumed-session',
         sessionRestoreProjection: {
+          executionEngine: executionEngineProof('resumed-session'),
           sessionId: 'resumed-session',
           filePath: '/tmp/resumed-session.jsonl',
           startTime: new Date(0).toISOString(),
@@ -3200,6 +3246,7 @@ describe('Server Config (config.ts)', () => {
       const config = new Config({
         ...baseParams,
         chatRecording: true,
+        sessionId: 'resumed-session',
         sessionData: resumedGoalSession('active'),
       });
       const started: string[] = [];
@@ -3216,7 +3263,7 @@ describe('Server Config (config.ts)', () => {
 
       config.startNewSession(
         'replacement-session',
-        resumedGoalSession('active'),
+        resumedGoalSession('active', 'replacement-session'),
       );
       await config.getGoalRuntimeReady();
       await vi.waitFor(() =>
@@ -3781,9 +3828,288 @@ describe('Server Config (config.ts)', () => {
       },
     );
 
+    it.each([false, true])(
+      'rejects managed history before constructing a legacy recorder (recording=%s)',
+      (chatRecording) => {
+        const sessionId = 'managed-restore';
+        const construct = vi.mocked(LlmClient);
+        const before = construct.mock.calls.length;
+        expect(
+          () =>
+            new Config({
+              ...baseParams,
+              sessionId,
+              chatRecording,
+              sessionData: {
+                executionEngine: executionEngineProof(sessionId, 'managed'),
+              } as ResumedSessionData,
+            }),
+        ).toThrow(/belongs to managed/);
+        expect(construct.mock.calls.length).toBe(before);
+      },
+    );
+
+    it('rejects a missing restore proof before changing the outgoing session', () => {
+      const config = new Config({ ...baseParams, chatRecording: true });
+      const recorder = config.getChatRecordingService()!;
+      const finalize = vi.spyOn(recorder, 'finalize');
+      const oldId = config.getSessionId();
+      expect(() =>
+        config.startNewSession('unverified', {
+          conversation: { messages: [] },
+        } as unknown as ResumedSessionData),
+      ).toThrow(/ownership was not verified/);
+      expect(config.getSessionId()).toBe(oldId);
+      expect(config.getChatRecordingService()).toBe(recorder);
+      expect(finalize).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { chatRecording: false, sessionWriterLeaseEnabled: true },
+      { chatRecording: true, sessionWriterLeaseEnabled: false },
+    ])(
+      'rejects managed initialization without recording and a lease: %j',
+      async (flags) => {
+        const config = new Config({
+          ...baseParams,
+          ...flags,
+          experimentalZedIntegration: true,
+          managedToolSessionFactory: () => {
+            throw new Error('must not create tools');
+          },
+        });
+        const initialize = vi.spyOn(
+          config as unknown as { initializeInternal(): Promise<void> },
+          'initializeInternal',
+        );
+        await expect(
+          config.initialize({ sessionExecutionEngine: 'managed' }),
+        ).rejects.toThrow(/requires recording and a writer lease/);
+        expect(initialize).not.toHaveBeenCalled();
+        expect(config.getSessionExecutionEngine()).toBeUndefined();
+      },
+    );
+
+    it.each([false, true])(
+      'settles durable managed ownership before initialization; write failure=%s',
+      async (failWrite) => {
+        const root = await mkdtemp(
+          path.join(os.tmpdir(), 'qwen-config-owner-'),
+        );
+        const workspace = path.join(root, 'workspace');
+        const runtime = path.join(root, 'runtime');
+        await mkdir(workspace);
+        const actualFs =
+          await vi.importActual<typeof import('node:fs')>('node:fs');
+        vi.mocked(fs.readFileSync).mockImplementation((file) =>
+          typeof file === 'number' ? actualFs.readFileSync(file, 'utf8') : '',
+        );
+        await Storage.runWithResolvedRuntimeBaseDir(runtime, async () => {
+          const config = new Config({
+            ...baseParams,
+            sessionId: '550e8400-e29b-41d4-a716-446655440191',
+            targetDir: workspace,
+            chatRecording: true,
+            experimentalZedIntegration: true,
+            sessionWriterLeaseEnabled: true,
+            managedToolSessionFactory: () => {
+              throw new Error('must not create tools');
+            },
+          });
+          const recorder = config.getChatRecordingService()!;
+          const initialize = vi
+            .spyOn(
+              config as unknown as { initializeInternal(): Promise<void> },
+              'initializeInternal',
+            )
+            .mockImplementation(async () => {
+              const records = (
+                await readFile(config.getTranscriptPath(), 'utf8')
+              )
+                .trim()
+                .split('\n')
+                .map((line) => JSON.parse(line));
+              expect(records).toEqual([
+                expect.objectContaining({
+                  subtype: 'session_execution_engine',
+                  systemPayload: { version: 1, engine: 'managed' },
+                }),
+              ]);
+              expect(config.hasSessionWriteOwnership()).toBe(true);
+            });
+          if (failWrite)
+            vi.spyOn(
+              recorder,
+              'recordSessionExecutionEngine',
+            ).mockRejectedValue(new Error('owner append failed'));
+          try {
+            if (failWrite) {
+              await expect(
+                config.initialize({ sessionExecutionEngine: 'managed' }),
+              ).rejects.toThrow('owner append failed');
+              expect(config.hasSessionWriteOwnership()).toBe(false);
+              await expect(
+                stat(getSessionWriterLockPath(runtime, config.getSessionId())),
+              ).rejects.toMatchObject({ code: 'ENOENT' });
+              expect(initialize).not.toHaveBeenCalled();
+              expect(config.getSessionExecutionEngine()).toBeUndefined();
+            } else {
+              await config.initialize({ sessionExecutionEngine: 'managed' });
+              expect(initialize).toHaveBeenCalledOnce();
+              expect(config.getSessionExecutionEngine()).toBe('managed');
+            }
+          } finally {
+            await config.closeSessionWriter();
+            expect(config.hasSessionWriteOwnership()).toBe(false);
+            await expect(
+              stat(getSessionWriterLockPath(runtime, config.getSessionId())),
+            ).rejects.toMatchObject({ code: 'ENOENT' });
+            await rm(root, { recursive: true, force: true });
+          }
+        });
+      },
+    );
+
+    it.each(['unchanged', 'appended', 'deleted', 'reowned'] as const)(
+      'defers leased projection Goal migration and checks the source snapshot: %s',
+      async (change) => {
+        const root = await mkdtemp(
+          path.join(os.tmpdir(), 'qwen-projection-owner-'),
+        );
+        const workspace = path.join(root, 'workspace');
+        const runtimeBaseDir = path.join(root, 'runtime');
+        await mkdir(workspace);
+        const actualFs =
+          await vi.importActual<typeof import('node:fs')>('node:fs');
+        vi.mocked(fs.readFileSync).mockImplementation((file) =>
+          typeof file === 'number' ? actualFs.readFileSync(file, 'utf8') : '',
+        );
+        try {
+          await Storage.runWithResolvedRuntimeBaseDir(
+            runtimeBaseDir,
+            async () => {
+              const sessionId = '550e8400-e29b-41d4-a716-446655440192';
+              const service = new SessionService(workspace, { runtimeBaseDir });
+              const file = service.getSessionTranscriptPath(sessionId);
+              const record = {
+                uuid: 'legacy-goal',
+                parentUuid: null,
+                sessionId,
+                timestamp: new Date(0).toISOString(),
+                type: 'system',
+                subtype: 'slash_command',
+                provenance: 'goal_control',
+                cwd: workspace,
+                version: 'test',
+                systemPayload: {
+                  phase: 'result',
+                  outputHistoryItems: [
+                    {
+                      type: 'goal_status',
+                      kind: 'set',
+                      condition: 'migrate after owner',
+                    },
+                  ],
+                },
+              };
+              await mkdir(path.dirname(file), { recursive: true });
+              await writeFile(file, JSON.stringify(record) + '\n');
+              const projection = await service.readRestoreProjection(
+                sessionId,
+                { replay: { kind: 'none' } },
+              );
+              expect(projection).toBeDefined();
+              const config = new Config({
+                ...baseParams,
+                sessionId,
+                targetDir: workspace,
+                chatRecording: true,
+                experimentalZedIntegration: true,
+                sessionWriterLeaseEnabled: true,
+                sessionRestoreProjection: projection,
+              });
+              const recorder = config.getChatRecordingService()!;
+              const migrate = vi.spyOn(recorder, 'recordGoalState');
+              const owner = vi.spyOn(recorder, 'recordSessionExecutionEngine');
+              const initialize = vi
+                .spyOn(
+                  config as unknown as { initializeInternal(): Promise<void> },
+                  'initializeInternal',
+                )
+                .mockResolvedValue(undefined);
+              await Promise.resolve();
+              expect(migrate).not.toHaveBeenCalled();
+              if (change === 'appended')
+                await writeFile(file, JSON.stringify(record) + '\n\n');
+              if (change === 'deleted') await rm(file);
+              if (change === 'reowned') {
+                await writeFile(
+                  file,
+                  JSON.stringify(record) +
+                    '\n' +
+                    JSON.stringify({
+                      ...record,
+                      uuid: 'owner',
+                      parentUuid: record.uuid,
+                      subtype: 'session_execution_engine',
+                      provenance: 'system',
+                      systemPayload: { version: 1, engine: 'managed' },
+                    }) +
+                    '\n',
+                );
+              }
+              try {
+                if (change === 'unchanged') {
+                  await config.initialize({ sessionExecutionEngine: 'legacy' });
+                  config.finalizeSessionRestore();
+                  const goal = await config.getGoalRuntimeReady();
+                  expect(goal.getSnapshot().goal?.objective).toBe(
+                    'migrate after owner',
+                  );
+                  expect(migrate).toHaveBeenCalledOnce();
+                  expect(owner.mock.invocationCallOrder[0]).toBeLessThan(
+                    migrate.mock.invocationCallOrder[0],
+                  );
+                  const records = (await readFile(file, 'utf8'))
+                    .trim()
+                    .split('\n')
+                    .map((line) => JSON.parse(line));
+                  expect(records.map((entry) => entry.subtype)).toEqual([
+                    'slash_command',
+                    'session_execution_engine',
+                    'goal_state',
+                  ]);
+                } else {
+                  await expect(
+                    config.initialize({ sessionExecutionEngine: 'legacy' }),
+                  ).rejects.toThrow();
+                  expect(owner).not.toHaveBeenCalled();
+                  expect(migrate).not.toHaveBeenCalled();
+                  expect(initialize).not.toHaveBeenCalled();
+                  expect(config.hasSessionWriteOwnership()).toBe(false);
+                  await expect(
+                    stat(getSessionWriterLockPath(runtimeBaseDir, sessionId)),
+                  ).rejects.toMatchObject({ code: 'ENOENT' });
+                  if (change === 'deleted')
+                    await expect(stat(file)).rejects.toMatchObject({
+                      code: 'ENOENT',
+                    });
+                }
+              } finally {
+                await config.closeSessionWriter();
+              }
+            },
+          );
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      },
+    );
+
     it('adopts the active transcript when writer activation sees both states', async () => {
       const sessionId = '550e8400-e29b-41d4-a716-446655440099';
       const sessionData = {
+        executionEngine: executionEngineProof(sessionId),
         conversation: {
           sessionId,
           projectHash: 'test',

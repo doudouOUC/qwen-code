@@ -33,6 +33,8 @@ import {
   runForkedAgent,
   SessionIdCaseConflictError,
   SessionService,
+  SessionExecutionEngineError,
+  SESSION_EXECUTION_ENGINE_META_KEY,
   SESSION_WRITER_RPC_CODES,
   SessionWriterUnavailableError,
   SESSION_TITLE_MAX_LENGTH,
@@ -5440,14 +5442,15 @@ class QwenAgent implements Agent {
               sessionSource,
               requestedSessionId,
               undefined,
-              initializationDeadline || deferMcpDiscovery
-                ? {
-                    ...(initializationDeadline
-                      ? { signal: initializationDeadline.signal }
-                      : {}),
-                    ...(deferMcpDiscovery ? { skipMcpDiscovery: true } : {}),
-                  }
-                : undefined,
+              {
+                sessionExecutionEngine: this.managedToolSessionFactory
+                  ? 'managed'
+                  : 'legacy',
+                ...(initializationDeadline
+                  ? { signal: initializationDeadline.signal }
+                  : {}),
+                ...(deferMcpDiscovery ? { skipMcpDiscovery: true } : {}),
+              },
             ),
           );
           let session: Session;
@@ -5488,6 +5491,10 @@ class QwenAgent implements Agent {
             models: this.buildAvailableModels(config),
             modes: this.buildModesData(config),
             configOptions: this.buildConfigOptions(config),
+            _meta: {
+              [SESSION_EXECUTION_ENGINE_META_KEY]:
+                config.getSessionExecutionEngine(),
+            },
           }));
         },
         parentContext ? { parentContext } : {},
@@ -5577,6 +5584,10 @@ class QwenAgent implements Agent {
                   modes: this.buildModesData(config),
                   models: this.buildAvailableModels(config),
                   configOptions: this.buildConfigOptions(config),
+                  _meta: {
+                    [SESSION_EXECUTION_ENGINE_META_KEY]:
+                      config.getSessionExecutionEngine(),
+                  },
                   ...(projection?.artifactSnapshot
                     ? { artifactSnapshot: projection.artifactSnapshot }
                     : {}),
@@ -5662,6 +5673,7 @@ class QwenAgent implements Agent {
             return withRestoreHint(liveSession, {
               ...response,
               _meta: {
+                ...response._meta,
                 [LOAD_REPLAY_META_KEY]: envelope,
               },
             });
@@ -5706,7 +5718,11 @@ class QwenAgent implements Agent {
           sessionSource,
           sessionId,
           true,
-          {},
+          {
+            sessionExecutionEngine: this.managedToolSessionFactory
+              ? 'managed'
+              : 'legacy',
+          },
           undefined,
           restoreOptions,
         ),
@@ -5731,15 +5747,15 @@ class QwenAgent implements Agent {
           modes: this.buildModesData(config),
           models: this.buildAvailableModels(config),
           configOptions: this.buildConfigOptions(config),
+          _meta: {
+            [SESSION_EXECUTION_ENGINE_META_KEY]:
+              config.getSessionExecutionEngine(),
+            ...(replayEnvelope
+              ? { [LOAD_REPLAY_META_KEY]: replayEnvelope }
+              : {}),
+          },
           ...(projection?.runtime.artifactSnapshot
             ? { artifactSnapshot: projection.runtime.artifactSnapshot }
-            : {}),
-          ...(replayEnvelope
-            ? {
-                _meta: {
-                  [LOAD_REPLAY_META_KEY]: replayEnvelope,
-                },
-              }
             : {}),
         })) as LoadSessionResponse;
       try {
@@ -6050,6 +6066,10 @@ class QwenAgent implements Agent {
                     modes: this.buildModesData(config),
                     models: this.buildAvailableModels(config),
                     configOptions: this.buildConfigOptions(config),
+                    _meta: {
+                      [SESSION_EXECUTION_ENGINE_META_KEY]:
+                        config.getSessionExecutionEngine(),
+                    },
                     ...(projection?.artifactSnapshot
                       ? { artifactSnapshot: projection.artifactSnapshot }
                       : {}),
@@ -6088,7 +6108,11 @@ class QwenAgent implements Agent {
           sessionSource,
           sessionId,
           true,
-          {},
+          {
+            sessionExecutionEngine: this.managedToolSessionFactory
+              ? 'managed'
+              : 'legacy',
+          },
           undefined,
           RESUME_RESTORE_OPTIONS,
         ),
@@ -6137,6 +6161,10 @@ class QwenAgent implements Agent {
                 modes: this.buildModesData(config),
                 models: this.buildAvailableModels(config),
                 configOptions: this.buildConfigOptions(config),
+                _meta: {
+                  [SESSION_EXECUTION_ENGINE_META_KEY]:
+                    config.getSessionExecutionEngine(),
+                },
                 ...(projection?.runtime.artifactSnapshot
                   ? { artifactSnapshot: projection.runtime.artifactSnapshot }
                   : {}),
@@ -13686,6 +13714,11 @@ class QwenAgent implements Agent {
         throw new RequestError(ACP_ERROR_CODES.INVALID_PARAMS, error.message, {
           errorKind: 'session_id_conflict',
           sessionId: error.sessionId,
+        });
+      }
+      if (error instanceof SessionExecutionEngineError) {
+        throw new RequestError(ACP_ERROR_CODES.INVALID_PARAMS, error.message, {
+          errorKind: error.errorKind,
         });
       }
       const writerError = getSessionWriterError(error);

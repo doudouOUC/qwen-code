@@ -10,6 +10,7 @@ import * as fs from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import process from 'node:process';
+import { isDeepStrictEqual } from 'node:util';
 
 // Types
 import type {
@@ -54,6 +55,11 @@ import {
 
 // Services
 import { FileDiscoveryService } from '../services/fileDiscoveryService.js';
+import {
+  assertSessionExecutionEngine,
+  SessionExecutionEngineError,
+  type SessionExecutionEngine,
+} from '../services/session-execution-engine.js';
 import { FileHistoryService } from '../services/fileHistoryService.js';
 import {
   type FileSystemService,
@@ -1494,6 +1500,8 @@ function readMemoryPressureRatioEnv(envName: string, fallback: number): number {
  * Options for Config.initialize()
  */
 export interface ConfigInitializeOptions {
+  /** Actual executable ACP session; omitted for bootstrap and readonly replay. */
+  sessionExecutionEngine?: SessionExecutionEngine;
   /** Cancels request-scoped initialization without becoming a session signal. */
   signal?: AbortSignal;
   /**
@@ -2008,6 +2016,7 @@ export class Config {
   private sessionSourceType?: string;
   private sessionSourceId?: string;
   private sessionData?: ResumedSessionData;
+  private sessionExecutionEngine?: SessionExecutionEngine;
   private pendingSessionRestoreProjection?: SessionRestoreProjection;
   private sessionRestoreRuntime?: SessionRuntimeResumeState;
   private readonly sessionRestoreProjectionSource?: () => Promise<
@@ -2424,6 +2433,34 @@ export class Config {
   private readonly runtimeEnvironment?: Readonly<NodeJS.ProcessEnv>;
 
   constructor(params: ConfigParameters) {
+    const restoredEngine = params.managedToolSessionFactory
+      ? 'managed'
+      : 'legacy';
+    for (const restored of [
+      params.sessionData,
+      params.sessionRestoreProjection,
+    ]) {
+      if (!restored) continue;
+      assertSessionExecutionEngine(
+        restored.executionEngine,
+        params.sessionId ?? '',
+        restoredEngine,
+      );
+    }
+    if (
+      restoredEngine === 'managed' &&
+      (params.sessionData ||
+        params.sessionRestoreProjection ||
+        params.sessionRestoreProjectionSource) &&
+      (params.chatRecording === false ||
+        params.experimentalZedIntegration !== true ||
+        params.sessionWriterLeaseEnabled !== true)
+    ) {
+      throw new SessionExecutionEngineError(
+        params.sessionId ?? '',
+        'managed execution requires recording and a writer lease',
+      );
+    }
     this.runtimeEnvironment =
       params.runtimeEnvironment === undefined
         ? undefined
@@ -2890,9 +2927,8 @@ export class Config {
       ? this.createChatRecordingService()
       : undefined;
     if (
-      !this.sessionRestoreProjectionSource ||
-      this.sessionRestoreRuntime ||
-      !this.sessionWriterLeaseEnabled
+      !this.sessionWriterLeaseEnabled ||
+      (!this.sessionRestoreProjectionSource && !this.sessionRestoreRuntime)
     ) {
       this.initializeGoalRuntime(
         this.sessionRestoreRuntime?.goalRecords ??
@@ -3016,7 +3052,9 @@ export class Config {
     options?: ConfigInitializeOptions,
   ): Promise<void> {
     try {
-      const activation = this.activateChatRecording();
+      const activation = this.activateChatRecording(
+        options?.sessionExecutionEngine,
+      );
       this.sessionWriterActivationPromise = activation;
       try {
         await activation;
@@ -3591,8 +3629,34 @@ export class Config {
     }
   }
 
-  private async activateChatRecording(): Promise<void> {
+  private async activateChatRecording(
+    executionEngine?: SessionExecutionEngine,
+  ): Promise<void> {
+    const expectedEngine = this.managedToolSessionFactory
+      ? 'managed'
+      : 'legacy';
+    if (executionEngine && executionEngine !== expectedEngine) {
+      throw new SessionExecutionEngineError(
+        this.sessionId,
+        'host engine mismatch',
+      );
+    }
+    if (
+      executionEngine === 'managed' &&
+      (!this.chatRecordingEnabled || !this.sessionWriterLeaseEnabled)
+    ) {
+      throw new SessionExecutionEngineError(
+        this.sessionId,
+        'managed execution requires recording and a writer lease',
+      );
+    }
     if (!this.chatRecordingEnabled || !this.sessionWriterLeaseEnabled) {
+      if (executionEngine) {
+        await this.chatRecordingService?.recordSessionExecutionEngine(
+          executionEngine,
+        );
+        this.sessionExecutionEngine = executionEngine;
+      }
       return;
     }
     if (this.sessionWriterShutdownRequested) {
@@ -3638,12 +3702,37 @@ export class Config {
           'after_writer_lease',
         );
         projection = await this.sessionRestoreProjectionSource();
+        assertSessionExecutionEngine(
+          projection?.executionEngine,
+          this.sessionId,
+          expectedEngine,
+        );
         this.setSessionRestoreProjection(projection);
-      } else if (this.sessionData || lease.transcriptExistedAtAcquire) {
+      } else if (
+        this.sessionData ||
+        this.pendingSessionRestoreProjection ||
+        lease.transcriptExistedAtAcquire
+      ) {
         authoritative = await this.getSessionService().loadSession(
           this.sessionId,
         );
         if (!authoritative) throw new SessionWriterUnavailableError();
+        assertSessionExecutionEngine(
+          authoritative.executionEngine,
+          this.sessionId,
+          expectedEngine,
+        );
+        if (this.pendingSessionRestoreProjection) {
+          projection = this.pendingSessionRestoreProjection;
+          if (
+            !isDeepStrictEqual(
+              projection.executionEngine?.snapshot,
+              authoritative.executionEngine.snapshot,
+            )
+          ) {
+            throw new SessionTranscriptChangedError();
+          }
+        }
       } else if (location !== undefined) {
         throw new SessionTranscriptChangedError();
       }
@@ -3661,14 +3750,18 @@ export class Config {
         persistedTitleInfo,
         projection?.runtime.recording,
       );
-      if (this.sessionRestoreProjectionSource) {
+      this.pendingSessionWriterLease = undefined;
+      lease = undefined;
+      if (executionEngine) {
+        await recorder.recordSessionExecutionEngine(executionEngine);
+        this.sessionExecutionEngine = executionEngine;
+      }
+      if (projection || this.sessionRestoreProjectionSource) {
         this.initializeGoalRuntime(
           projection?.runtime.goalRecords,
           projection?.runtime,
         );
       }
-      this.pendingSessionWriterLease = undefined;
-      lease = undefined;
       // The recorder can take writes now, so the restore the constructor
       // held back can finally run — against `authoritative`, which is
       // fresher than what the constructor had. Not awaited: activation
@@ -4381,13 +4474,24 @@ export class Config {
     return this.debugLogger;
   }
 
-  /**
-   * Starts a new session and resets session-scoped services.
-   */
+  assertCanRestoreSession(sessionId: string, data: ResumedSessionData): void {
+    assertSessionExecutionEngine(
+      data.executionEngine,
+      sessionId,
+      this.managedToolSessionFactory ? 'managed' : 'legacy',
+    );
+  }
+
+  getSessionExecutionEngine(): SessionExecutionEngine | undefined {
+    return this.sessionExecutionEngine;
+  }
+
+  /** Starts a new session and resets session-scoped services. */
   startNewSession(
     sessionId?: string,
     sessionData?: ResumedSessionData,
   ): string {
+    if (sessionData) this.assertCanRestoreSession(sessionId ?? '', sessionData);
     if (isDerivedConfig(this)) {
       throw new Error('Derived Configs cannot start new sessions');
     }
@@ -4434,6 +4538,7 @@ export class Config {
     unregisterSessionModel(previousSessionId);
     this.publishModelEnv();
     this.sessionData = sessionData;
+    this.sessionExecutionEngine = undefined;
     if (isSessionTransition) {
       const skillTool = this.toolRegistry?.getTool?.(ToolNames.SKILL);
       if (skillTool && 'clearLoadedSkills' in skillTool) {

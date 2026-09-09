@@ -27,12 +27,32 @@ import * as ServerConfig from '@qwen-code/qwen-code-core';
 import { isWorkspaceTrusted } from './trustedFolders.js';
 import { resetMcpApprovalsForTesting } from './mcpApprovals.js';
 
+function executionEngineProof(
+  sessionId: string,
+  engine: ServerConfig.SessionExecutionEngine = 'legacy',
+): ServerConfig.SessionExecutionEngineState {
+  return {
+    status: 'verified',
+    sessionId,
+    engine,
+    recorded: true,
+    snapshot: {
+      filePath: `/mock/${sessionId}.jsonl`,
+      dev: 1,
+      ino: 1,
+      size: 1,
+      lastUpdated: new Date(0).toISOString(),
+    },
+  };
+}
+
 const mockWriteStderrLine = vi.hoisted(() => vi.fn());
 const mockWriteStdoutLine = vi.hoisted(() => vi.fn());
 const mockUpdateHandler = vi.hoisted(() => vi.fn());
 const mockSessionServiceInstance = vi.hoisted(() => ({
   loadLastSession: vi.fn(),
   loadSession: vi.fn(),
+  readExecutionEngine: vi.fn(),
   forkSession: vi.fn(),
   sessionExists: vi.fn(),
   sessionExistsInAnyState: vi.fn(),
@@ -1854,6 +1874,50 @@ describe('loadCliConfig', () => {
     expect(config.isMcpServerPendingApproval('ide-only')).toBe(false);
   });
 
+  it.each([false, true])(
+    'rejects managed history before Config construction with recording=%s',
+    async (chatRecording) => {
+      const sessionId = '123e4567-e89b-42d3-a456-426614174000';
+      mockSessionServiceInstance.loadSession.mockResolvedValue({
+        conversation: { sessionId, messages: [] },
+        executionEngine: executionEngineProof(sessionId, 'managed'),
+      });
+      mockConfigConstructorParams.mockClear();
+      await expect(
+        loadCliConfig({}, { resume: sessionId, chatRecording } as CliArgs),
+      ).rejects.toThrow(/belongs to managed/);
+      expect(mockConfigConstructorParams).not.toHaveBeenCalled();
+    },
+  );
+
+  it('prechecks a deferred projection owner before constructing Config', async () => {
+    const sessionId = '123e4567-e89b-42d3-a456-426614174000';
+    const projectionSource = vi.fn();
+    mockSessionServiceInstance.readExecutionEngine.mockResolvedValue(
+      executionEngineProof(sessionId, 'managed'),
+    );
+    mockConfigConstructorParams.mockClear();
+    await expect(
+      loadCliConfig(
+        { experimental: { sessionWriterLease: true } },
+        { resume: sessionId, acp: true } as CliArgs,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+        { sessionRestore: { projectionSource } },
+      ),
+    ).rejects.toThrow(/belongs to managed/);
+    expect(mockSessionServiceInstance.readExecutionEngine).toHaveBeenCalledWith(
+      sessionId,
+    );
+    expect(projectionSource).not.toHaveBeenCalled();
+    expect(mockConfigConstructorParams).not.toHaveBeenCalled();
+  });
+
   it('should fork and load a new session when --resume is combined with --fork-session', async () => {
     const sourceSessionId = '123e4567-e89b-42d3-a456-426614174000';
     const sourceData = {
@@ -1866,8 +1930,12 @@ describe('loadCliConfig', () => {
     };
     mockSessionServiceInstance.loadSession.mockImplementation(
       async (sessionId: string) => {
-        if (sessionId === sourceSessionId) return sourceData;
-        return forkedData;
+        const data = sessionId === sourceSessionId ? sourceData : forkedData;
+        return {
+          ...data,
+          conversation: { ...data.conversation, sessionId },
+          executionEngine: executionEngineProof(sessionId),
+        };
       },
     );
 
@@ -1892,6 +1960,7 @@ describe('loadCliConfig', () => {
     const sourceSessionId = '123e4567-e89b-42d3-a456-426614174000';
     const projectionSource = vi.fn(async (sessionId: string) => ({
       sessionId,
+      executionEngine: executionEngineProof(sessionId),
       filePath: `/mock/${sessionId}.jsonl`,
       startTime: '2026-08-13T00:00:00.000Z',
       lastUpdated: '2026-08-13T00:00:00.000Z',
@@ -1950,6 +2019,7 @@ describe('loadCliConfig', () => {
     const sourceSessionId = '123e4567-e89b-42d3-a456-426614174000';
     const projectionSource = vi.fn(async (sessionId: string) => ({
       sessionId,
+      executionEngine: executionEngineProof(sessionId),
       filePath: `/mock/${sessionId}.jsonl`,
       startTime: '2026-08-13T00:00:00.000Z',
       lastUpdated: '2026-08-13T00:00:00.000Z',

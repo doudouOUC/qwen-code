@@ -59,10 +59,15 @@ import {
 import {
   SessionTranscriptReader,
   SessionTranscriptTooLargeError,
+  readSessionTranscriptSnapshot,
   type SelectiveSessionRestoreOptions,
   type SessionLiveRestoreProjection,
   type SessionRestoreProjection,
 } from './session-transcript-reader.js';
+import {
+  assertSessionExecutionEngine,
+  type SessionExecutionEngineState,
+} from './session-execution-engine.js';
 import {
   SessionWriterError,
   SessionWriterLease,
@@ -365,6 +370,7 @@ export interface ConversationRecord {
  * Data structure for resuming an existing session.
  */
 export interface ResumedSessionData {
+  executionEngine?: SessionExecutionEngineState;
   conversation: ConversationRecord;
   filePath: string;
   /** UUID of the last completed message - new messages should use this as parentUuid */
@@ -866,6 +872,25 @@ export class SessionService {
    */
   getSessionTranscriptPath(sessionId: string): string {
     return this.getSessionFilePath(sessionId, 'active');
+  }
+
+  async readExecutionEngine(
+    sessionId: string,
+  ): Promise<SessionExecutionEngineState | undefined> {
+    const snapshot = await readSessionTranscriptSnapshot(
+      this.getSessionFilePath(sessionId, 'active'),
+      sessionId,
+      false,
+    );
+    if (!snapshot) return undefined;
+    const first = snapshot.firstRecord;
+    if (
+      !first ||
+      !(await this.sessionBelongsToCurrentProject(first.sessionId, first.cwd))
+    ) {
+      throw new SessionStorageEntryError(sessionId, 'unknown_project');
+    }
+    return snapshot.executionEngine;
   }
 
   getWorktreeSessionPathForArchiveState(
@@ -2483,20 +2508,6 @@ export class SessionService {
   }
 
   /**
-   * Reads all records from a session file.
-   */
-  private async readAllRecords(filePath: string): Promise<ChatRecord[]> {
-    try {
-      return await jsonl.read<ChatRecord>(filePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-        debugLogger.error('Error reading session file:', error);
-      }
-      return [];
-    }
-  }
-
-  /**
    * Reconstructs a linear conversation from tree-structured records.
    *
    * Delegates validation, parentUuid walking, and fragment aggregation to the
@@ -2597,7 +2608,8 @@ export class SessionService {
   ): Promise<ResumedSessionData | undefined> {
     const filePath = this.getSessionFilePath(sessionId, state);
 
-    const records = await this.readAllRecords(filePath);
+    const snapshot = await readSessionTranscriptSnapshot(filePath, sessionId);
+    const records = snapshot?.records ?? [];
     if (records.length === 0) {
       return;
     }
@@ -2634,7 +2646,7 @@ export class SessionService {
     }
 
     const lastMessage = messages[messages.length - 1];
-    stats ??= await fs.promises.stat(filePath);
+    stats = snapshot!.stats;
 
     const conversation: ConversationRecord = {
       sessionId: firstRecord.sessionId,
@@ -2668,6 +2680,7 @@ export class SessionService {
     return {
       conversation,
       filePath,
+      executionEngine: snapshot!.executionEngine,
       lastCompletedUuid: lastMessage.uuid,
       fileHistorySnapshots,
       ...(artifactSnapshot ? { artifactSnapshot } : {}),
@@ -3400,11 +3413,19 @@ export class SessionService {
     const sourcePath = path.join(chatsDir, `${sourceSessionId}.jsonl`);
     const targetPath = path.join(chatsDir, `${newSessionId}.jsonl`);
 
-    // Read + parse the full source transcript.
-    const records = await jsonl.read<ChatRecord>(sourcePath);
+    const snapshot = await readSessionTranscriptSnapshot(
+      sourcePath,
+      sourceSessionId,
+    );
+    const records = snapshot?.records ?? [];
     if (records.length === 0) {
       throw new Error(`Source session not found or empty: ${sourceSessionId}`);
     }
+    assertSessionExecutionEngine(
+      snapshot?.executionEngine,
+      sourceSessionId,
+      'legacy',
+    );
 
     if (
       !(await this.sessionBelongsToCurrentProject(
@@ -3462,6 +3483,7 @@ export class SessionService {
           record.type === 'system' &&
           (record.subtype === 'parent_session' ||
             record.subtype === 'session_source' ||
+            record.subtype === 'session_execution_engine' ||
             record.subtype === 'turn_result' ||
             (options.source && record.subtype === 'custom_title'))
         ),
@@ -3469,6 +3491,12 @@ export class SessionService {
     if (sourceRecords.length === 0) {
       throw new Error(`Source session not found or empty: ${sourceSessionId}`);
     }
+    const sourceEngine = records.find(
+      (record) =>
+        record.type === 'system' &&
+        record.subtype === 'session_execution_engine',
+    );
+    if (sourceEngine) sourceRecords.unshift(sourceEngine);
 
     // Rebuild the parentUuid chain in active-history order so the fork is a
     // clean linear descendant. `forkedFrom` captures the origin of each

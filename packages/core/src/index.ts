@@ -145,6 +145,7 @@ export type { ConnectionId, PoolEvent } from './tools/mcp-pool-events.js';
 export { WorkspaceMcpBudget } from './tools/mcp-workspace-budget.js';
 export * from './tools/mcp-tool.js';
 export * from './tools/read-file.js';
+export * from './services/session-execution-engine.js';
 export * from './tools/ripGrep.js';
 export * from './tools/sdk-control-client-transport.js';
 export * from './tools/client-mcp-registrar.js';

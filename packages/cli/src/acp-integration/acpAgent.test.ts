@@ -202,7 +202,10 @@ vi.mock('@agentclientprotocol/sdk', async (importOriginal) => ({
   PROTOCOL_VERSION: '1.0.0',
 }));
 
-vi.mock('@qwen-code/acp-bridge/ndJsonStream', () => ({
+vi.mock('@qwen-code/acp-bridge/ndJsonStream', async (importOriginal) => ({
+  hasBoundedJsonStructure: (
+    await importOriginal<typeof import('@qwen-code/acp-bridge/ndJsonStream')>()
+  ).hasBoundedJsonStructure,
   ndJsonStream: vi.fn().mockReturnValue({}),
 }));
 
@@ -754,6 +757,12 @@ vi.mock('@qwen-code/qwen-code-core', async (importOriginal) => ({
       .map(([key, value]) => `${key}: ${String(value)}`)
       .join('\n'),
   ),
+  SESSION_EXECUTION_ENGINE_META_KEY: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).SESSION_EXECUTION_ENGINE_META_KEY,
+  SessionExecutionEngineError: (
+    await importOriginal<typeof import('@qwen-code/qwen-code-core')>()
+  ).SessionExecutionEngineError,
   SESSION_TITLE_MAX_LENGTH: 200,
   tokenLimit: vi.fn().mockReturnValue(128_000),
   buildBackgroundEntryLabel: vi.fn(
@@ -4998,6 +5007,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       getReasoningEffort: vi.fn().mockReturnValue(undefined),
       getReasoningEffortOverride: vi.fn().mockReturnValue(undefined),
       setReasoningEffort: vi.fn(),
+      getSessionExecutionEngine: vi.fn().mockReturnValue('legacy'),
       getSessionId: vi.fn().mockReturnValue('test-session-id'),
       getAuthType: vi.fn().mockReturnValue('api-key'),
       getCurrentModelRegistryBaseUrl: vi.fn().mockReturnValue(undefined),
@@ -14498,7 +14508,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       );
       expect(
         mockCreateBuiltinManagedToolRuntime,
-      ).toHaveBeenCalledExactlyOnceWith(innerConfig);
+      ).toHaveBeenCalledExactlyOnceWith(innerConfig, undefined, undefined);
       expect(runtime.beginTurn).toHaveBeenCalledWith(identity);
       expect(innerConfig.setFileSystemService).not.toHaveBeenCalled();
       await expect(
@@ -18848,6 +18858,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     });
     expect(innerConfig.initialize).toHaveBeenCalledWith({
       sendSdkMcpMessage: expect.any(Function),
+      sessionExecutionEngine: 'legacy',
     });
     expect(initialize).toHaveBeenCalledTimes(1);
     expect(fireSessionStartEvent).toHaveBeenCalledTimes(1);
@@ -20126,6 +20137,7 @@ describe('QwenAgent sessionIdContext binding', () => {
       getModel: vi.fn().mockReturnValue('test-model'),
       getWorkspaceContext: vi.fn().mockReturnValue({}),
       getDebugMode: vi.fn().mockReturnValue(false),
+      getSessionExecutionEngine: vi.fn().mockReturnValue('legacy'),
       getSessionId: vi.fn().mockReturnValue(sessionId),
     } as unknown as Config;
   });
@@ -20480,6 +20492,7 @@ describe('QwenAgent extMethod renameSession routing', () => {
       getAvailableModels: vi.fn().mockReturnValue([]),
       getModes: vi.fn().mockReturnValue([]),
       getApprovalMode: vi.fn().mockReturnValue('default'),
+      getSessionExecutionEngine: vi.fn().mockReturnValue('legacy'),
       getSessionId: vi.fn().mockReturnValue(liveSessionId),
       getAuthType: vi.fn().mockReturnValue('api-key'),
       getAllConfiguredModels: vi.fn().mockReturnValue([]),
@@ -22197,6 +22210,7 @@ describe('QwenAgent loadSession / unstable_resumeSession', () => {
       getAvailableModels: vi.fn().mockReturnValue([]),
       getModes: vi.fn().mockReturnValue([]),
       getApprovalMode: vi.fn().mockReturnValue('default'),
+      getSessionExecutionEngine: vi.fn().mockReturnValue('legacy'),
       getSessionId: vi.fn().mockReturnValue('persisted-1'),
       getAuthType: vi.fn().mockReturnValue('api-key'),
       getAllConfiguredModels: vi.fn().mockReturnValue([]),
@@ -26500,6 +26514,7 @@ describe('sessionLanguage multi-session propagation', () => {
       getAvailableModels: vi.fn().mockReturnValue([]),
       getModes: vi.fn().mockReturnValue([]),
       getApprovalMode: vi.fn().mockReturnValue('default'),
+      getSessionExecutionEngine: vi.fn().mockReturnValue('legacy'),
       getSessionId: vi.fn().mockReturnValue('sid'),
       getAuthType: vi.fn().mockReturnValue('api-key'),
       getAllConfiguredModels: vi.fn().mockReturnValue([]),

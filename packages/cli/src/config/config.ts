@@ -22,6 +22,7 @@ import {
   InputFormat,
   OutputFormat,
   SessionService,
+  assertSessionExecutionEngine,
   ideContextStore,
   type ResumedSessionData,
   type SessionRestoreProjection,
@@ -1893,6 +1894,20 @@ export async function loadCliConfig(
           process.exit(1);
         }
       }
+    }
+
+    if (sessionId) {
+      const executionEngine =
+        sessionRestoreProjection?.executionEngine ??
+        sessionData?.executionEngine ??
+        (deferProjectionUntilWriterLease
+          ? await sessionService.readExecutionEngine(sessionId)
+          : undefined);
+      assertSessionExecutionEngine(
+        executionEngine,
+        sessionId,
+        hostPolicy?.managedToolSessionFactory ? 'managed' : 'legacy',
+      );
     }
   } else if (argv.sandboxSessionId) {
     if (!environment['SANDBOX']) {

@@ -136,6 +136,10 @@ describe('managed Agent channel', () => {
     const channel = await create(cwd, privateOverrides);
     const bootstrap =
       vi.mocked(loadCliConfig).mock.calls[0][9]?.managedToolSessionFactory;
+    expect(
+      vi.mocked(loadCliConfig).mock.calls[0][0].experimental
+        ?.sessionWriterLease,
+    ).toBe(true);
     const host =
       vi.mocked(createAcpAgentHost).mock.calls[0][4]?.managedToolSessionFactory;
     expect(bootstrap).toBeTypeOf('function');

@@ -167,6 +167,8 @@ export function useResumeCommand(
           return;
         }
 
+        config.assertCanRestoreSession(sessionId, sessionData);
+
         // Restore session name tag from custom title.
         const customTitle = sessionService.getSessionTitle(sessionId);
 

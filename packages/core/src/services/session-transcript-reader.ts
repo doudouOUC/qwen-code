@@ -62,6 +62,11 @@ import type { AttributionSnapshot } from './commitAttribution.js';
 import type { FileHistorySnapshot } from './fileHistoryService.js';
 import { SessionFileHistoryAccumulator } from './session-file-history-state.js';
 import {
+  SessionExecutionEngineAccumulator,
+  type SessionExecutionEngine,
+  type SessionExecutionEngineState,
+} from './session-execution-engine.js';
+import {
   selectActiveSideArtifactRecordUuids,
   SessionArtifactSnapshotAccumulator,
   type RebuiltSessionArtifactSnapshot,
@@ -213,6 +218,7 @@ export interface SessionRuntimeResumeState {
     sourceId?: string;
     sessionModel?: SessionModelRecordPayload;
     lastAssistantModel?: string;
+    executionEngine?: SessionExecutionEngine;
   };
   fileHistorySnapshots?: FileHistorySnapshot[];
   artifactSnapshot?: RebuiltSessionArtifactSnapshot;
@@ -229,6 +235,7 @@ export interface SessionRestoreProjection {
   startTime: string;
   lastUpdated: string;
   runtime: SessionRuntimeResumeState;
+  executionEngine?: SessionExecutionEngineState;
   replay?: SessionRestoreReplayPage;
 }
 
@@ -295,6 +302,7 @@ interface UuidIndexEntry {
 }
 
 interface TranscriptIndex {
+  executionEngine: SessionExecutionEngineState;
   filePath: string;
   fileIdentity: SessionTranscriptFileIdentity;
   snapshotSize: number;
@@ -1558,6 +1566,7 @@ async function buildIndex(params: {
 }): Promise<TranscriptIndex> {
   const { filePath, fileIdentity, snapshotSize, lastUpdated } = params;
   const sessionId = path.basename(filePath, '.jsonl');
+  const executionEngine = new SessionExecutionEngineAccumulator(sessionId);
   if (snapshotSize > SESSION_TRANSCRIPT_MAX_INDEX_BYTES) {
     debugLogger.warn(
       `index rejected: snapshot too large session=${sessionId} ` +
@@ -1595,7 +1604,7 @@ async function buildIndex(params: {
         const text = line.toString('utf8').trim();
         if (text.length === 0) return;
         let fragmentIndex = 0;
-        for (const value of jsonl.parseLineTolerant<unknown>(text, filePath)) {
+        for (const value of executionEngine.parseLine(text, filePath)) {
           const record = validateTranscriptRecord(value).record;
           if (!record) {
             continue;
@@ -1772,6 +1781,12 @@ async function buildIndex(params: {
   await indexBuildCompleteHookForTest?.(filePath);
 
   return {
+    executionEngine: executionEngine.finish({
+      filePath,
+      ...fileIdentity,
+      size: snapshotSize,
+      lastUpdated,
+    }),
     filePath,
     fileIdentity,
     snapshotSize,
@@ -1967,6 +1982,66 @@ async function hasSnapshotSignature(
     sameFileIdentity(fileIdentityFromStats(stats), fileIdentity) &&
     new Date(stats.mtimeMs).toISOString() === lastUpdated
   );
+}
+
+export async function readSessionTranscriptSnapshot(
+  filePath: string,
+  sessionId: string,
+  collectRecords = true,
+): Promise<
+  | {
+      records: ChatRecord[];
+      firstRecord?: ChatRecord;
+      executionEngine: SessionExecutionEngineState;
+      stats: fs.Stats;
+    }
+  | undefined
+> {
+  let stats: fs.Stats;
+  try {
+    stats = await fsp.stat(filePath);
+  } catch (error) {
+    if (isFileMissingError(error)) return undefined;
+    throw error;
+  }
+  if (!stats.isFile()) {
+    throw new SessionTranscriptSnapshotUnavailableError(sessionId);
+  }
+  const fileIdentity = fileIdentityFromStats(stats);
+  const lastUpdated = new Date(stats.mtimeMs).toISOString();
+  const owner = new SessionExecutionEngineAccumulator(sessionId);
+  const records: ChatRecord[] = [];
+  let firstRecord: ChatRecord | undefined;
+  await forEachLineInSnapshot(filePath, stats.size, (line) => {
+    for (const record of owner.parseLine(
+      line.toString('utf8').trim(),
+      filePath,
+    )) {
+      firstRecord ??= record as ChatRecord;
+      if (collectRecords) records.push(record as ChatRecord);
+    }
+  });
+  if (
+    !(await hasSnapshotSignature(
+      filePath,
+      fileIdentity,
+      stats.size,
+      lastUpdated,
+    ))
+  ) {
+    throw new SessionTranscriptSnapshotUnavailableError(sessionId);
+  }
+  return {
+    records,
+    firstRecord,
+    stats,
+    executionEngine: owner.finish({
+      filePath,
+      ...fileIdentity,
+      size: stats.size,
+      lastUpdated,
+    }),
+  };
 }
 
 function offerFreshIndexToCache(index: TranscriptIndex): void {
@@ -2518,6 +2593,10 @@ export class SessionTranscriptReader {
         ...(sourceId !== undefined ? { sourceId } : {}),
         ...(sessionModel !== undefined ? { sessionModel } : {}),
         ...(lastAssistantModel !== undefined ? { lastAssistantModel } : {}),
+        ...(index.executionEngine.status === 'verified' &&
+        index.executionEngine.recorded
+          ? { executionEngine: index.executionEngine.engine }
+          : {}),
       },
       ...(restoredFileHistory
         ? { fileHistorySnapshots: restoredFileHistory }
@@ -2546,6 +2625,7 @@ export class SessionTranscriptReader {
       startTime: index.restoreStartTime,
       lastUpdated: index.lastUpdated,
       runtime,
+      executionEngine: index.executionEngine,
       ...(replay ? { replay } : {}),
     };
   }

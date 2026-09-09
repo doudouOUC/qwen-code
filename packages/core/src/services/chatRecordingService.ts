@@ -5,6 +5,12 @@
  */
 
 import { type Config } from '../config/config.js';
+import {
+  SessionExecutionEngineError,
+  type SessionExecutionEngine,
+  type SessionExecutionEnginePayload,
+  type SessionExecutionEngineState,
+} from './session-execution-engine.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -303,6 +309,7 @@ export interface ChatRecord {
     | 'parent_session'
     | 'session_source'
     | 'session_model'
+    | 'session_execution_engine'
     | 'rewind'
     | 'agent_bootstrap'
     | 'agent_launch_prompt'
@@ -366,6 +373,7 @@ export interface ChatRecord {
     | ParentSessionRecordPayload
     | SessionSourceRecordPayload
     | SessionModelRecordPayload
+    | SessionExecutionEnginePayload
     | NotificationRecordPayload
     | UserPromptRecordPayload
     | RewindRecordPayload
@@ -861,6 +869,7 @@ export interface BranchCheckpointCursor {
 }
 
 export interface ChatRecordingRestoreState {
+  executionEngine?: SessionExecutionEngine;
   lastCompletedUuid: string;
   turnParentUuids: Array<string | null>;
   customTitle?: string;
@@ -1021,6 +1030,11 @@ export class ChatRecordingService {
   private bytesSinceTitleAnchor = 0;
   private hasNonTitleContentSinceTitleAnchor = false;
   private bytesSinceSourceAnchor = 0;
+  private currentExecutionEngine?: SessionExecutionEngine;
+  private executionEngineWrite?: {
+    engine: SessionExecutionEngine;
+    completion: Promise<void>;
+  };
 
   constructor(
     config: Config,
@@ -1048,6 +1062,7 @@ export class ChatRecordingService {
             ? {
                 conversation: resumed.conversation ?? { messages: [] },
                 lastCompletedUuid: resumed.lastCompletedUuid,
+                executionEngine: resumed.executionEngine,
               }
             : undefined,
           resumed ? this.readPersistedTitleInfo() : undefined,
@@ -1133,6 +1148,7 @@ export class ChatRecordingService {
     sessionData?: {
       conversation: { messages: ChatRecord[] };
       lastCompletedUuid: string | null;
+      executionEngine?: SessionExecutionEngineState;
     },
     persistedTitleInfo?: { title?: string; source?: TitleSource },
   ): void {
@@ -1144,6 +1160,11 @@ export class ChatRecordingService {
     this.currentSourceType = undefined;
     this.currentSourceId = undefined;
     this.currentSessionModel = undefined;
+    this.currentExecutionEngine =
+      sessionData?.executionEngine?.status === 'verified' &&
+      sessionData.executionEngine.recorded
+        ? sessionData.executionEngine.engine
+        : undefined;
     this.activeBranchRecords = [];
     this.activeBranchBaseUuid = null;
     this.pendingBranchToolCalls = [];
@@ -1202,6 +1223,7 @@ export class ChatRecordingService {
   }
 
   private restoreProjectedState(state: ChatRecordingRestoreState): void {
+    this.currentExecutionEngine = state.executionEngine;
     this.lastRecordUuid = state.lastCompletedUuid;
     this.lastPersistedRecordUuid = state.lastCompletedUuid;
     this.activeBranchBaseUuid = state.lastCompletedUuid;
@@ -1227,6 +1249,7 @@ export class ChatRecordingService {
     sessionData?: {
       conversation: { messages: ChatRecord[] };
       lastCompletedUuid: string | null;
+      executionEngine?: SessionExecutionEngineState;
     },
     persistedTitleInfo?: { title?: string; source?: TitleSource },
     restoreState?: ChatRecordingRestoreState,
@@ -1246,6 +1269,30 @@ export class ChatRecordingService {
     }
     this.state = 'active';
     this.acceptingWrites = true;
+  }
+
+  async recordSessionExecutionEngine(
+    engine: SessionExecutionEngine,
+  ): Promise<void> {
+    const owner =
+      this.currentExecutionEngine ?? this.executionEngineWrite?.engine;
+    if (owner !== undefined && owner !== engine) {
+      throw new SessionExecutionEngineError(
+        this.getSessionId(),
+        `cannot change ${owner} to ${engine}`,
+      );
+    }
+    if (this.executionEngineWrite) return this.executionEngineWrite.completion;
+    if (this.currentExecutionEngine === engine) return;
+    const completion = this.appendRecordStrict({
+      ...this.createBaseRecord('system'),
+      subtype: 'session_execution_engine',
+      systemPayload: { version: 1, engine },
+    }).then(() => {
+      this.currentExecutionEngine = engine;
+    });
+    this.executionEngineWrite = { engine, completion };
+    await completion;
   }
 
   /**

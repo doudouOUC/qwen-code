@@ -127,6 +127,7 @@ const KNOWN_RECORD_SUBTYPES = new Set([
   'file_history_snapshot',
   'session_source',
   'session_model',
+  'session_execution_engine',
   'branch_checkpoint',
   'goal_state',
   'goal_runtime',

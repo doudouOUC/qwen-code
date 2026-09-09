@@ -177,7 +177,15 @@ export function createManagedAgentChannelFactory(
             skipWorkspaceSettings: !workspaceTrusted,
           });
           config = await loadCliConfig(
-            settings.merged,
+            managedToolSessionFactory
+              ? {
+                  ...settings.merged,
+                  experimental: {
+                    ...settings.merged.experimental,
+                    sessionWriterLease: true,
+                  },
+                }
+              : settings.merged,
             argv,
             cwd,
             undefined,
