@@ -1062,6 +1062,7 @@ export interface ProcessSingleFileContentOptions {
    */
   preparePdfForVisionBridge?: boolean;
   signal?: AbortSignal;
+  requireProcessGroupExit?: boolean;
   /**
    * Large full-PDF text fallback returns a tool error by default. `@`-attached
    * PDFs use `reference` so the model gets guidance without a failed read.
@@ -1152,6 +1153,12 @@ export async function processSingleFileContent(
     displayPath = filePath,
   } = options;
   const rootDirectory = config.getTargetDir();
+  const pdfProcessOptions = {
+    signal,
+    ...(options.requireProcessGroupExit
+      ? { requireProcessGroupExit: true, cwd: rootDirectory }
+      : {}),
+  };
   const relativePathForDisplay = (
     path.isAbsolute(displayPath)
       ? path.relative(rootDirectory, displayPath)
@@ -1312,7 +1319,8 @@ export async function processSingleFileContent(
       };
     }
     if (willExtractPdfText && !pageRange) {
-      pdfPageCount = await getPDFPageCount(filePath);
+      pdfPageCount = await getPDFPageCount(filePath, pdfProcessOptions);
+      signal?.throwIfAborted();
       const requirement = shouldRequirePDFPageRange(pdfPageCount, stats.size);
       // A vision render can hold up to PDF_MAX_PAGES_PER_READ pages, so only
       // require an explicit range past that ceiling; the text path keeps the
@@ -1325,7 +1333,12 @@ export async function processSingleFileContent(
         `PDF full-text fallback gate: file=${relativePathForDisplay}, sizeMB=${fileSizeInMB.toFixed(2)}, pageCount=${pdfPageCount ?? 'unknown'}, required=${requirement.required}, rangeRequired=${rangeRequired}, effectivePageCount=${requirement.effectivePageCount}, hadPdfInfo=${requirement.hadPdfInfo}, behavior=${largePdfBehavior}`,
       );
       if (rangeRequired) {
-        if (largePdfBehavior === 'error' && !(await isPdftotextAvailable())) {
+        const textAvailable =
+          largePdfBehavior === 'error'
+            ? await isPdftotextAvailable(pdfProcessOptions)
+            : true;
+        signal?.throwIfAborted();
+        if (!textAvailable) {
           return {
             llmContent: `[Cannot extract text from PDF: "${displayName}". ${PDF_TEXT_EXTRACTION_UNAVAILABLE_MESSAGE}]`,
             returnDisplay: `Failed to read pdf: ${relativePathForDisplay}`,
@@ -1731,12 +1744,16 @@ export async function processSingleFileContent(
         };
       }
       case 'pdf': {
+        signal?.throwIfAborted();
         // When `pages` is provided, always extract text (even if model supports PDF natively).
         // When model supports PDF modality and no pages requested, send as base64.
         // Otherwise, fall back to pdftotext for text extraction.
         if (!pageRange && modalities.pdf) {
           // Model supports PDF natively — send as base64
-          const contentBuffer = await fs.promises.readFile(filePath);
+          const contentBuffer = await fs.promises.readFile(filePath, {
+            signal,
+          });
+          signal?.throwIfAborted();
           const base64Data = contentBuffer.toString('base64');
           const base64SizeInMB = base64Data.length / (1024 * 1024);
           if (base64SizeInMB > 9.9) {
@@ -1763,7 +1780,11 @@ export async function processSingleFileContent(
         // without native PDF support). Only when the text overflows the token
         // budget or extraction fails (scanned / no text layer) do we fall back
         // to rendering pages as images.
-        const pdfResult = await extractPDFText(filePath, pageRange);
+        const pdfResult = await extractPDFText(filePath, {
+          ...pageRange,
+          ...pdfProcessOptions,
+        });
+        signal?.throwIfAborted();
         const estimatedTokens = pdfResult.success
           ? estimatePDFTextOutputTokens(pdfResult.text)
           : 0;
@@ -1800,10 +1821,14 @@ export async function processSingleFileContent(
         //     page range, render from the start up to the per-read ceiling.
         if (willRenderPdfImages) {
           const startPage = pageRange?.firstPage ?? 1;
-          const render = await renderPDFPagesToImages(
-            filePath,
-            pageRange ?? { firstPage: 1, lastPage: PDF_MAX_PAGES_PER_READ },
-          );
+          const render = await renderPDFPagesToImages(filePath, {
+            ...(pageRange ?? {
+              firstPage: 1,
+              lastPage: PDF_MAX_PAGES_PER_READ,
+            }),
+            ...pdfProcessOptions,
+          });
+          signal?.throwIfAborted();
           if (render.success && render.images.length > 0) {
             const parts = toImageParts(render.images, startPage);
             // Never drop pages silently. Two ways a no-page-range read can be
@@ -1852,7 +1877,8 @@ export async function processSingleFileContent(
           isSinglePageRead;
         if (renderForBridge && (!pdfResult.success || singlePageTextOverflow)) {
           if (pageRange && pdfPageCount === undefined) {
-            pdfPageCount = await getPDFPageCount(filePath);
+            pdfPageCount = await getPDFPageCount(filePath, pdfProcessOptions);
+            signal?.throwIfAborted();
           }
           const firstPage = pageRange?.firstPage ?? 1;
           const requestedLastPage =
@@ -1872,11 +1898,13 @@ export async function processSingleFileContent(
               ? await renderPDFPagesToImages(filePath, {
                   firstPage,
                   lastPage,
+                  ...pdfProcessOptions,
                 })
               : {
                   success: false as const,
                   error: 'The requested page range is outside the PDF.',
                 };
+          signal?.throwIfAborted();
           if (render.success && render.images.length > 0) {
             const parts = toImageParts(render.images, firstPage);
             const renderedLastPage = firstPage + render.images.length - 1;

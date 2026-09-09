@@ -32,6 +32,7 @@ import {
 } from '../utils/fileUtils.js';
 import { parsePDFPageRange, PDF_MAX_PAGES_PER_READ } from '../utils/pdf.js';
 import type { Config } from '../config/config.js';
+import type { ShellExecutionConfig } from '../services/shellExecutionService.js';
 import { FileOperation } from '../telemetry/metrics.js';
 import { getProgrammingLanguage } from '../telemetry/telemetry-utils.js';
 import { logFileOperation } from '../telemetry/loggers.js';
@@ -129,7 +130,12 @@ class ReadFileToolInvocation extends BaseToolInvocation<
     );
   }
 
-  async execute(signal: AbortSignal): Promise<ToolResult> {
+  async execute(
+    signal: AbortSignal,
+    _updateOutput?: (output: ToolResultDisplay) => void,
+    shellExecutionConfig?: ShellExecutionConfig,
+  ): Promise<ToolResult> {
+    if (shellExecutionConfig?.requireProcessGroupExit) signal.throwIfAborted();
     const absPath = path.resolve(this.params.file_path);
     const projectRoot = this.config.getTargetDir();
     // Auto-memory files (AGENTS.md and friends under the auto-memory
@@ -177,6 +183,7 @@ class ReadFileToolInvocation extends BaseToolInvocation<
       });
     }
 
+    if (shellExecutionConfig?.requireProcessGroupExit) signal.throwIfAborted();
     if (useFastPath && stats && isFullRead) {
       const status = cache.check(stats);
       if (
@@ -208,6 +215,7 @@ class ReadFileToolInvocation extends BaseToolInvocation<
         preserveUnsupportedImage: prepareForVisionBridge,
         preparePdfForVisionBridge: prepareForVisionBridge,
         signal,
+        requireProcessGroupExit: shellExecutionConfig?.requireProcessGroupExit,
       },
     );
 
