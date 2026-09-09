@@ -590,6 +590,74 @@ describe('Managed Runtime providers', () => {
     }
   });
 
+  it('keeps an admitted v2 execute response during release while refusing new execution', async () => {
+    const runtime = fakeRuntime();
+    const client = toolV2Client();
+    const started = deferred<void>();
+    const closing = deferred<void>();
+    const finish = deferred<void>();
+    client.execute.mockImplementation(async () => {
+      started.resolve();
+      await finish.promise;
+      return { executionStatus: 'success' };
+    });
+    runtime.close.mockImplementation(async () => {
+      closing.resolve();
+      await finish.promise;
+    });
+    runtime.bridge.getManagedToolV2Client = vi.fn(
+      () => client as unknown as ManagedToolV2Client,
+    );
+    const local = new LocalManagedRuntimeProvider(runtime.registry);
+    const server = createServer(workerApp(local, ownedBoot()));
+    servers.push(server);
+    const remote = new RemoteManagedRuntimeProvider({
+      baseUrl: `http://127.0.0.1:${await listen(server)}`,
+      token,
+      lease: ownedBoot(),
+    });
+    let pending: Promise<unknown> | undefined;
+    let release: Promise<boolean> | undefined;
+    try {
+      const connected = await remote.getToolV2Client(prepareRequest);
+      let settled = false;
+      pending = connected.execute(invocation).then(
+        (result) => {
+          settled = true;
+          return result;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await started.promise;
+      release = remote.release(prepareRequest.sessionId, prepareRequest);
+      await closing.promise;
+      await expect(connected.execute(invocation)).rejects.toThrow('released');
+      await expect(
+        connected.prepare(invocation, 'read_file', {}),
+      ).rejects.toThrow('released');
+      await expect(connected.status(invocation)).resolves.toMatchObject({
+        state: 'executing',
+      });
+      await expect(connected.cancel(invocation)).resolves.toMatchObject({
+        state: 'cancel_requested',
+      });
+      expect(settled).toBe(false);
+      finish.resolve();
+      await expect(pending).resolves.toEqual({ executionStatus: 'success' });
+      await expect(release).resolves.toBe(true);
+      expect(client.execute).toHaveBeenCalledOnce();
+      await expect(connected.execute(invocation)).rejects.toThrow();
+    } finally {
+      finish.resolve();
+      await Promise.allSettled([pending, release]);
+      remote.dispose();
+      local.dispose();
+    }
+  });
+
   it('pins request identity and lease while retrying cold-start preparation', async () => {
     const lease = { leaseId: 'owned-lease', epoch: 1 };
     const input = { ...prepareRequest };

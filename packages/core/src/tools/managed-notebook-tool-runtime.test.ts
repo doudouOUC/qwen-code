@@ -37,6 +37,14 @@ function reference(prepared: ManagedToolPrepareResponse) {
   return parseManagedToolInvocationReference(ref);
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe('managed native notebook editing', () => {
   let root: string;
   let config: Config;
@@ -148,6 +156,109 @@ describe('managed native notebook editing', () => {
     const notebook = JSON.parse(await readFile(notebookPath, 'utf8'));
     expect(notebook.cells[0].source).toEqual(['proposal = 2\n']);
     expect(notebook.cells[1].source).toEqual(['old note']);
+  });
+
+  it.each(['read', 'backup', 'written'] as const)(
+    'drains cancellation during %s and reports the actual write outcome',
+    async (phase) => {
+      const ref = reference(await prepared());
+      await runtime.confirmation(ref);
+      await runtime.confirm(ref, ToolConfirmationOutcome.ProceedOnce);
+      await runtime.preflight(ref);
+      const held = deferred();
+      const resume = deferred();
+      const pause = async () => {
+        held.resolve();
+        await resume.promise;
+      };
+      const filesystem = config.getFileSystemService();
+      const history = config.getFileHistoryService();
+      if (phase === 'read') {
+        const original = filesystem.readTextFile.bind(filesystem);
+        vi.spyOn(filesystem, 'readTextFile').mockImplementation(
+          async (input) => {
+            const result = await original(input);
+            await pause();
+            return result;
+          },
+        );
+      } else if (phase === 'backup') {
+        const original = history.trackEdit.bind(history);
+        vi.spyOn(history, 'trackEdit').mockImplementation(async (file) => {
+          await original(file);
+          await pause();
+        });
+      } else {
+        const original = filesystem.writeTextFile.bind(filesystem);
+        vi.spyOn(filesystem, 'writeTextFile').mockImplementation(
+          async (input) => {
+            const result = await original(input);
+            await pause();
+            return result;
+          },
+        );
+      }
+      const executing = runtime.execute(ref);
+      let settled = false;
+      void executing.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      let disposing: Promise<void> | undefined;
+      let disposed = false;
+      try {
+        await held.promise;
+        expect(runtime.cancel(ref).state).toBe('cancel_requested');
+        disposing = runtime.dispose().then(() => {
+          disposed = true;
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        expect(disposed).toBe(false);
+        expect((await readFile(notebookPath, 'utf8')) !== initial).toBe(
+          phase === 'written',
+        );
+        resume.resolve();
+        const result = await executing;
+        await disposing;
+        expect(result.executionStatus).toBe(
+          phase === 'written' ? 'success' : 'cancelled',
+        );
+        expect((await readFile(notebookPath, 'utf8')) !== initial).toBe(
+          phase === 'written',
+        );
+        if (phase === 'written') {
+          expect(
+            JSON.parse(await readFile(notebookPath, 'utf8')).cells[0].source,
+          ).toEqual(['proposal = 2\n']);
+        }
+      } finally {
+        resume.resolve();
+        await executing;
+        await disposing;
+      }
+    },
+  );
+
+  it('rejects an already cancelled native edit before filesystem operations', async () => {
+    await read();
+    const invocation = new NotebookEditTool(config).build(params());
+    const readText = vi.spyOn(config.getFileSystemService(), 'readTextFile');
+    const track = vi.spyOn(config.getFileHistoryService(), 'trackEdit');
+    const writeText = vi.spyOn(config.getFileSystemService(), 'writeTextFile');
+    const controller = new AbortController();
+    controller.abort(new Error('cancel before execution'));
+    await expect(invocation.execute(controller.signal)).rejects.toThrow(
+      'cancel before execution',
+    );
+    expect(readText).not.toHaveBeenCalled();
+    expect(track).not.toHaveBeenCalled();
+    expect(writeText).not.toHaveBeenCalled();
+    expect(await readFile(notebookPath, 'utf8')).toBe(initial);
   });
 
   it('carries full notebook modifications through the proxy, preserves native metadata and retries', async () => {

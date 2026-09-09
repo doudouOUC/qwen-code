@@ -1095,7 +1095,11 @@ export class RemoteManagedRuntimeProvider implements ManagedRuntimeProvider {
         body,
         AbortSignal.any([
           this.lifetime.signal,
-          ...(allowDraining ? [] : [entry.controller.signal]),
+          // Release closes admission, but an admitted execute must retain its
+          // physical result until the worker has drained the operation.
+          ...(allowDraining || operation === 'execute'
+            ? []
+            : [entry.controller.signal]),
           AbortSignal.timeout(TOOL_REQUEST_TIMEOUT_MS),
         ]),
         operation === 'manifest'

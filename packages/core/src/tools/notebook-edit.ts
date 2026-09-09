@@ -562,9 +562,11 @@ class NotebookEditInvocation extends BaseToolInvocation<
   }
 
   override async execute(signal: AbortSignal): Promise<ToolResult> {
+    signal.throwIfAborted();
     let prepared: PreparedNotebookEdit;
     try {
       prepared = await this.prepareEdit(signal);
+      signal.throwIfAborted();
     } catch (error) {
       if (signal.aborted) {
         throw error;
@@ -617,6 +619,7 @@ class NotebookEditInvocation extends BaseToolInvocation<
         this.params.notebook_path,
         { expectExisting: true },
       );
+      signal.throwIfAborted();
       if (!writeDecision.ok) {
         return {
           llmContent: writeDecision.rawMessage,
@@ -716,6 +719,9 @@ class NotebookEditInvocation extends BaseToolInvocation<
         resultFilePaths: [this.params.notebook_path],
       };
     } catch (error) {
+      if (signal.aborted) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       return {
         llmContent: `Error writing notebook: ${message}`,
