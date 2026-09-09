@@ -37,7 +37,7 @@ import {
   loadCliConfig,
   type CliArgs,
 } from '../config/config.js';
-import { loadSettings } from '../config/settings.js';
+import { readSettingsSnapshot } from '../config/settings.js';
 import type { WorkspaceGenerationGuard } from './workspace-registry.js';
 import type { AutoLocalManagedRuntimeProvider } from './auto-local-managed-runtime-provider.js';
 import { createManagedToolSessionFactory } from './managed-tool-session.js';
@@ -171,10 +171,9 @@ export function createManagedAgentChannelFactory(
         let hostOwnsConfig = false;
         try {
           generationGuard.assertOpen();
-          const settings = loadSettings(cwd, {
+          const settings = readSettingsSnapshot(cwd, {
             runtimeEnvironment,
             workspaceTrusted,
-            skipWorkspaceSettings: !workspaceTrusted,
           });
           config = await loadCliConfig(
             managedToolSessionFactory

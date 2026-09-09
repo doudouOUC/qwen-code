@@ -912,6 +912,7 @@ vi.mock('./service/filesystem.js', () => ({
 vi.mock('../config/settings.js', () => ({
   SettingScope: { User: 'User', Workspace: 'Workspace' },
   loadSettings: vi.fn(),
+  readSettingsSnapshot: vi.fn(),
   reloadEnvironment: vi.fn(() => ({ updatedKeys: [], removedKeys: [] })),
 }));
 // Passthrough: the real cache would serve the first mockReturnValue to every
@@ -1086,6 +1087,7 @@ import type {
 import { AgentSideConnection, RequestError } from '@agentclientprotocol/sdk';
 import {
   loadSettings,
+  readSettingsSnapshot,
   reloadEnvironment,
   SettingScope,
 } from '../config/settings.js';
@@ -2368,9 +2370,15 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
     expect(mockConfig.initialize).not.toHaveBeenCalled();
   });
 
-  it.each([true, false])(
-    'pins explicit host settings and request storage with workspace trust %s',
-    async (trusted) => {
+  it.each([
+    { trusted: true, managed: false },
+    { trusted: false, managed: false },
+    { trusted: true, managed: true },
+    { trusted: false, managed: true },
+  ])(
+    'pins explicit host settings and request storage with $trusted trust and managed=$managed',
+    async ({ trusted, managed }) => {
+      vi.mocked(readSettingsSnapshot).mockReturnValue(makeSessionSettings());
       const innerConfig = await setupSessionMocks('snapshot-session');
       const canonicalCwd = await realFsPromises.realpath('/tmp');
       const runtimeBaseDir = path.join(canonicalCwd, 'qwen-host-snapshot-unit');
@@ -2393,6 +2401,7 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       const outputRoots: string[] = [];
       const connection = await bootInMemoryHost({
         runtimeEnvironment: environment,
+        ...(managed ? { managedToolSessionFactory: vi.fn() } : {}),
       });
       try {
         environment.MODEL_KEY = 'caller-mutation';
@@ -2419,10 +2428,12 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
           {},
         );
         expect(outputRoots).toEqual([runtimeBaseDir]);
-        expect(loadSettings).toHaveBeenLastCalledWith(canonicalCwd, {
+        expect(
+          managed ? readSettingsSnapshot : loadSettings,
+        ).toHaveBeenLastCalledWith(canonicalCwd, {
           runtimeEnvironment: { MODEL_KEY: 'host-key' },
           workspaceTrusted: trusted,
-          skipWorkspaceSettings: !trusted,
+          ...(managed ? {} : { skipWorkspaceSettings: !trusted }),
         });
         const policy = vi.mocked(loadCliConfig).mock.calls.at(-1)?.[9];
         expect(policy?.runtimeEnvironment).toEqual({ MODEL_KEY: 'host-key' });
@@ -2434,6 +2445,35 @@ describe('QwenAgent MCP SSE/HTTP support', () => {
       }
     },
   );
+
+  it('rejects a Managed bootstrap settings error before initialization', async () => {
+    const environment = { MODEL_KEY: 'host-key' };
+    Object.assign(mockConfig, {
+      getRuntimeEnvironment: () => environment,
+      getTargetDir: () => '/tmp',
+      getSessionRuntimeBaseDir: () => '/tmp/qwen-managed-config-unit',
+      isTrustedFolder: () => true,
+    });
+    vi.mocked(readSettingsSnapshot).mockImplementation(() => {
+      throw new Error('Settings file contains invalid JSON.');
+    });
+    const streamFactory = vi.fn();
+    await expect(
+      createAcpAgentHost(
+        mockConfig,
+        makeSessionSettings(),
+        mockArgv,
+        streamFactory,
+        {
+          runtimeEnvironment: environment,
+          managedToolSessionFactory: vi.fn(),
+        },
+      ),
+    ).rejects.toThrow('Settings file contains invalid JSON.');
+    expect(mockConfig.initialize).not.toHaveBeenCalled();
+    expect(streamFactory).not.toHaveBeenCalled();
+    expect(mockConfig.shutdown).toHaveBeenCalledOnce();
+  });
 
   it('rejects cross-workspace creation, restore, list and settings requests', async () => {
     const sdk = await vi.importActual<

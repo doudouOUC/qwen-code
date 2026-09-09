@@ -1981,7 +1981,10 @@ export async function loadCliConfig(
   const mcpServers =
     bareMode || safeMode
       ? { ...topTierMcpServers }
-      : assembleMcpServers(settings.mcpServers, cwd, topTierMcpServers);
+      : assembleMcpServers(settings.mcpServers, cwd, topTierMcpServers, {
+          rejectProjectConfigErrors:
+            hostPolicy?.managedToolSessionFactory !== undefined,
+        });
   // Top-tier servers are never gated (#4615, see the comment above), so this
   // is a no-op for them either way today. Skipped under safe mode anyway
   // (Copilot review, PR #7827): getPendingGatedMcpServers reads the local

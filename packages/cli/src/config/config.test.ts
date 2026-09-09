@@ -7,6 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as fsPromises from 'node:fs/promises';
 import {
   ToolNames,
   DEFAULT_QWEN_MODEL,
@@ -3619,6 +3620,101 @@ describe('loadCliConfig with --mcp-config', () => {
       'settings-server': { url: 'http://localhost:9000' },
     });
   });
+});
+
+describe('loadCliConfig Managed project configuration', () => {
+  let cwd: string;
+  const originalArgv = process.argv;
+  const managedToolSessionFactory = vi.fn(() => {
+    throw new Error('A configuration read must not create a tool session.');
+  });
+
+  beforeEach(async () => {
+    cwd = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'managed-config-'));
+    process.argv = ['node', 'script.js', '--acp'];
+    mockConfigConstructorParams.mockClear();
+    managedToolSessionFactory.mockClear();
+  });
+
+  afterEach(async () => {
+    process.argv = originalArgv;
+    await fsPromises.rm(cwd, { recursive: true, force: true });
+  });
+
+  it.each(['invalid JSON', 'invalid entry', 'directory'])(
+    'rejects %s before constructing the actual Managed Config',
+    async (kind) => {
+      const file = path.join(cwd, '.mcp.json');
+      if (kind === 'directory') await fsPromises.mkdir(file);
+      else {
+        await fsPromises.writeFile(
+          file,
+          kind === 'invalid JSON'
+            ? '{ invalid'
+            : '{"mcpServers":{"good":{"command":"good"},"bad":null}}',
+        );
+      }
+      const argv = await parseArguments();
+      await expect(
+        loadCliConfig(
+          {},
+          argv,
+          cwd,
+          [],
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          true,
+          {
+            managedToolSessionFactory,
+          },
+        ),
+      ).rejects.toThrow(file);
+      expect(mockConfigConstructorParams).not.toHaveBeenCalled();
+      expect(managedToolSessionFactory).not.toHaveBeenCalled();
+      expect(await fsPromises.readdir(cwd)).toEqual(['.mcp.json']);
+    },
+  );
+
+  it('retains the legacy warning and valid servers for a partial project file', async () => {
+    await fsPromises.writeFile(
+      path.join(cwd, '.mcp.json'),
+      '{"mcpServers":{"good":{"command":"good"},"bad":null}}',
+    );
+    const config = await loadCliConfig({}, await parseArguments(), cwd);
+    expect(config.getMcpServers()).toEqual({
+      good: { command: 'good', scope: 'project' },
+    });
+    expect(mockWriteStderrLine).toHaveBeenCalledWith(
+      expect.stringContaining('server "bad"'),
+    );
+    expect(managedToolSessionFactory).not.toHaveBeenCalled();
+  });
+
+  it.each(['bare', 'safeMode'] as const)(
+    'keeps %s mode ambient MCP exclusion while preserving explicit session input',
+    async (mode) => {
+      await fsPromises.mkdir(path.join(cwd, '.mcp.json'));
+      const argv = { ...(await parseArguments()), [mode]: true };
+      const config = await loadCliConfig(
+        {},
+        argv,
+        cwd,
+        [],
+        undefined,
+        undefined,
+        { session: { command: 'session-command' } },
+        undefined,
+        true,
+        { managedToolSessionFactory },
+      );
+      expect(config.getMcpServers()).toEqual({
+        session: { command: 'session-command' },
+      });
+      expect(managedToolSessionFactory).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe('loadCliConfig model selection', () => {

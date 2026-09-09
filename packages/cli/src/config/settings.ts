@@ -21,6 +21,7 @@ import type {
 } from '@qwen-code/qwen-code-core';
 import stripJsonComments from 'strip-json-comments';
 import { isWorkspaceTrusted } from './trustedFolders.js';
+import { readConfigFile } from './read-config-file.js';
 import { hasOwnModelProviders } from './modelProvidersScope.js';
 import {
   type Settings,
@@ -790,6 +791,33 @@ export function loadSettings(
     typeof consumeCorruptionEnvVars === 'object'
       ? consumeCorruptionEnvVars
       : { consumeCorruptionEnvVars };
+  return loadSettingsInternal(workspaceDir, opts, false);
+}
+
+export function readSettingsSnapshot(
+  workspaceDir: string,
+  options: {
+    runtimeEnvironment: Readonly<NodeJS.ProcessEnv>;
+    workspaceTrusted: boolean;
+  },
+): LoadedSettings {
+  return loadSettingsInternal(
+    workspaceDir,
+    {
+      ...options,
+      skipWorkspaceSettings: !options.workspaceTrusted,
+      skipLoadEnvironment: true,
+      consumeCorruptionEnvVars: false,
+    },
+    true,
+  );
+}
+
+function loadSettingsInternal(
+  workspaceDir: string,
+  opts: LoadSettingsOptions,
+  snapshotOnly: boolean,
+): LoadedSettings {
   // Apply any QWEN_HOME / QWEN_RUNTIME_DIR set in user-level `.env` files
   // BEFORE any code reads a path derived from them. After this call, the
   // lazy `getUserSettingsPath()` / `Storage.getGlobalQwenDir()` getters
@@ -840,8 +868,11 @@ export function loadSettings(
     wasRecovered?: boolean;
   } => {
     try {
-      if (fs.existsSync(filePath)) {
-        const content = fs.readFileSync(filePath, 'utf-8');
+      if (snapshotOnly || fs.existsSync(filePath)) {
+        const content = snapshotOnly
+          ? readConfigFile(filePath)
+          : fs.readFileSync(filePath, 'utf-8');
+        if (content === undefined) return { settings: {} };
         let rawSettings: unknown;
         // Carry corruption state through to the final return so it
         // can be attached after the migration pipeline runs.
@@ -852,6 +883,9 @@ export function loadSettings(
         try {
           rawSettings = JSON.parse(stripJsonComments(content));
         } catch (parseError: unknown) {
+          if (snapshotOnly) {
+            throw new Error('Settings file contains invalid JSON.');
+          }
           // ===== JSON parse failed — enter corruption recovery =====
           // Strategy: save corrupted file as .corrupted → reset to empty →
           // show dialog in UI. Never crash due to a corrupted settings file.
@@ -941,9 +975,22 @@ export function loadSettings(
           hasVersionKey && typeof versionValue !== 'number';
         const hasLegacyNumericVersion =
           typeof versionValue === 'number' && versionValue < SETTINGS_VERSION;
+        if (
+          snapshotOnly &&
+          hasVersionKey &&
+          (typeof versionValue !== 'number' ||
+            !Number.isInteger(versionValue) ||
+            versionValue < 1)
+        ) {
+          throw new Error('Settings file has an unsupported version.');
+        }
         let migrationWarnings: string[] | undefined;
 
         const persistSettingsObject = (warningPrefix: string) => {
+          if (snapshotOnly) {
+            migratedInMemoryScopes.add(scope);
+            return;
+          }
           try {
             // Use sync mode to remove deprecated keys (zombie key prevention)
             // while preserving comments and formatting from the original file.
@@ -1000,6 +1047,13 @@ export function loadSettings(
           // that would create a .orig file from the freshly reset settings.
           settingsObject[SETTINGS_VERSION_KEY] = SETTINGS_VERSION;
           persistSettingsObject('Error normalizing settings version on disk');
+        }
+
+        if (
+          snapshotOnly &&
+          settingsObject[SETTINGS_VERSION_KEY] !== SETTINGS_VERSION
+        ) {
+          throw new Error('Settings file has an unsupported version.');
         }
 
         // Attach corruption state propagated from the parent via env vars.

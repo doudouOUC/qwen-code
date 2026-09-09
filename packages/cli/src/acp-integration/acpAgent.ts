@@ -228,6 +228,7 @@ import * as path from 'node:path';
 import type { LoadedSettings } from '../config/settings.js';
 import {
   loadSettings,
+  readSettingsSnapshot,
   reloadEnvironment,
   SettingScope,
 } from '../config/settings.js';
@@ -2940,11 +2941,16 @@ export async function createAcpAgentHost(
           };
     if (workspaceBinding) {
       settings = runScoped(() =>
-        loadSettings(workspaceBinding.cwd, {
-          runtimeEnvironment,
-          workspaceTrusted: workspaceBinding.trusted,
-          skipWorkspaceSettings: !workspaceBinding.trusted,
-        }),
+        options.managedToolSessionFactory
+          ? readSettingsSnapshot(workspaceBinding.cwd, {
+              runtimeEnvironment: workspaceBinding.environment,
+              workspaceTrusted: workspaceBinding.trusted,
+            })
+          : loadSettings(workspaceBinding.cwd, {
+              runtimeEnvironment,
+              workspaceTrusted: workspaceBinding.trusted,
+              skipWorkspaceSettings: !workspaceBinding.trusted,
+            }),
       );
     }
     // Reverse tool channel (issue #5626, Phase 2). Runtime-MCP-add targets the
@@ -5010,6 +5016,12 @@ class QwenAgent implements Agent {
   private loadScopedSettings(cwd: string, cached = false): LoadedSettings {
     if (!this.workspaceBinding) {
       return cached ? loadSettingsCached(cwd) : loadSettings(cwd);
+    }
+    if (this.managedToolSessionFactory) {
+      return readSettingsSnapshot(cwd, {
+        runtimeEnvironment: this.workspaceBinding.environment,
+        workspaceTrusted: this.workspaceBinding.trusted,
+      });
     }
     return loadSettings(cwd, {
       runtimeEnvironment: this.workspaceBinding.environment,

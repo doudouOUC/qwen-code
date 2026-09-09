@@ -26,7 +26,10 @@ import {
 } from '@qwen-code/acp-bridge/externalToolGuard';
 import { createAcpAgentHost } from '../acp-integration/acpAgent.js';
 import { loadCliConfig, type CliArgs } from '../config/config.js';
-import { loadSettings, type LoadedSettings } from '../config/settings.js';
+import {
+  readSettingsSnapshot,
+  type LoadedSettings,
+} from '../config/settings.js';
 import { createManagedAgentChannelFactory } from './managed-agent-channel.js';
 import type { AutoLocalManagedRuntimeProvider } from './auto-local-managed-runtime-provider.js';
 import { createWorkspaceGenerationGuard } from './workspace-registry.js';
@@ -39,7 +42,7 @@ vi.mock('../config/config.js', () => ({
   loadCliConfig: vi.fn(),
   buildDisabledSkillNamesProvider: vi.fn(() => () => new Set()),
 }));
-vi.mock('../config/settings.js', () => ({ loadSettings: vi.fn() }));
+vi.mock('../config/settings.js', () => ({ readSettingsSnapshot: vi.fn() }));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -73,7 +76,7 @@ describe('managed Agent channel', () => {
     await mkdir(cwd);
     guard = createWorkspaceGenerationGuard();
     closed = deferred<void>();
-    vi.mocked(loadSettings).mockReturnValue({
+    vi.mocked(readSettingsSnapshot).mockReturnValue({
       merged: {},
       getUserHooks: () => ({}),
       getProjectHooks: () => ({}),
@@ -201,10 +204,9 @@ describe('managed Agent channel', () => {
       QWEN_CODE_NO_RELAUNCH: 'true',
       QWEN_TLS_INSECURE: '1',
     });
-    expect(loadSettings).toHaveBeenCalledWith(cwd, {
+    expect(readSettingsSnapshot).toHaveBeenCalledWith(cwd, {
       runtimeEnvironment: policy.runtimeEnvironment,
       workspaceTrusted: false,
-      skipWorkspaceSettings: true,
     });
     const hostArgs = vi.mocked(createAcpAgentHost).mock.calls[0];
     expect(hostArgs[2]).toMatchObject({ extensions: ['original'], acp: true });
@@ -234,6 +236,18 @@ describe('managed Agent channel', () => {
       'no longer active',
     );
     expect(loadCliConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects unreadable settings before creating a Config or ACP host', async () => {
+    vi.mocked(readSettingsSnapshot).mockImplementation(() => {
+      throw new Error('Settings file contains invalid JSON.');
+    });
+    await expect(factory()(cwd, privateOverrides)).rejects.toThrow(
+      'Settings file contains invalid JSON.',
+    );
+    expect(loadCliConfig).not.toHaveBeenCalled();
+    expect(createAcpAgentHost).not.toHaveBeenCalled();
+    expect(shutdown).not.toHaveBeenCalled();
   });
 
   it('cleans a Config that finishes loading after generation closure', async () => {
