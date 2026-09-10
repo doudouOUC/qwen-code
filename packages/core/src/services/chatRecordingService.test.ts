@@ -3540,6 +3540,38 @@ describe('ChatRecordingService', () => {
   // Note: Session management tests (listSessions, loadSession, deleteSession, etc.)
   // have been moved to sessionService.test.ts
   // Session resume integration tests should test via SessionService mock
+  describe('managed session sink binding', () => {
+    it('routes records to the sink and never to the transcript', async () => {
+      const carried: Array<{ type?: string }> = [];
+      chatRecordingService.bindManagedSink({
+        write: async (record) => {
+          carried.push(record);
+        },
+      });
+      vi.mocked(mockLease.appendJsonLine).mockClear();
+
+      chatRecordingService.recordUserMessage([{ text: 'managed hello' }]);
+      await chatRecordingService.flush();
+
+      expect(carried).toHaveLength(1);
+      expect(carried[0].type).toBe('user');
+      // The authoritative log is the only copy, so the lease must stay unused.
+      expect(mockLease.appendJsonLine).not.toHaveBeenCalled();
+    });
+
+    it('does not fall back to the transcript when the sink refuses', async () => {
+      chatRecordingService.bindManagedSink({
+        write: () => Promise.reject(new Error('unmapped record shape')),
+      });
+      vi.mocked(mockLease.appendJsonLine).mockClear();
+
+      chatRecordingService.recordUserMessage([{ text: 'refused' }]);
+      await expect(chatRecordingService.flush()).rejects.toThrow(
+        /unmapped record shape/,
+      );
+      expect(mockLease.appendJsonLine).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe('Goal turn token ledger', () => {
