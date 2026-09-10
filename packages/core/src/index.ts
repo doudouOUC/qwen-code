@@ -156,6 +156,7 @@ export * from './managed-runtime/managed-prompt-admission.js';
 export * from './managed-runtime/managed-session-inbox.js';
 export * from './managed-runtime/managed-session-authority.js';
 export * from './managed-runtime/managed-session-message-projection.js';
+export * from './managed-runtime/managed-session-record-sink.js';
 export * from './managed-runtime/managed-session-records.js';
 export * from './managed-runtime/managed-session-resources.js';
 

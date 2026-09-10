@@ -280,6 +280,14 @@ function copyGoalContext(goalContext: GoalTurnPermit): GoalTurnPermit {
   };
 }
 
+/**
+ * The controlled sink a Managed session's records are written through. Declared
+ * structurally so this module keeps no dependency on the managed runtime.
+ */
+export interface ManagedSessionRecordWriter {
+  write(record: ChatRecord): Promise<void>;
+}
+
 export interface ChatRecord {
   /** Unique identifier for this logical message */
   uuid: string;
@@ -1399,6 +1407,17 @@ export class ChatRecordingService {
     updatePendingBranchToolCalls(this.pendingBranchToolCalls, record);
   }
 
+  /**
+   * Set for a Managed session, whose records go to the authoritative log
+   * instead of straight into the transcript.
+   */
+  private managedSink?: ManagedSessionRecordWriter;
+
+  /** Binds the controlled sink; a Managed session must be bound before writing. */
+  bindManagedSink(sink: ManagedSessionRecordWriter): void {
+    this.managedSink = sink;
+  }
+
   private enqueueRecordWrite(
     record: ChatRecord,
     legacyConversationFile?: string,
@@ -1408,7 +1427,13 @@ export class ChatRecordingService {
       if (this.writeFailure) throw this.writeFailure;
       try {
         const lease = this.binding?.lease;
-        if (lease) {
+        const managedSink = this.managedSink;
+        if (managedSink) {
+          /* A Managed session keeps its history once, in the authoritative
+             log. Writing the record here as well would create the second copy
+             the layering exists to prevent. */
+          await managedSink.write(record);
+        } else if (lease) {
           await lease.appendJsonLine(record);
         } else if (!this.writerLeaseRequired && legacyConversationFile) {
           await jsonl.writeLine(legacyConversationFile, record);
