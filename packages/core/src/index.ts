@@ -154,6 +154,7 @@ export * from './managed-runtime/embedded-harness-scheduler.js';
 export * from './managed-runtime/managed-activation-store.js';
 export * from './managed-runtime/managed-prompt-admission.js';
 export * from './managed-runtime/managed-session-inbox.js';
+export * from './managed-runtime/managed-session-assembly.js';
 export * from './managed-runtime/managed-session-authority.js';
 export * from './managed-runtime/managed-session-message-projection.js';
 export * from './managed-runtime/managed-session-record-sink.js';

@@ -1,0 +1,238 @@
+/**
+ * @license
+ * Copyright 2025 Qwen Team
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { Storage } from '../config/storage.js';
+import type { ChatRecord } from '../services/chatRecordingService.js';
+import { SessionWriterLease } from '../services/session-writer-lease.js';
+import {
+  openManagedSession,
+  type ManagedSession,
+} from './managed-session-assembly.js';
+import { readManagedSessionTitleInfoSync } from '../utils/sessionStorageUtils.js';
+import type { ManagedSessionDurableRef } from './managed-session-records.js';
+
+const DIGEST = '9'.repeat(64);
+const sessionId = '550e8400-e29b-41d4-a716-446655440000';
+const sessionKey = { tenantId: 't1', workspaceId: 'w1', sessionId };
+const temporaryDirectories = new Set<string>();
+
+afterEach(async () => {
+  for (const directory of temporaryDirectories) {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+  temporaryDirectories.clear();
+});
+
+function ref(kind = 'managed-test'): ManagedSessionDurableRef {
+  return {
+    resourceId: 'res-1',
+    kind,
+    schemaVersion: 1,
+    byteLength: 4,
+    digest: DIGEST,
+  };
+}
+
+interface Workspace {
+  runtimeBaseDir: string;
+  projectRoot: string;
+  transcriptPath: string;
+  activation: { activationId: string; epoch: number } | undefined;
+}
+
+async function createWorkspace(): Promise<Workspace> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'qwen-managed-asm-'));
+  temporaryDirectories.add(root);
+  const projectRoot = path.join(root, 'project');
+  const runtimeBaseDir = path.join(root, 'runtime');
+  await fs.mkdir(projectRoot, { recursive: true });
+  await fs.mkdir(runtimeBaseDir, { recursive: true });
+  const transcriptPath = path.join(
+    new Storage(projectRoot, runtimeBaseDir).getProjectDir(),
+    'chats',
+    `${sessionId}.jsonl`,
+  );
+  await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+  return { runtimeBaseDir, projectRoot, transcriptPath, activation: undefined };
+}
+
+function open(
+  workspace: Workspace,
+  options: { create?: boolean } = {},
+): Promise<ManagedSession> {
+  return openManagedSession({
+    runtimeBaseDir: workspace.runtimeBaseDir,
+    sessionId,
+    transcriptPath: workspace.transcriptPath,
+    sessionKey,
+    cwd: workspace.projectRoot,
+    version: 'test',
+    activation: () => workspace.activation,
+    ...(options.create === false
+      ? {}
+      : {
+          create: {
+            definitionRef: ref('managed-definition'),
+            rootSnapshotRef: ref('managed-root'),
+            createdBy: 'daemon',
+          },
+        }),
+  });
+}
+
+function record(overrides: Partial<ChatRecord>): ChatRecord {
+  return {
+    uuid: 'rec-1',
+    parentUuid: null,
+    sessionId,
+    timestamp: '2026-09-01T10:00:00.000Z',
+    type: 'user',
+    cwd: '/workspace',
+    version: 'test',
+    ...overrides,
+  } as ChatRecord;
+}
+
+describe('managed session assembly', () => {
+  it('carries one whole turn from input to terminal state', async () => {
+    const workspace = await createWorkspace();
+    const session = await open(workspace);
+
+    // Before a Harness advances the session there is no activation to name, so
+    // the accepted input is written as a trusted entry.
+    const userRecord = record({
+      uuid: 'rec-user-1',
+      message: { role: 'user', parts: [{ text: 'summarise the docs' }] },
+    });
+    await session.sink.write(userRecord);
+
+    // A Harness claims the session, and from here records name its activation.
+    await session.authority.appendExecution(
+      {
+        operation: 'claimActivation',
+        commandId: 'cmd-act-1',
+        sessionKey,
+        contentDigest: DIGEST,
+      },
+      [
+        {
+          v: 1,
+          sequence: session.authority.committedSequence + 1,
+          eventId: 'evt-act-1',
+          sessionKey,
+          kind: 'activation.changed',
+          occurredAt: 1,
+          payload: {
+            activationId: 'act-1',
+            epoch: 1,
+            workerId: 'worker-1',
+            subject: {
+              type: 'activation',
+              scopeId: 'act-1',
+              activationId: 'act-1',
+              epoch: 1,
+            },
+            phase: 'active',
+            leaseDurationMs: 60_000,
+            expiresAt: 2,
+            installRef: ref(),
+            boundaryRef: null,
+          },
+        },
+      ],
+      { class: 'coordinator' },
+    );
+    workspace.activation = { activationId: 'act-1', epoch: 1 };
+
+    const assistantRecord = record({
+      uuid: 'rec-assistant-1',
+      parentUuid: 'rec-user-1',
+      type: 'assistant',
+      model: 'qwen3-coder-plus',
+      message: { role: 'model', parts: [{ text: 'Here it is.' }] },
+    });
+    await session.sink.write(assistantRecord);
+
+    await session.sink.write(
+      record({
+        uuid: 'rec-title-1',
+        type: 'system',
+        subtype: 'custom_title',
+        systemPayload: { customTitle: 'Doc summary', titleSource: 'auto' },
+      }),
+    );
+
+    await session.sink.write(
+      record({
+        uuid: 'rec-turn-1',
+        type: 'system',
+        subtype: 'turn_result',
+        systemPayload: {
+          promptId: 'turn-1',
+          state: 'completed',
+          stopReason: 'end_turn',
+          endedAt: Date.parse('2026-09-01T10:00:10.000Z'),
+        },
+      }),
+    );
+
+    const settled = session.authority
+      .readEvents()
+      .filter((event) => event.kind === 'turn.settled');
+    expect(settled).toHaveLength(1);
+    expect(settled[0].payload['outcome']).toBe('completed');
+
+    expect(await session.sink.project()).toEqual([userRecord, assistantRecord]);
+    await session.close();
+
+    // Reopening reads the same history back, and the title reaches the session
+    // directory through the metadata record rather than the message channel.
+    const reopened = await open(workspace, { create: false });
+    expect(await reopened.sink.project()).toEqual([
+      userRecord,
+      assistantRecord,
+    ]);
+    expect(
+      readManagedSessionTitleInfoSync(
+        workspace.transcriptPath,
+        workspace.runtimeBaseDir,
+      ),
+    ).toEqual({ title: 'Doc summary', source: 'auto' });
+    await reopened.close();
+  });
+
+  it('leaves the sealed barrier in place after closing', async () => {
+    const workspace = await createWorkspace();
+    const session = await open(workspace);
+    await session.sink.write(record({ uuid: 'rec-user-1' }));
+    await session.close();
+
+    await expect(
+      SessionWriterLease.acquire({
+        runtimeBaseDir: workspace.runtimeBaseDir,
+        sessionId,
+        transcriptPath: workspace.transcriptPath,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('does not hold the writer when opening fails', async () => {
+    const workspace = await createWorkspace();
+
+    // No creation parameters and no existing header: opening cannot succeed.
+    await expect(open(workspace, { create: false })).rejects.toThrow();
+
+    // The writer was released rather than left held or sealed, so a fresh open
+    // succeeds instead of colliding with an abandoned lock.
+    const session = await open(workspace);
+    expect(session.authority.committedSequence).toBe(0);
+    await session.close();
+  });
+});
