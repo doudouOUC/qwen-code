@@ -8,6 +8,13 @@
 
 全量指本仓库 daemon 能力的完整迁移及明确的平台/故障契约，不承诺任意外部副作用 exactly-once、任意进程快照或任意旧二进制可写新格式。恶意进程安全沙箱、SaaS多租户平台、Kubernetes/VM部署模板和独立CLI/TUI默认引擎仍在原目标边界外；执行环境接口及扩展条件已经定义，不需以它们作为本地daemon迁移前置。
 
+两条全局口径与上面的目标边界同级，各专项不得各自放宽：
+
+- **恢复模型是 checkpoint 续跑，不是无状态 Harness 重放事件日志。** 因为 Harness 复用完整 Agent，其内部执行状态无法由已提交事件唯一确定；checkpoint 因此是恢复必需资产，替换 handle 只能在已提交安全点进行。理由、代价与不选另一模型的判据见[全局架构](managed-agent-session-harness-runtime.md)§7。
+- **执行保证是 at-most-once 派发，不是外部副作用 exactly-once。** 派发次数由稳定 executionCallId、门禁与回执去重控制且可证明；某次已派发操作在外部世界发生几次不可观测，started 无终态一律保持未知。见[私有协议](managed-agent-control-protocol.md)§5。
+
+首版可恢复范围限于原 coordinator 与原 Runtime binding 存活时更换 Harness；daemon/worker 自身重启后的未决副作用保持 recovery_blocked，跨进程接管所需的持久 binding 与门禁账本属于[恢复与运行](managed-agent-recovery-operations.md)的后续切片。
+
 ## 2. 统一接口与实现关系
 
 | 接缝                                  | 目标实现/组合                                                                        | 固定边界                                                                     |

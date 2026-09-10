@@ -8,6 +8,8 @@ Harness 复用完整 `QwenAgent → Session → LlmChat` 模型路径及既有�
 
 一个物理/进程内 ACP host 可以承载多个 Session，逻辑 Harness handle 只绑定一次 activation。Factory 可借用原 channel/host 池，但不另起与 Bridge slot/ProcessRegistry 重复的容量账本。一个 handle detach 不能 kill 整个共享 host；物理 host 的最终 teardown 由原资源 owner 在所有引用排空后执行。
 
+本设计的 Harness 是**有状态**组件，恢复走 checkpoint 续跑，不是无状态实例重放事件日志重建执行状态——理由与代价见[全局架构](managed-agent-session-harness-runtime.md)§7。这决定了本专项的两条硬约束：替换 handle 只能在 §3 的已提交安全点进行，不能在任意时刻杀掉重建；`HarnessCheckpoint` 的九组字段是恢复必需资产，缺失或损坏即恢复失败，不是可选优化。阅读时不要按 Anthropic 公开架构中的无状态 Harness 推断本专项能力。
+
 | 注入依赖                   | owner 与要求                                                                                                                          |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | 有效配置/AgentDefinition   | 服务端解析 workspace/env/argv/trust/source 与 model route；引用可恢复的非敏感内容和 revision，凭据由受控来源重新取得，不放 checkpoint |
@@ -31,7 +33,7 @@ Harness 复用完整 `QwenAgent → Session → LlmChat` 模型路径及既有�
 
 用户 cancel、Session close、workspace drain 由原 SessionExecutor/coordinator 控制面执行；它们携带不同原因，使当前 handle 中断模型并进入对应收敛流程。最终 Session/host dispose 保留原终结责任，但不能用于实现 requestBoundary 或可恢复 detach。Factory/handle 不是可远程传递的 Config、Promise 或 AbortController 容器。
 
-HarnessBoundary 为三种结果：`turn_complete`、`durable_wait`、`recovery_blocked`，包含 checkpoint/提交回执、turn/activation 与原因。前两者需要完整已提交证明；存储本身不可用时只能返回错误并由 coordinator 保留最后已验证 checkpoint，不能编造带成功 receipt 的 blocked boundary。
+HarnessBoundary 是封闭 union，共四种结果：`turn_complete`、`durable_wait`、`recovery_blocked`，以及仅用于无活 turn 的生命周期 prompt Hook 的 `hook_complete`（字段与适用范围见 §8）。每种都包含 checkpoint/提交回执、subject/activation 与原因。前两者需要完整已提交证明；存储本身不可用时只能返回错误并由 coordinator 保留最后已验证 checkpoint，不能编造带成功 receipt 的 blocked boundary。新增 boundary 需要同时更新本节、coordinator 的释放原因和私有协议的 `releaseActivation`，不允许只在某一处出现。
 
 ## 3. 状态机与安全点
 
@@ -107,7 +109,7 @@ Config、LlmChat 实例、文件 lease、AbortController、SDK connection、perm
 
 ## 6. detach 与终结实现约束
 
-可恢复脱离顺序：暂停该 handle 新模型/工具/内部续轮 → 将原引用与等待 owner 转给 coordinator → 提交完整 checkpoint/boundary → 执行端门禁撤销 ACK → 解除该 handle 的本地 waiter/回调/连接引用 → 确认停止并释放 activation 容量。结果在任何窗口到达都先由 coordinator 提交，并通过 wake intent 对账，不丢给已销毁回调。
+可恢复脱离顺序（本节是该顺序的唯一来源，coordinator 文档引用此处）：暂停该 handle 新模型/工具/内部续轮 → 执行端门禁撤销并取得 ACK → 将原引用与等待 owner 转给 coordinator → 提交完整 checkpoint/boundary → 解除该 handle 的本地 waiter/回调/连接引用 → 确认停止并释放 activation 容量。门禁撤销必须早于 checkpoint：否则提交期间仍可能产生新派发，checkpoint 声明的覆盖范围在落盘瞬间即已失效，恢复会漏掉这些调用。结果在任何窗口到达都先由 coordinator 提交，并通过 wake intent 对账，不丢给已销毁回调。
 
 当前 `runTool` finally 会 cancelAndDrain，权限等待 abort 可能发送 Cancel，Config shutdown 会关闭 child/root Runtime。新增 transfer 状态只允许经过 authority/coordinator 确认的 detach 使用；普通用户 cancel、错误和 Session close 继续收敛自有调用。若无法绕开某个本地 Promise/child 的终结式 finally，首版保持该 handle 驻留并如实占槽，不能宣称完成可恢复脱离。
 
@@ -115,15 +117,17 @@ Session close 的完整顺序由 coordinator 文档约束。关闭共享 host �
 
 ## 7. 实施与验收
 
-| 编号 | 实施/故障场景                                                     | 完成证据                                                                                                            |
-| ---- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| H01  | 完整普通 turn 到 A/D 安全点后更换 handle/host                     | 原 history/owner/config 与后续轮次保留，仅一套完整 Agent 模型循环                                                   |
-| H02  | partial tool-call 流错误、retry、无 provider callId、路由恢复失败 | 正式历史与实际结果相符，稳定调用 ID 不变，未提交 partial 不派发工具，未知配置明确阻塞                               |
-| H03  | 等待权限/问答时 detach，重复/迟到/改参/无客户端答复               | 旧 waiter 不误取消原请求，原合法最终决定持久后才授权；AskUserQuestion 和一般权限分别验收                            |
-| H04  | 原工具正在写/已写而 ACK 丢失时替换 Harness                        | 原 PID/Runtime ID/invocation/history owner 保持，物理副作用一次，结果按原引用消费；杀 worker 的未知场景另行 blocked |
-| H05  | 并行 Agent 批次部分完成、父 child 工作、原结果提交失败            | 保持 batch ordinal、未决 refs 与父快照，不提前发模型下一步或回收唯一资源                                            |
-| H06  | 用户抢占 cron/通知、Goal permit/mid-turn 恢复                     | 队列和停止预算不复位，输入不重复或丢失；延期用途继续固定 legacy                                                     |
-| H07  | 同 host sibling Session 存活，detach/close/reload 分别执行        | 单 handle 脱离不杀 sibling，终结仍实际取消/排空；清理失败保留责任和真实容量                                         |
+| 编号 | 实施/故障场景                                                     | 完成证据                                                                                                                                                                                                                                       |
+| ---- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H01  | 完整普通 turn 到 A/D 安全点后更换 handle/host                     | 原 history/owner/config 与后续轮次保留，仅一套完整 Agent 模型循环                                                                                                                                                                              |
+| H02  | partial tool-call 流错误、retry、无 provider callId、路由恢复失败 | 正式历史与实际结果相符，稳定调用 ID 不变，未提交 partial 不派发工具，未知配置明确阻塞                                                                                                                                                          |
+| H03  | 等待权限/问答时 detach，重复/迟到/改参/无客户端答复               | 旧 waiter 不误取消原请求，原合法最终决定持久后才授权；AskUserQuestion 和一般权限分别验收                                                                                                                                                       |
+| H04  | 原工具正在写/已写而 ACK 丢失时替换 Harness                        | 原 PID/Runtime ID/invocation/history owner 保持，结果按原引用消费；保证是**原 invocation 不被二次派发**（at-most-once 派发），不是外部副作用 exactly-once——见[私有协议](managed-agent-control-protocol.md)§5；杀 worker 的未知场景另行 blocked |
+| H05  | 并行 Agent 批次部分完成、父 child 工作、原结果提交失败            | 保持 batch ordinal、未决 refs 与父快照，不提前发模型下一步或回收唯一资源                                                                                                                                                                       |
+| H06  | 用户抢占 cron/通知、Goal permit/mid-turn 恢复                     | 队列和停止预算不复位，输入不重复或丢失；延期用途继续固定 legacy                                                                                                                                                                                |
+| H07  | 同 host sibling Session 存活，detach/close/reload 分别执行        | 单 handle 脱离不杀 sibling，终结仍实际取消/排空；清理失败保留责任和真实容量                                                                                                                                                                    |
+
+**正向门槛。** H01～H07 每条都必须同时给出应当成功的对照用例并观测到实际继续执行，不能只验证“拒绝/阻塞”分支：H02 路由恢复成功的分支要真的用同一稳定调用 ID 派发并完成该工具；H03 合法最终决定持久后必须真的授权原调用并推进模型，不能停在等待；H04 的对照是原回执可按原引用取回并被模型消费（未知场景才 blocked）；H05 部分完成的批次在剩余结果到达后必须完成整批并回到父作用域；H06 抢占后原队列必须继续执行到终态；H07 单 handle detach 后原 Session 必须能由新 handle 继续。**对任何输入都返回 `recovery_blocked` 的实现视为验收不通过**——保守阻塞是未知场景的正确结果，不是全部场景的合格结果。每条记录写明正向用例的观测点（已提交 boundary、消费的回执、客户端可见终态）。
 
 R2.S1 先交付 Session client、唯一 writer、稳定工具身份及提交记录；R2.S2 接 Factory、基础 activation 门禁和 A/D 安全点，验证旧 handle 已排空再替换；R2.S3 再接 B/C 的持久等待、在途门禁交接和原调用接管。基础门禁不能等到 S3 才接，否则 S2 的 RunnableGrant 与跨 host 替换缺少执行端证明。完整可恢复 child/后台、MCP/Hooks/Channels、Skills/本地初始化与完整媒体等按原后置阶段逐项验收；已实现功能不因本次抽象被删掉。不支持的等待必须有明确驻留/阻塞策略，不能空实现后报告恢复成功。
 
@@ -136,6 +140,8 @@ R2.S1 先交付 Session client、唯一 writer、稳定工具身份及提交记�
 上述专项细化已有九组 checkpoint，不引入第二份 Harness 日志。来源/根与不可恢复回调缺失仍按安全点能力声明拒绝 detach；已提交领域发送和历史维护可由 OperationGrant 完成，不为这些动作启动空模型轮。首阶段保留的驻留和延期行为仅是实现阶段，不代表这些领域尚无设计。
 
 ### 生命周期 prompt Hook 的全量激活分型
+
+**阶段归属先写清：** Hooks 整体是 C09、落在 R5/F5，本小节的 hook-purpose activation 与 `hook_complete` boundary 随该片交付。R2.S1～S3 只需在 boundary union 与 `ActivationSubject` 里留出这两个分型并让 validator 认识它们，**不实现该执行路径**；在 F5 之前，无活 turn 的生命周期 prompt Hook 保持原 legacy 行为，不得因为本小节已有设计就在 R2 提前接线。这样做的原因是它需要“关闭中仍可运行一次模型”的窄例外，在持久等待与维护屏障尚未验收前接入会扩大关闭路径的风险面。
 
 首版上述 turn 接口保留；全量 Factory 的 RunnableGrant/RestoreBundle 增加私有协议的 ActivationSubject 分型，run 接受 `turn` 或已受理 `hook_operation` 引用。后者装配已绑定 Config/Session client 与原 PromptHookRunner，恢复原 occurrence，不重新触发 SessionStart/Goal/cron 或建立主 Agent 推理轮。共享同 Session epoch/模型槽位，普通 turn 的 prompt Hook 继续在原有效 activation 内执行。
 
