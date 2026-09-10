@@ -2202,6 +2202,86 @@ export class SessionWriterLease {
     return this.runExclusive(() => this.appendJsonLineOnce(value));
   }
 
+  /**
+   * Discards a trailing byte range this owner has proven was never committed,
+   * then re-pins the transcript proof.
+   *
+   * Only the active writer may change the file, so a caller cannot repair a
+   * torn tail by editing it: `acquire` would reject the result as changed
+   * outside its writer. The retained prefix must already be verified by the
+   * caller — this method checks ownership and identity, not meaning.
+   */
+  truncateTo(byteLength: number): Promise<void> {
+    return this.runExclusive(() => this.truncateToOnce(byteLength));
+  }
+
+  private async truncateToOnce(byteLength: number): Promise<void> {
+    if (!Number.isSafeInteger(byteLength) || byteLength < 0) {
+      throw new SessionWriterUnavailableError();
+    }
+    await this.assertOwnedAndUnchangedOnce();
+    const expected = this.expectedTranscriptState;
+    if (!expected?.exists || !this.expectedTranscriptHasher) {
+      throw new SessionWriterUnavailableError();
+    }
+    if (byteLength > expected.byteLength) {
+      throw new SessionWriterUnavailableError();
+    }
+    if (byteLength === expected.byteLength) return;
+
+    let handle: fs.FileHandle | undefined;
+    try {
+      handle = await openTranscriptForAppend(this.transcriptPath, expected);
+      const beforeState = await getOpenTranscriptState(
+        this.transcriptPath,
+        handle,
+        true,
+      );
+      if (!sameTranscriptState(beforeState, expected)) {
+        throw new SessionTranscriptChangedError();
+      }
+      await this.readOwnedLock();
+      assertVerifiableTranscriptIdentity(beforeState.fingerprint);
+      await handle.truncate(byteLength);
+      await handle.sync();
+      const afterState = transcriptStateFromStat(await handle.stat());
+      if (
+        afterState.byteLength !== byteLength ||
+        !sameFileIdentity(afterState.fingerprint, beforeState.fingerprint) ||
+        !sameFileSecurityMetadata(
+          afterState.fingerprint,
+          beforeState.fingerprint,
+        )
+      ) {
+        throw new SessionTranscriptChangedError();
+      }
+      await handle.close();
+      handle = undefined;
+
+      // The rolling hash covers the discarded bytes and cannot be rewound, so
+      // the retained prefix is re-read to rebuild it.
+      const snapshot = await captureTranscriptSnapshot(
+        this.transcriptPath,
+        afterState,
+        () => this.released,
+      );
+      if (
+        !snapshot.state.exists ||
+        snapshot.state.byteLength !== byteLength ||
+        !sameFileIdentity(snapshot.state.fingerprint, afterState.fingerprint)
+      ) {
+        throw new SessionTranscriptChangedError();
+      }
+      await this.readOwnedLock();
+      this.expectedTranscriptState = snapshot.state;
+      this.expectedTranscriptHasher = snapshot.hasher;
+    } finally {
+      if (handle) {
+        await handle.close().catch(() => undefined);
+      }
+    }
+  }
+
   private async appendJsonLineOnce(value: unknown): Promise<void> {
     let serialized: string | undefined;
     try {

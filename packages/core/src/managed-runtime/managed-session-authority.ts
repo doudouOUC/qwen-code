@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import type { SessionWriterLease } from '../services/session-writer-lease.js';
 import type { LocalManagedSessionResourceStore } from './managed-session-resources.js';
 import { managedToolDigest } from '../tools/managed-tool-protocol.js';
@@ -261,6 +261,38 @@ export class LocalManagedSessionAuthority {
       }
     }
     return authority;
+  }
+
+  /**
+   * Discards a tail that was appended without a commit marker, after proving
+   * the retained prefix reads cleanly. Repair is explicit: opening a session
+   * reports the tail and refuses to write, because a read-only owner or a
+   * compatibility probe must never rewrite a transcript.
+   */
+  static async recoverUncommittedTail(options: {
+    lease: SessionWriterLease;
+    sessionKey: ManagedSessionKey;
+  }): Promise<{ discardedBytes: number; diagnosticPath: string }> {
+    const scan = await readManagedSessionLog(
+      options.lease.transcriptPath,
+      options.sessionKey,
+    );
+    if (scan.uncommitted === 0) {
+      throw new ManagedSessionRecordError(
+        'session log has no uncommitted tail to discard.',
+      );
+    }
+    const text = await readFile(options.lease.transcriptPath, 'utf8');
+    const discarded = Buffer.from(text, 'utf8').subarray(scan.committedBytes);
+    if (discarded.byteLength !== scan.uncommittedBytes) {
+      throw new ManagedSessionRecordError(
+        'session log changed while preparing tail recovery.',
+      );
+    }
+    const diagnosticPath = `${options.lease.transcriptPath}.uncommitted-tail`;
+    await writeFile(diagnosticPath, discarded, { mode: 0o600 });
+    await options.lease.truncateTo(scan.committedBytes);
+    return { discardedBytes: discarded.byteLength, diagnosticPath };
   }
 
   /**
@@ -706,6 +738,10 @@ interface ManagedSessionLogScan {
   readonly lastMarkerDigest: string | null;
   readonly lastRecordUuid: string | null;
   readonly activation: ManagedSessionActivationState | undefined;
+  /** Byte length of the prefix ending at the last commit marker. */
+  readonly committedBytes: number;
+  /** Byte length of the records after it, kept for diagnostics. */
+  readonly uncommittedBytes: number;
   readonly uncommitted: number;
   readonly foreignRecords: number;
 }
@@ -731,6 +767,8 @@ async function readManagedSessionLog(
         lastMarkerDigest: null,
         lastRecordUuid: null,
         activation: undefined,
+        committedBytes: 0,
+        uncommittedBytes: 0,
         uncommitted: 0,
         foreignRecords: 0,
       };
@@ -750,6 +788,8 @@ async function readManagedSessionLog(
   let lastMarkerDigest: string | null = null;
   let lastRecordUuid: string | null = null;
   let activation: ManagedSessionActivationState | undefined;
+  let scanned = 0;
+  let committedBytes = 0;
   let foreignRecords = 0;
   let pending: ManagedSessionEvent[] = [];
 
@@ -760,6 +800,7 @@ async function readManagedSessionLog(
         `session log line ${index + 1} is blank.`,
       );
     }
+    scanned += Buffer.byteLength(line, 'utf8') + 1;
     const record = parseManagedSessionRecordJson(
       line,
       MANAGED_SESSION_LIMITS.maxEventBytes,
@@ -854,6 +895,7 @@ async function readManagedSessionLog(
       }
     }
     committed = marker.lastSequence;
+    committedBytes = scanned;
     lastMarkerDigest = managedToolDigest(
       marker,
       MANAGED_SESSION_LIMITS.maxCommitMarkerBytes,
@@ -881,6 +923,8 @@ async function readManagedSessionLog(
     lastMarkerDigest,
     lastRecordUuid,
     activation,
+    committedBytes,
+    uncommittedBytes: Buffer.byteLength(text, 'utf8') - committedBytes,
     uncommitted: pending.length + tornTail,
     foreignRecords,
   };

@@ -935,3 +935,161 @@ describe('managed session authority scan strictness', () => {
     );
   });
 });
+
+describe('managed session uncommitted tail recovery', () => {
+  async function seedTornTail(fixture: Fixture): Promise<number> {
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await opened.release();
+    const committedBytes = (await fs.stat(fixture.transcriptPath)).size;
+
+    /* Append an event through a lease with no marker, the way a crash between
+       the records and the marker would leave it. */
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    await lease.appendJsonLine({
+      uuid: 'orphan-1',
+      parentUuid: null,
+      sessionId: fixture.sessionId,
+      timestamp: new Date().toISOString(),
+      type: 'system',
+      subtype: 'managed_session_event_v1',
+      cwd: '/workspace',
+      version: 'test',
+      managedSession: {
+        v: 1,
+        sequence: 3,
+        eventId: 'orphan-event',
+        sessionKey: sessionKeyFor(fixture),
+        kind: 'cancel.requested',
+        occurredAt: 1,
+        payload: {
+          requestId: 'req-orphan',
+          target: { turnId: 'turn-1' },
+          reason: 'user',
+          requestedBy: 'web_shell',
+        },
+      },
+    });
+    await lease.release();
+    return committedBytes;
+  }
+
+  it('discards the tail and reopens on the committed prefix', async () => {
+    const fixture = await createFixture();
+    const committedBytes = await seedTornTail(fixture);
+    const before = await readLines(fixture);
+    expect(before).toHaveLength(5);
+
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    await expect(
+      LocalManagedSessionAuthority.open({
+        lease,
+        sessionKey: sessionKeyFor(fixture),
+        cwd: '/workspace',
+        version: 'test',
+      }),
+    ).rejects.toThrow(ManagedSessionUncommittedTailError);
+
+    const recovered = await LocalManagedSessionAuthority.recoverUncommittedTail(
+      { lease, sessionKey: sessionKeyFor(fixture) },
+    );
+    expect(recovered.discardedBytes).toBeGreaterThan(0);
+
+    const authority = await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey: sessionKeyFor(fixture),
+      cwd: '/workspace',
+      version: 'test',
+    });
+    expect(authority.committedSequence).toBe(2);
+    expect(authority.readEvents().map((event) => event.kind)).toEqual([
+      'input.accepted',
+      'wake.requested',
+    ]);
+
+    /* The writer stays usable: its pinned proof was rebuilt, so the next
+       transaction continues from the recovered tail. */
+    const receipt = await authority.submitInput(
+      inputCommand(fixture, { commandId: 'cmd-after-recovery' }),
+      { ...inputRequest, inputId: 'in-after' },
+    );
+    expect(receipt.firstSequence).toBe(3);
+    await lease.release();
+
+    expect((await fs.stat(fixture.transcriptPath)).size).toBeGreaterThan(
+      committedBytes,
+    );
+    const after = await readLines(fixture);
+    expect(after.filter((line) => line.includes('orphan-event'))).toHaveLength(
+      0,
+    );
+
+    const reopened = await openAuthority(fixture, { create: false });
+    expect(reopened.authority.committedSequence).toBe(4);
+    await reopened.release();
+  });
+
+  it('keeps the discarded bytes for diagnosis', async () => {
+    const fixture = await createFixture();
+    await seedTornTail(fixture);
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    const recovered = await LocalManagedSessionAuthority.recoverUncommittedTail(
+      { lease, sessionKey: sessionKeyFor(fixture) },
+    );
+    await lease.release();
+
+    const kept = await fs.readFile(recovered.diagnosticPath, 'utf8');
+    expect(kept).toContain('orphan-event');
+    expect(Buffer.byteLength(kept, 'utf8')).toBe(recovered.discardedBytes);
+  });
+
+  it('refuses to recover a log with nothing uncommitted', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await opened.release();
+
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    await expect(
+      LocalManagedSessionAuthority.recoverUncommittedTail({
+        lease,
+        sessionKey: sessionKeyFor(fixture),
+      }),
+    ).rejects.toThrow(/no uncommitted tail to discard/);
+    await lease.release();
+  });
+
+  it('refuses a truncation past the end of the transcript', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await opened.release();
+
+    const size = (await fs.stat(fixture.transcriptPath)).size;
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    await expect(lease.truncateTo(size + 1)).rejects.toThrow();
+    await expect(lease.truncateTo(-1)).rejects.toThrow();
+    expect((await fs.stat(fixture.transcriptPath)).size).toBe(size);
+    await lease.release();
+  });
+});
