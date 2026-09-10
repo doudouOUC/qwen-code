@@ -443,3 +443,111 @@ describe('legacy maintenance on a managed session', () => {
     );
   });
 });
+
+describe('maintenance on a sealed managed session', () => {
+  interface SealedHarness {
+    projectRoot: string;
+    runtimeBaseDir: string;
+    transcriptPath: string;
+    service: SessionService;
+    store: LocalManagedSessionResourceStore;
+  }
+
+  async function createSealed(): Promise<SealedHarness> {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'qwen-managed-seal-'));
+    temporaryDirectories.add(root);
+    const projectRoot = path.join(root, 'project');
+    const runtimeBaseDir = path.join(root, 'runtime');
+    await fs.mkdir(projectRoot, { recursive: true });
+    await fs.mkdir(runtimeBaseDir, { recursive: true });
+    const storage = new Storage(projectRoot, runtimeBaseDir);
+    const transcriptPath = path.join(
+      storage.getProjectDir(),
+      'chats',
+      `${sessionId}.jsonl`,
+    );
+    await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+
+    const store = LocalManagedSessionResourceStore.create({
+      runtimeBaseDir,
+      sessionKey,
+    });
+    const lease = await LocalManagedSessionAuthority.acquireWriter({
+      runtimeBaseDir,
+      sessionId,
+      transcriptPath,
+    });
+    const authority = await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey,
+      cwd: projectRoot,
+      version: 'test',
+      resources: store,
+      create: {
+        definitionRef: await store.publish(
+          'managed-definition',
+          Buffer.from('{}', 'utf8'),
+        ),
+        rootSnapshotRef: await store.publish(
+          'managed-root',
+          Buffer.from('{}', 'utf8'),
+        ),
+        createdBy: 'daemon',
+      },
+    });
+    await authority.commitDomainRecord(
+      renameCommand('cmd-rename-1'),
+      {
+        domain: 'session_metadata',
+        content: { title: 'Sealed session', titleSource: 'manual' },
+      },
+      { class: 'trusted_entry' },
+    );
+    /* Closing seals the lock, which is what leaves a barrier behind. Every
+       maintenance path below now meets that sealed lock. */
+    await authority.close();
+
+    return {
+      projectRoot,
+      runtimeBaseDir,
+      transcriptPath,
+      service: new SessionService(projectRoot, { runtimeBaseDir }),
+      store,
+    };
+  }
+
+  it('still lists the session and projects its title', async () => {
+    const harness = await createSealed();
+    const listed = await harness.service.listSessions();
+    expect(listed.items.map((entry) => entry.sessionId)).toContain(sessionId);
+    expect(harness.service.getSessionTitleInfo(sessionId)).toEqual({
+      title: 'Sealed session',
+      source: 'manual',
+    });
+  });
+
+  it('still refuses a legacy rename', async () => {
+    const harness = await createSealed();
+    await expect(
+      harness.service.renameSession(sessionId, 'Renamed'),
+    ).rejects.toThrow(/belongs to managed/);
+  });
+
+  it('still archives and unarchives', async () => {
+    const harness = await createSealed();
+    const archived = await harness.service.archiveSessions([sessionId]);
+    expect(archived.errors).toEqual([]);
+    expect(archived.archived).toEqual([sessionId]);
+
+    const restored = await harness.service.unarchiveSessions([sessionId]);
+    expect(restored.errors).toEqual([]);
+  });
+
+  it('still deletes the session and its resources', async () => {
+    const harness = await createSealed();
+    await expect(fs.stat(harness.store.sessionRoot)).resolves.toBeDefined();
+    await expect(harness.service.removeSession(sessionId)).resolves.toBe(true);
+    await expect(fs.stat(harness.transcriptPath)).rejects.toThrow();
+    await expect(fs.stat(harness.store.sessionRoot)).rejects.toThrow();
+  });
+});
