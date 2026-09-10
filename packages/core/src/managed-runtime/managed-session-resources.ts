@@ -7,6 +7,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { open, mkdir, rename, readFile, unlink } from 'node:fs/promises';
 import * as path from 'node:path';
+import { managedSessionResourceRoot } from '../utils/sessionStorageUtils.js';
 import {
   ManagedSessionRecordError,
   type ManagedSessionDurableRef,
@@ -38,10 +39,9 @@ export class LocalManagedSessionResourceStore {
     sessionKey: ManagedSessionKey;
   }): LocalManagedSessionResourceStore {
     return new LocalManagedSessionResourceStore(
-      path.join(
+      managedSessionResourceRoot(
         options.runtimeBaseDir,
-        'resources',
-        assertPathSegment(options.sessionKey.sessionId, 'sessionId'),
+        options.sessionKey.sessionId,
       ),
       options.sessionKey,
     );

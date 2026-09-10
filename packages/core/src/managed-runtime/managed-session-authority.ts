@@ -7,6 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import type { SessionWriterLease } from '../services/session-writer-lease.js';
+import type { LocalManagedSessionResourceStore } from './managed-session-resources.js';
 import { managedToolDigest } from '../tools/managed-tool-protocol.js';
 import {
   MANAGED_SESSION_COMMIT_SUBTYPE,
@@ -16,6 +17,7 @@ import {
   MANAGED_SESSION_LIMITS,
   MANAGED_SESSION_MINIMUM_READER,
   ManagedSessionRecordError,
+  assertManagedSessionDomainEnabled,
   assertManagedSessionEventActor,
   assertManagedSessionTransaction,
   managedSessionEventsDigest,
@@ -25,6 +27,7 @@ import {
   parseManagedSessionHeader,
   parseManagedSessionRecordJson,
   type ManagedSessionActorClass,
+  type ManagedSessionDomain,
   type ManagedSessionCommitMarker,
   type ManagedSessionDurableRef,
   type ManagedSessionEvent,
@@ -53,6 +56,12 @@ export interface ManagedSessionActor {
     readonly activationId: string;
     readonly epoch: number;
   };
+}
+
+export interface ManagedSessionDomainReceipt {
+  readonly receipt: ManagedSessionCommitReceipt;
+  readonly recordRef: ManagedSessionDurableRef;
+  readonly revision: number;
 }
 
 export interface ManagedSessionActivationState {
@@ -126,6 +135,8 @@ export interface OpenManagedSessionAuthorityOptions {
     readonly createdBy: string;
   };
   readonly now?: () => number;
+  /** Required only for domain records, whose bodies live in resources. */
+  readonly resources?: LocalManagedSessionResourceStore;
 }
 
 function commandKey(operation: string, commandId: string): string {
@@ -153,11 +164,16 @@ export class LocalManagedSessionAuthority {
     private lastMarkerDigest: string | null,
     private lastRecordUuid: string | null,
     private activation: ManagedSessionActivationState | undefined,
+    private readonly resources: LocalManagedSessionResourceStore | undefined,
   ) {}
 
   private writeFailure: Error | undefined;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly eventIds = new Set<string>();
+  private readonly domainRecords = new Map<
+    string,
+    { revision: number; recordRef: ManagedSessionDurableRef }
+  >();
 
   get committedSequence(): number {
     return this.committed;
@@ -236,8 +252,14 @@ export class LocalManagedSessionAuthority {
       scan.lastMarkerDigest,
       lastRecordUuid,
       scan.activation,
+      options.resources,
     );
-    for (const event of scan.events) authority.eventIds.add(event.eventId);
+    for (const event of scan.events) {
+      authority.eventIds.add(event.eventId);
+      if (event.kind === 'domain.committed') {
+        authority.recordDomainEvent(event);
+      }
+    }
     return authority;
   }
 
@@ -333,6 +355,66 @@ export class LocalManagedSessionAuthority {
         events.map(() => actor),
       ),
     );
+  }
+
+  /**
+   * Commits one registered domain record. The body is published as a resource
+   * first, because the event carries only a reference to it; the authority
+   * composes the envelope so a caller cannot choose its own revision or break
+   * the per-domain chain.
+   */
+  async commitDomainRecord(
+    command: ManagedSessionCommand,
+    request: {
+      domain: ManagedSessionDomain;
+      content: Readonly<Record<string, unknown>>;
+    },
+    actor: ManagedSessionActor,
+  ): Promise<ManagedSessionDomainReceipt> {
+    assertManagedSessionDomainEnabled(request.domain);
+    const store = this.resources;
+    if (store === undefined) {
+      throw new ManagedSessionRecordError(
+        'a resource store is required to commit domain records.',
+      );
+    }
+    return this.runSerial(async () => {
+      const previous = this.domainRecords.get(request.domain);
+      const revision = (previous?.revision ?? 0) + 1;
+      const recordRef = await store.publish(
+        `managed-${request.domain}`,
+        Buffer.from(
+          JSON.stringify({
+            operationId: command.commandId,
+            revision,
+            previousRecordRef: previous?.recordRef ?? null,
+            ...request.content,
+          }),
+          'utf8',
+        ),
+      );
+      const receipt = await this.commit(
+        command,
+        [
+          {
+            v: MANAGED_SESSION_FORMAT_VERSION,
+            sequence: this.committed + 1,
+            eventId: `${request.domain}:${revision}`,
+            sessionKey: command.sessionKey,
+            kind: 'domain.committed',
+            occurredAt: this.now(),
+            payload: {
+              domain: request.domain,
+              version: MANAGED_SESSION_FORMAT_VERSION,
+              operationId: command.commandId,
+              recordRef,
+            },
+          },
+        ],
+        [actor],
+      );
+      return { receipt, recordRef, revision };
+    });
   }
 
   /**
@@ -485,6 +567,9 @@ export class LocalManagedSessionAuthority {
       if (event.kind === 'activation.changed') {
         this.activation = activationStateFrom(event);
       }
+      if (event.kind === 'domain.committed') {
+        this.recordDomainEvent(event);
+      }
     }
     this.committed = marker.lastSequence;
     this.lastMarkerDigest = managedToolDigest(
@@ -512,6 +597,24 @@ export class LocalManagedSessionAuthority {
    * the authority would assign. A new activation advances the epoch by one, and
    * a phase change keeps the epoch of the activation it describes.
    */
+  private recordDomainEvent(event: ManagedSessionEvent): void {
+    const domain = event.payload['domain'] as string;
+    const previous = this.domainRecords.get(domain);
+    this.domainRecords.set(domain, {
+      revision: (previous?.revision ?? 0) + 1,
+      recordRef: event.payload[
+        'recordRef'
+      ] as unknown as ManagedSessionDurableRef,
+    });
+  }
+
+  /** The latest committed record for a registered domain, if any. */
+  domainRecord(
+    domain: ManagedSessionDomain,
+  ): { revision: number; recordRef: ManagedSessionDurableRef } | undefined {
+    return this.domainRecords.get(domain);
+  }
+
   private assertActivationEpoch(event: ManagedSessionEvent): void {
     const next = activationStateFrom(event);
     const current = this.activation;

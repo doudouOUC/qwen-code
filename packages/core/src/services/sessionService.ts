@@ -41,6 +41,7 @@ import { readRuntimeStatus } from '../utils/runtimeStatus.js';
 import {
   LITE_READ_BUF_SIZE,
   readLastJsonStringFieldSync,
+  readManagedSessionTitleInfoSync,
   readSessionTitleInfoFromFileSync,
 } from '../utils/sessionStorageUtils.js';
 import {
@@ -1817,7 +1818,18 @@ export class SessionService {
     title?: string;
     source?: TitleSource;
   } {
-    return readSessionTitleInfoFromFileSync(filePath, tailBuffer);
+    const legacy = readSessionTitleInfoFromFileSync(filePath, tailBuffer);
+    if (legacy.title !== undefined) return legacy;
+    /* Only sessions without a legacy title pay for the Managed probe. A
+       Managed transcript never carries a custom_title record, so the scan
+       above cannot return one for it. */
+    return (
+      readManagedSessionTitleInfoSync(
+        filePath,
+        this.storage.getRuntimeBaseDir(),
+        tailBuffer,
+      ) ?? legacy
+    );
   }
 
   /**

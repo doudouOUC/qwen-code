@@ -12,6 +12,7 @@
  */
 
 import fs from 'node:fs';
+import * as path from 'node:path';
 
 /** Size of the head/tail buffer for lite metadata reads (64KB). */
 export const LITE_READ_BUF_SIZE = 64 * 1024;
@@ -504,4 +505,127 @@ export function readSessionTitleInfoFromFileSync(
   const source =
     rawSource === 'auto' || rawSource === 'manual' ? rawSource : undefined;
   return { title, source };
+}
+
+/**
+ * Session-owned Managed resources live beside the session under the controlled
+ * runtime base directory. Defined here so `utils/` stays a leaf layer and the
+ * resource store and this reader cannot drift apart.
+ */
+export function managedSessionResourceRoot(
+  runtimeBaseDir: string,
+  sessionId: string,
+): string {
+  if (sessionId.length === 0 || sessionId !== path.basename(sessionId)) {
+    throw new Error('sessionId must be a single path segment.');
+  }
+  return path.join(runtimeBaseDir, 'resources', sessionId);
+}
+
+const MANAGED_HEADER_MARKER = '"subtype":"managed_session_header_v1"';
+const MANAGED_METADATA_MARKER = '"domain":"session_metadata"';
+
+function lastLineContaining(text: string, marker: string): string | undefined {
+  const lines = text.split('\n');
+  for (let index = lines.length - 1; index >= 0; index--) {
+    if (lines[index].includes(marker)) return lines[index];
+  }
+  return undefined;
+}
+
+/**
+ * Managed sessions keep their title in a committed `session_metadata` domain
+ * record whose body lives in the resource store, so the legacy scan for a
+ * `custom_title` record finds nothing and would report a blank title.
+ *
+ * Returns `undefined` when the transcript is not Managed, so the caller falls
+ * back to the legacy reader. Returns `{}` for a Managed session that was never
+ * renamed, which genuinely has no custom title. Display stays tolerant: an
+ * unreadable body yields `{}` rather than throwing into the session list.
+ *
+ * Like the legacy reader this only scans the tail and head windows, so a rename
+ * buried in the middle of a very long log is not found.
+ */
+export function readManagedSessionTitleInfoSync(
+  filePath: string,
+  runtimeBaseDir: string,
+  scratchBuffer?: Buffer,
+): { title?: string; source?: 'auto' | 'manual' } | undefined {
+  let fd: number | undefined;
+  try {
+    const fileSize = fs.statSync(filePath).size;
+    if (fileSize === 0) return undefined;
+    fd = fs.openSync(filePath, getReadOpenFlags());
+
+    const buffer =
+      scratchBuffer && scratchBuffer.length >= LITE_READ_BUF_SIZE
+        ? scratchBuffer
+        : Buffer.alloc(LITE_READ_BUF_SIZE);
+
+    const headLength = Math.min(fileSize, LITE_READ_BUF_SIZE);
+    const headBytes = fs.readSync(fd, buffer, 0, headLength, 0);
+    const headText = buffer.toString('utf-8', 0, headBytes);
+    const headerLine = lastLineContaining(headText, MANAGED_HEADER_MARKER);
+    if (headerLine === undefined) return undefined;
+
+    /* The recorded identity, not the file name, decides where the resources
+       live. */
+    const header = JSON.parse(headerLine) as {
+      managedSession?: { sessionKey?: { sessionId?: unknown } };
+    };
+    const recordedId = header.managedSession?.sessionKey?.sessionId;
+    if (typeof recordedId !== 'string' || recordedId.length === 0) return {};
+    const resourceRoot = managedSessionResourceRoot(runtimeBaseDir, recordedId);
+
+    let line = undefined as string | undefined;
+    const tailLength = Math.min(fileSize, LITE_READ_BUF_SIZE);
+    const tailOffset = fileSize - tailLength;
+    if (tailOffset > 0) {
+      const tailBytes = fs.readSync(fd, buffer, 0, tailLength, tailOffset);
+      line = lastLineContaining(
+        buffer.toString('utf-8', 0, tailBytes),
+        MANAGED_METADATA_MARKER,
+      );
+    }
+    line ??= lastLineContaining(headText, MANAGED_METADATA_MARKER);
+    if (line === undefined) return {};
+
+    const record = JSON.parse(line) as {
+      managedSession?: {
+        payload?: { recordRef?: { kind?: unknown; resourceId?: unknown } };
+      };
+    };
+    const ref = record.managedSession?.payload?.recordRef;
+    if (typeof ref?.kind !== 'string' || typeof ref.resourceId !== 'string') {
+      return {};
+    }
+    if (
+      ref.kind !== path.basename(ref.kind) ||
+      ref.resourceId !== path.basename(ref.resourceId)
+    ) {
+      return {};
+    }
+    const body = JSON.parse(
+      fs.readFileSync(
+        path.join(resourceRoot, ref.kind, ref.resourceId),
+        'utf-8',
+      ),
+    ) as { title?: unknown; titleSource?: unknown };
+    if (typeof body.title !== 'string' || body.title.length === 0) return {};
+    const source =
+      body.titleSource === 'auto' || body.titleSource === 'manual'
+        ? body.titleSource
+        : undefined;
+    return { title: body.title, source };
+  } catch {
+    return {};
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
 }

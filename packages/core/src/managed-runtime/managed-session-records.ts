@@ -88,6 +88,25 @@ export const MANAGED_SESSION_DOMAINS = [
 
 export type ManagedSessionDomain = (typeof MANAGED_SESSION_DOMAINS)[number];
 
+/**
+ * The domains a caller may actually submit today. The registry above is the
+ * closed v1 name space; recognising a name never means the capability is
+ * implemented or admitted, so submission is gated separately.
+ */
+export const MANAGED_SESSION_ENABLED_DOMAINS: readonly ManagedSessionDomain[] = [
+  'session_metadata',
+];
+
+export function assertManagedSessionDomainEnabled(
+  domain: ManagedSessionDomain,
+): void {
+  if (!MANAGED_SESSION_ENABLED_DOMAINS.includes(domain)) {
+    throw new ManagedSessionRecordError(
+      `domain ${domain} is registered but not enabled for submission.`,
+    );
+  }
+}
+
 export const MANAGED_SESSION_ACTOR_CLASSES = [
   'harness',
   'coordinator',
