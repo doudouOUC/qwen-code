@@ -282,19 +282,31 @@ export function assertManagedSessionKey(
   const record = object(value, label);
   assertNoUnknownKeys(record, ['tenantId', 'workspaceId', 'sessionId'], label);
   return {
-    tenantId: assertManagedSessionStableId(
-      record['tenantId'],
-      `${label}.tenantId`,
-    ),
-    workspaceId: assertManagedSessionStableId(
+    tenantId: assertKeyComponent(record['tenantId'], `${label}.tenantId`),
+    workspaceId: assertKeyComponent(
       record['workspaceId'],
       `${label}.workspaceId`,
     ),
-    sessionId: assertManagedSessionStableId(
-      record['sessionId'],
-      `${label}.sessionId`,
-    ),
+    sessionId: assertKeyComponent(record['sessionId'], `${label}.sessionId`),
   };
+}
+
+/**
+ * §2.1 derives on-disk resource roots from these components, so they must be
+ * usable as a single path segment.
+ */
+function assertKeyComponent(
+  value: ManagedSessionJsonValue | undefined,
+  label: string,
+): string {
+  const id = assertManagedSessionStableId(value, label);
+  if (/[/\\]/.test(id)) {
+    fail(`${label} must not contain a path separator.`);
+  }
+  if (/^\.+$/.test(id)) {
+    fail(`${label} must not be a relative path segment.`);
+  }
+  return id;
 }
 
 export function managedSessionKeysEqual(
@@ -564,7 +576,7 @@ const EVENT_ACTORS: Readonly<
   'wake.requested': ['authority'],
   'activation.changed': ['coordinator'],
   'model.attempt': ['harness'],
-  'message.committed': ['harness', 'authority'],
+  'message.committed': ['harness', 'trusted_entry'],
   'tool.intent': ['harness'],
   'action.changed': ['harness', 'trusted_entry'],
   'tool.receipt': ['trusted_entry'],
@@ -577,9 +589,8 @@ const EVENT_ACTORS: Readonly<
   'domain.committed': ['trusted_entry'],
 };
 
-const ACTIVATION_SUBJECT_KINDS: readonly ManagedSessionEventKind[] = [
+const HARNESS_ONLY_KINDS: readonly ManagedSessionEventKind[] = [
   'model.attempt',
-  'message.committed',
   'tool.intent',
   'context.compacted',
   'checkpoint.committed',
@@ -643,6 +654,7 @@ function assertField(
       return;
     case 'json':
       if (value === undefined) fail(`${at} is required.`);
+      canonicalDigest(value, MANAGED_SESSION_LIMITS.maxEventBytes, at);
       return;
     default: {
       const exhaustive: never = kind;
@@ -737,8 +749,14 @@ function assertPayloadRules(
       return;
     }
     case 'context.compacted': {
-      const from = payload['fromSequence'] as number;
-      const to = payload['toSequence'] as number;
+      const from = assertManagedSessionSequence(
+        payload['fromSequence'],
+        `${at}.fromSequence`,
+      );
+      const to = assertManagedSessionSequence(
+        payload['toSequence'],
+        `${at}.toSequence`,
+      );
       if (to < from) {
         fail(`${at}.toSequence must not precede ${at}.fromSequence.`);
       }
@@ -753,10 +771,10 @@ function assertPayloadRules(
       if (payload['version'] !== MANAGED_SESSION_FORMAT_VERSION) {
         fail(`${at}.version must be ${MANAGED_SESSION_FORMAT_VERSION}.`);
       }
-      const recordRef = payload['recordRef'] as unknown as {
-        kind: string;
-        schemaVersion: number;
-      };
+      const recordRef = assertManagedSessionDurableRef(
+        payload['recordRef'],
+        `${at}.recordRef`,
+      );
       if (recordRef.kind !== `managed-${domain}`) {
         fail(`${at}.recordRef.kind must be managed-${domain}.`);
       }
@@ -817,10 +835,7 @@ export function parseManagedSessionEvent(value: unknown): ManagedSessionEvent {
     record['subject'] === undefined
       ? undefined
       : assertSubject(record['subject'], 'event.subject');
-  if (
-    ACTIVATION_SUBJECT_KINDS.includes(kind) &&
-    subject?.type !== 'activation'
-  ) {
+  if (HARNESS_ONLY_KINDS.includes(kind) && subject?.type !== 'activation') {
     fail(`${kind} requires an activation subject.`);
   }
 
@@ -838,7 +853,7 @@ export function parseManagedSessionEvent(value: unknown): ManagedSessionEvent {
       'event.occurredAt',
     ),
     ...(subject === undefined ? {} : { subject }),
-    payload,
+    payload: Object.freeze(payload),
   };
 }
 
@@ -863,10 +878,22 @@ export function assertManagedSessionEventActor(
         `action.changed ${state}/${source} must be requested by ${expected}, not ${actor}.`,
       );
     }
+    assertHarnessSubject(event, actor);
     return;
   }
   if (!EVENT_ACTORS[event.kind].includes(actor)) {
     fail(`${event.kind} must not be requested by ${actor}.`);
+  }
+  assertHarnessSubject(event, actor);
+}
+
+/** Every kind the Harness may request is a Harness-advancing record. */
+function assertHarnessSubject(
+  event: ManagedSessionEvent,
+  actor: ManagedSessionActorClass,
+): void {
+  if (actor === 'harness' && event.subject?.type !== 'activation') {
+    fail(`${event.kind} from the harness requires an activation subject.`);
   }
 }
 
@@ -1039,20 +1066,33 @@ export function parseManagedSessionCommitMarker(
 }
 
 /**
- * Digest over the committed event sequence. The marker carries it so a reader
- * can prove the transaction's events are the ones the writer committed.
+ * Digest over the committed events. It covers full event content, not just
+ * identities, so a replaced or corrupted body cannot match a stored marker.
  */
 export function managedSessionEventsDigest(
   events: readonly ManagedSessionEvent[],
 ): string {
-  return managedToolDigest(
-    events.map((event) => ({
-      sequence: event.sequence,
-      eventId: event.eventId,
-      kind: event.kind,
-    })),
+  return canonicalDigest(
+    events,
     MANAGED_SESSION_LIMITS.maxTransactionBytes,
+    'transaction events',
   );
+}
+
+function canonicalDigest(
+  value: unknown,
+  maxBytes: number,
+  label: string,
+): string {
+  try {
+    return managedToolDigest(value, maxBytes);
+  } catch (cause) {
+    return fail(
+      `${label} is not canonically encodable: ${
+        cause instanceof Error ? cause.message : String(cause)
+      }`,
+    );
+  }
 }
 
 export function assertManagedSessionTransaction(
@@ -1165,6 +1205,9 @@ function assertNoDuplicateJsonKeys(text: string): void {
       let probe = index;
       while (probe < text.length && /\s/.test(text[probe])) probe++;
       if (text[probe] === ':' && stack.length > 0) {
+        if (value === '__proto__') {
+          fail('record must not use "__proto__" as a JSON key.');
+        }
         const keys = stack[stack.length - 1];
         if (keys.has(value)) {
           fail(`record has the duplicate JSON key "${value}".`);

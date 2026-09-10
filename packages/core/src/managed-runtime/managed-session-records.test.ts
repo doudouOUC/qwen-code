@@ -428,7 +428,11 @@ describe('managed session actor eligibility', () => {
   });
 
   it('splits action.changed between the harness and the trusted entry', () => {
-    const action = (source: string, state: string) =>
+    const action = (
+      source: string,
+      state: string,
+      subject: typeof activationSubject | null = activationSubject,
+    ) =>
       parseManagedSessionEvent({
         v: 1,
         sequence: 5,
@@ -436,6 +440,7 @@ describe('managed session actor eligibility', () => {
         sessionKey,
         kind: 'action.changed',
         occurredAt: 1,
+        ...(subject === null ? {} : { subject }),
         payload: {
           requestId: 'req-1',
           kind: 'permission',
@@ -453,6 +458,12 @@ describe('managed session actor eligibility', () => {
         'harness',
       ),
     ).not.toThrow();
+    expect(() =>
+      assertManagedSessionEventActor(
+        action('tool_call', 'requested', null),
+        'harness',
+      ),
+    ).toThrow(/from the harness requires an activation subject/);
     expect(() =>
       assertManagedSessionEventActor(
         action('tool_call', 'requested'),
@@ -678,6 +689,216 @@ describe('managed session raw record parsing', () => {
   it('rejects malformed JSON', () => {
     expect(() => parseManagedSessionRecordJson('{"a":}', 1024)).toThrow(
       /not valid JSON/,
+    );
+  });
+
+  it('rejects __proto__ as a key', () => {
+    expect(() =>
+      parseManagedSessionRecordJson('{"__proto__":{"x":1}}', 1024),
+    ).toThrow(/must not use "__proto__" as a JSON key/);
+  });
+
+  it('allows __proto__ as a string value', () => {
+    expect(parseManagedSessionRecordJson('{"a":"__proto__"}', 1024)).toEqual({
+      a: '__proto__',
+    });
+  });
+});
+
+describe('managed session input projection', () => {
+  function messageEvent(
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      v: 1,
+      sequence: 2,
+      eventId: 'evt-2',
+      sessionKey,
+      kind: 'message.committed',
+      occurredAt: 1,
+      payload: {
+        messageId: 'msg-1',
+        role: 'user',
+        contentRef: ref(),
+        parentMessageId: null,
+      },
+      ...overrides,
+    };
+  }
+
+  it('accepts a user input message with no activation to name', () => {
+    const event = parseManagedSessionEvent(messageEvent());
+    expect(event.subject).toBeUndefined();
+    expect(() =>
+      assertManagedSessionEventActor(event, 'trusted_entry'),
+    ).not.toThrow();
+  });
+
+  it('still requires an activation subject from the harness', () => {
+    const event = parseManagedSessionEvent(messageEvent());
+    expect(() => assertManagedSessionEventActor(event, 'harness')).toThrow(
+      /from the harness requires an activation subject/,
+    );
+    const advanced = parseManagedSessionEvent(
+      messageEvent({ subject: activationSubject }),
+    );
+    expect(() =>
+      assertManagedSessionEventActor(advanced, 'harness'),
+    ).not.toThrow();
+  });
+
+  it('never lets the harness commit a physical tool receipt', () => {
+    const receipt = parseManagedSessionEvent({
+      v: 1,
+      sequence: 3,
+      eventId: 'evt-3',
+      sessionKey,
+      kind: 'tool.receipt',
+      occurredAt: 1,
+      subject: activationSubject,
+      payload: {
+        executionCallId: 'call-1',
+        toolOutcomeRef: ref(),
+        resultRef: null,
+        resources: [],
+        historyRevision: 1,
+      },
+    });
+    expect(() => assertManagedSessionEventActor(receipt, 'harness')).toThrow(
+      /must not be requested by harness/,
+    );
+    expect(() =>
+      assertManagedSessionEventActor(receipt, 'trusted_entry'),
+    ).not.toThrow();
+  });
+});
+
+describe('managed session free-form payload validation', () => {
+  function cancelEvent(target: unknown): Record<string, unknown> {
+    return {
+      v: 1,
+      sequence: 4,
+      eventId: 'evt-4',
+      sessionKey,
+      kind: 'cancel.requested',
+      occurredAt: 1,
+      payload: {
+        requestId: 'req-1',
+        target,
+        reason: 'user',
+        requestedBy: 'web_shell',
+      },
+    };
+  }
+
+  it('accepts a plain JSON target', () => {
+    expect(
+      parseManagedSessionEvent(cancelEvent({ turnId: 'turn-1' })).kind,
+    ).toBe('cancel.requested');
+  });
+
+  it('rejects a non-finite number in the target', () => {
+    expect(() =>
+      parseManagedSessionEvent(cancelEvent({ n: Number.POSITIVE_INFINITY })),
+    ).toThrow(/not canonically encodable/);
+  });
+
+  it('rejects a cyclic target', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic['self'] = cyclic;
+    expect(() => parseManagedSessionEvent(cancelEvent(cyclic))).toThrow(
+      /not canonically encodable/,
+    );
+  });
+
+  it('freezes the validated payload', () => {
+    const event = parseManagedSessionEvent(cancelEvent({ turnId: 'turn-1' }));
+    expect(Object.isFrozen(event.payload)).toBe(true);
+  });
+});
+
+describe('managed session key components', () => {
+  it('refuses a key component that escapes its own path segment', () => {
+    for (const sessionId of ['../other', 'a/b', 'a\\b', '..']) {
+      expect(() =>
+        parseManagedSessionEvent(
+          inputEvent({ sessionKey: { ...sessionKey, sessionId } }),
+        ),
+      ).toThrow(/sessionId must not/);
+    }
+  });
+
+  it('accepts a dot inside a component', () => {
+    expect(
+      parseManagedSessionEvent(
+        inputEvent({ sessionKey: { ...sessionKey, sessionId: 'a.b' } }),
+      ).sessionKey.sessionId,
+    ).toBe('a.b');
+  });
+});
+
+describe('managed session activation revocation', () => {
+  it('accepts a revoked activation carrying its boundary', () => {
+    const event = parseManagedSessionEvent({
+      v: 1,
+      sequence: 5,
+      eventId: 'evt-5',
+      sessionKey,
+      kind: 'activation.changed',
+      occurredAt: 1,
+      payload: {
+        activationId: 'act-1',
+        epoch: 3,
+        workerId: 'worker-1',
+        subject: activationSubject,
+        phase: 'revoked',
+        leaseDurationMs: 60_000,
+        expiresAt: 2,
+        installRef: ref(),
+        boundaryRef: ref(),
+      },
+    });
+    expect(event.payload['phase']).toBe('revoked');
+  });
+});
+
+describe('managed session domain round trip', () => {
+  it('accepts every registered domain with its own record kind', () => {
+    for (const domain of MANAGED_SESSION_DOMAINS) {
+      const event = parseManagedSessionEvent({
+        v: 1,
+        sequence: 6,
+        eventId: 'evt-6',
+        sessionKey,
+        kind: 'domain.committed',
+        occurredAt: 1,
+        payload: {
+          domain,
+          version: 1,
+          operationId: 'op-1',
+          recordRef: ref(`managed-${domain}`),
+        },
+      });
+      expect(event.payload['domain']).toBe(domain);
+    }
+  });
+});
+
+describe('managed session events digest coverage', () => {
+  it('changes when payload content changes, not just identity', () => {
+    const base = parseManagedSessionEvent(inputEvent());
+    const altered = parseManagedSessionEvent(
+      inputEvent({
+        payload: {
+          ...(inputEvent()['payload'] as Record<string, unknown>),
+          source: 'scheduled_task',
+        },
+      }),
+    );
+    expect(base.eventId).toBe(altered.eventId);
+    expect(base.sequence).toBe(altered.sequence);
+    expect(managedSessionEventsDigest([base])).not.toBe(
+      managedSessionEventsDigest([altered]),
     );
   });
 });
