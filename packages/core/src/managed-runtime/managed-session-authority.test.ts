@@ -8,6 +8,8 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { assertSessionExecutionEngine } from '../services/session-execution-engine.js';
+import { readSessionTranscriptSnapshot } from '../services/session-transcript-reader.js';
 import { SessionWriterLease } from '../services/session-writer-lease.js';
 import {
   LocalManagedSessionAuthority,
@@ -142,9 +144,17 @@ async function readBodies(
   fixture: Fixture,
 ): Promise<Array<Record<string, unknown>>> {
   const records = await readRecords(fixture);
-  return records.map(
-    (record) => record['managedSession'] as Record<string, unknown>,
+  return records
+    .filter((record) => record['managedSession'] !== undefined)
+    .map((record) => record['managedSession'] as Record<string, unknown>);
+}
+
+function indexOfSubtype(lines: string[], subtype: string): number {
+  const index = lines.findIndex((line) =>
+    line.includes(`"subtype":"${subtype}"`),
   );
+  if (index < 0) throw new Error(`no ${subtype} record in the log`);
+  return index;
 }
 
 async function rewrite(fixture: Fixture, lines: string[]): Promise<void> {
@@ -168,6 +178,7 @@ describe('managed session authority', () => {
 
     const records = await readRecords(fixture);
     expect(records.map((record) => record['subtype'])).toEqual([
+      'session_execution_engine',
       'managed_session_header_v1',
       'managed_session_event_v1',
       'managed_session_event_v1',
@@ -232,7 +243,7 @@ describe('managed session authority', () => {
     expect(replay.transactionId).toBe(first.transactionId);
     expect(replay.replayed).toBe(true);
     expect(replay.lastSequence).toBe(first.lastSequence);
-    expect(await readLines(fixture)).toHaveLength(4);
+    expect(await readLines(fixture)).toHaveLength(5);
   });
 
   it('survives a repeated command id across a cold reopen', async () => {
@@ -253,7 +264,7 @@ describe('managed session authority', () => {
 
     expect(replay.transactionId).toBe(original.transactionId);
     expect(replay.replayed).toBe(true);
-    expect(await readLines(fixture)).toHaveLength(4);
+    expect(await readLines(fixture)).toHaveLength(5);
   });
 
   it('rejects the same command id carrying different content', async () => {
@@ -267,7 +278,7 @@ describe('managed session authority', () => {
       ),
     ).rejects.toThrow(ManagedSessionConflictError);
     await opened.release();
-    expect(await readLines(fixture)).toHaveLength(4);
+    expect(await readLines(fixture)).toHaveLength(5);
   });
 
   it('rejects a command for another workspace', async () => {
@@ -282,7 +293,7 @@ describe('managed session authority', () => {
       ),
     ).rejects.toThrow(/does not match this session/);
     await opened.release();
-    expect(await readLines(fixture)).toHaveLength(1);
+    expect(await readLines(fixture)).toHaveLength(2);
   });
 
   it('rejects a stale expectedSequence', async () => {
@@ -709,11 +720,12 @@ describe('managed session authority log integrity', () => {
     await opened.release();
 
     const lines = await readLines(fixture);
-    const record = JSON.parse(lines[1]) as Record<string, unknown>;
+    const at = indexOfSubtype(lines, 'managed_session_event_v1');
+    const record = JSON.parse(lines[at]) as Record<string, unknown>;
     const body = record['managedSession'] as Record<string, unknown>;
     const payload = body['payload'] as Record<string, unknown>;
     payload['source'] = 'tampered';
-    lines[1] = JSON.stringify(record);
+    lines[at] = JSON.stringify(record);
     await rewrite(fixture, lines);
 
     await expect(openAuthority(fixture, { create: false })).rejects.toThrow(
@@ -728,7 +740,8 @@ describe('managed session authority log integrity', () => {
     await opened.release();
 
     const lines = await readLines(fixture);
-    await rewrite(fixture, lines.slice(1));
+    lines.splice(indexOfSubtype(lines, 'managed_session_header_v1'), 1);
+    await rewrite(fixture, lines);
 
     await expect(openAuthority(fixture, { create: false })).rejects.toThrow(
       /precedes the Managed header/,
@@ -741,14 +754,15 @@ describe('managed session authority log integrity', () => {
     await opened.release();
 
     const lines = await readLines(fixture);
-    const record = JSON.parse(lines[0]) as Record<string, unknown>;
+    const at = indexOfSubtype(lines, 'managed_session_header_v1');
+    const record = JSON.parse(lines[at]) as Record<string, unknown>;
     const body = record['managedSession'] as Record<string, unknown>;
     body['sessionKey'] = {
       tenantId: 'tenant-1',
       workspaceId: 'workspace-2',
       sessionId: fixture.sessionId,
     };
-    lines[0] = JSON.stringify(record);
+    lines[at] = JSON.stringify(record);
     await rewrite(fixture, lines);
 
     await expect(openAuthority(fixture, { create: false })).rejects.toThrow(
@@ -860,7 +874,7 @@ describe('managed session authority serialisation', () => {
       ),
     ).rejects.toThrow(/event id in-1:accepted is already committed/);
     await opened.release();
-    expect(await readLines(fixture)).toHaveLength(4);
+    expect(await readLines(fixture)).toHaveLength(5);
   });
 
   it('refuses an event id repeated inside one transaction', async () => {
@@ -982,7 +996,7 @@ describe('managed session uncommitted tail recovery', () => {
     const fixture = await createFixture();
     const committedBytes = await seedTornTail(fixture);
     const before = await readLines(fixture);
-    expect(before).toHaveLength(5);
+    expect(before).toHaveLength(6);
 
     const lease = await SessionWriterLease.acquire({
       runtimeBaseDir: fixture.runtimeBaseDir,
@@ -1090,6 +1104,188 @@ describe('managed session uncommitted tail recovery', () => {
     await expect(lease.truncateTo(size + 1)).rejects.toThrow();
     await expect(lease.truncateTo(-1)).rejects.toThrow();
     expect((await fs.stat(fixture.transcriptPath)).size).toBe(size);
+    await lease.release();
+  });
+});
+
+describe('managed session engine ownership', () => {
+  it('records managed ownership so legacy-only operations refuse the session', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await opened.release();
+
+    const snapshot = await readSessionTranscriptSnapshot(
+      fixture.transcriptPath,
+      fixture.sessionId,
+    );
+    expect(snapshot?.executionEngine).toMatchObject({
+      status: 'verified',
+      engine: 'managed',
+      recorded: true,
+    });
+
+    /* Without this record the reader reports a verified legacy session, and
+       fork, rename and the config guards would all operate on it. */
+    expect(() =>
+      assertSessionExecutionEngine(
+        snapshot?.executionEngine,
+        fixture.sessionId,
+        'legacy',
+      ),
+    ).toThrow(/belongs to managed/);
+    expect(() =>
+      assertSessionExecutionEngine(
+        snapshot?.executionEngine,
+        fixture.sessionId,
+        'managed',
+      ),
+    ).not.toThrow();
+  });
+
+  it('completes a create interrupted between the engine record and the header', async () => {
+    const fixture = await createFixture();
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    await lease.appendJsonLine({
+      uuid: 'engine-only',
+      parentUuid: null,
+      sessionId: fixture.sessionId,
+      timestamp: new Date().toISOString(),
+      type: 'system',
+      subtype: 'session_execution_engine',
+      cwd: '/workspace',
+      version: 'test',
+      systemPayload: { version: 1, engine: 'managed' },
+    });
+    await lease.release();
+
+    const opened = await openAuthority(fixture);
+    expect(opened.authority.sessionHeader.engine).toBe('managed');
+    await opened.release();
+
+    const subtypes = (await readRecords(fixture)).map(
+      (record) => record['subtype'],
+    );
+    expect(subtypes).toEqual([
+      'session_execution_engine',
+      'managed_session_header_v1',
+    ]);
+  });
+});
+
+describe('managed session first transaction recovery', () => {
+  it('retains the header when the first transaction never committed', async () => {
+    const fixture = await createFixture();
+    const created = await openAuthority(fixture);
+    await created.release();
+    const prefixSize = (await fs.stat(fixture.transcriptPath)).size;
+
+    /* No commit marker exists yet, so the committed sequence is still zero.
+       Truncating to that offset would delete the header and leave a session
+       that can never be opened again. */
+    const crashed = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    await crashed.appendJsonLine({
+      uuid: 'first-orphan',
+      parentUuid: null,
+      sessionId: fixture.sessionId,
+      timestamp: new Date().toISOString(),
+      type: 'system',
+      subtype: 'managed_session_event_v1',
+      cwd: '/workspace',
+      version: 'test',
+      managedSession: {
+        v: 1,
+        sequence: 1,
+        eventId: 'first-orphan-event',
+        sessionKey: sessionKeyFor(fixture),
+        kind: 'input.accepted',
+        occurredAt: 1,
+        payload: {
+          inputId: 'in-orphan',
+          turnId: 'turn-orphan',
+          source: 'web_shell',
+          contentRef: ref(),
+          deadline: null,
+          admissionRef: ref(),
+        },
+      },
+    });
+    await crashed.release();
+
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    const recovered = await LocalManagedSessionAuthority.recoverUncommittedTail(
+      { lease, sessionKey: sessionKeyFor(fixture) },
+    );
+    expect(recovered.discardedBytes).toBeGreaterThan(0);
+
+    expect((await fs.stat(fixture.transcriptPath)).size).toBe(prefixSize);
+    expect((await readRecords(fixture)).map((r) => r['subtype'])).toEqual([
+      'session_execution_engine',
+      'managed_session_header_v1',
+    ]);
+
+    const authority = await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey: sessionKeyFor(fixture),
+      cwd: '/workspace',
+      version: 'test',
+    });
+    expect(authority.committedSequence).toBe(0);
+    expect(authority.sessionHeader.engine).toBe('managed');
+    const receipt = await authority.submitInput(
+      inputCommand(fixture),
+      inputRequest,
+    );
+    expect(receipt.firstSequence).toBe(1);
+    await lease.release();
+  });
+
+  it('refuses recovery when there is no prefix to retain', async () => {
+    const fixture = await createFixture();
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    await lease.appendJsonLine({
+      uuid: 'headerless',
+      parentUuid: null,
+      sessionId: fixture.sessionId,
+      timestamp: new Date().toISOString(),
+      type: 'system',
+      subtype: 'managed_session_commit_v1',
+      cwd: '/workspace',
+      version: 'test',
+      managedSession: {
+        transactionId: 'tx-1',
+        commandId: 'cmd-1',
+        operation: 'submitInput',
+        contentDigest: DIGEST,
+        firstSequence: 1,
+        lastSequence: 1,
+        eventCount: 1,
+        eventsDigest: DIGEST,
+        previousCommitDigest: null,
+      },
+    });
+    await expect(
+      LocalManagedSessionAuthority.recoverUncommittedTail({
+        lease,
+        sessionKey: sessionKeyFor(fixture),
+      }),
+    ).rejects.toThrow(/precedes the Managed header/);
     await lease.release();
   });
 });

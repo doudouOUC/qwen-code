@@ -2268,13 +2268,26 @@ export class SessionWriterLease {
       if (
         !snapshot.state.exists ||
         snapshot.state.byteLength !== byteLength ||
-        !sameFileIdentity(snapshot.state.fingerprint, afterState.fingerprint)
+        !sameFileIdentity(snapshot.state.fingerprint, afterState.fingerprint) ||
+        !sameFileSecurityMetadata(
+          snapshot.state.fingerprint,
+          afterState.fingerprint,
+        )
       ) {
         throw new SessionTranscriptChangedError();
       }
       await this.readOwnedLock();
       this.expectedTranscriptState = snapshot.state;
       this.expectedTranscriptHasher = snapshot.hasher;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'ENOENT') {
+        throw new SessionTranscriptChangedError();
+      }
+      if (error instanceof SessionWriterError) throw error;
+      throw new SessionWriterUnavailableError({
+        cause: error instanceof Error ? error : undefined,
+      });
     } finally {
       if (handle) {
         await handle.close().catch(() => undefined);

@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import type { SessionWriterLease } from '../services/session-writer-lease.js';
 import type { LocalManagedSessionResourceStore } from './managed-session-resources.js';
 import { managedToolDigest } from '../tools/managed-tool-protocol.js';
@@ -206,7 +206,7 @@ export class LocalManagedSessionAuthority {
     let header = scan.header;
     let lastRecordUuid = scan.lastRecordUuid;
     if (header === undefined) {
-      if (scan.foreignRecords > 0) {
+      if (scan.foreignRecords > scan.engineRecords) {
         throw new ManagedSessionRecordError(
           'session log has existing records but no Managed header; history import is not supported yet.',
         );
@@ -225,6 +225,24 @@ export class LocalManagedSessionAuthority {
         rootSnapshotRef: options.create.rootSnapshotRef,
         createdBy: options.create.createdBy,
       });
+      // Recorded before the header, in the container's own metadata shape, so
+      // every existing execution-engine guard sees a Managed session instead of
+      // defaulting to legacy and letting a legacy-only operation run on it.
+      if (scan.engineRecords === 0) {
+        const engineUuid = randomUUID();
+        await options.lease.appendJsonLine({
+          uuid: engineUuid,
+          parentUuid: lastRecordUuid,
+          sessionId: options.sessionKey.sessionId,
+          timestamp: new Date(now()).toISOString(),
+          type: 'system',
+          subtype: 'session_execution_engine',
+          cwd: options.cwd,
+          version: options.version,
+          systemPayload: { version: 1, engine: 'managed' },
+        });
+        lastRecordUuid = engineUuid;
+      }
       const uuid = randomUUID();
       await options.lease.appendJsonLine({
         uuid,
@@ -282,16 +300,34 @@ export class LocalManagedSessionAuthority {
         'session log has no uncommitted tail to discard.',
       );
     }
-    const text = await readFile(options.lease.transcriptPath, 'utf8');
-    const discarded = Buffer.from(text, 'utf8').subarray(scan.committedBytes);
-    if (discarded.byteLength !== scan.uncommittedBytes) {
+    // The header has no marker after it, so a crash during the very first
+    // transaction leaves committedBytes at zero. Truncating there would delete
+    // the header and leave a session that can never be opened again.
+    const retain = Math.max(scan.committedBytes, scan.headerBytes);
+    if (retain === 0) {
+      throw new ManagedSessionRecordError(
+        'session log has no committed prefix to retain.',
+      );
+    }
+    // Read as bytes: a tail torn mid-character would not survive a decode and
+    // re-encode round trip.
+    const bytes = await readFile(options.lease.transcriptPath);
+    if (bytes.byteLength <= retain) {
       throw new ManagedSessionRecordError(
         'session log changed while preparing tail recovery.',
       );
     }
+    const discarded = bytes.subarray(retain);
     const diagnosticPath = `${options.lease.transcriptPath}.uncommitted-tail`;
-    await writeFile(diagnosticPath, discarded, { mode: 0o600 });
-    await options.lease.truncateTo(scan.committedBytes);
+    const pendingPath = `${diagnosticPath}.pending`;
+    await writeFile(pendingPath, discarded, { mode: 0o600 });
+    try {
+      await options.lease.truncateTo(retain);
+    } catch (cause) {
+      await unlink(pendingPath).catch(() => undefined);
+      throw cause;
+    }
+    await rename(pendingPath, diagnosticPath);
     return { discardedBytes: discarded.byteLength, diagnosticPath };
   }
 
@@ -740,10 +776,18 @@ interface ManagedSessionLogScan {
   readonly activation: ManagedSessionActivationState | undefined;
   /** Byte length of the prefix ending at the last commit marker. */
   readonly committedBytes: number;
+  /**
+   * Byte length through the header. The header carries the session identity
+   * and definition refs and has no marker after it, so it is a required
+   * prefix rather than an uncommitted tail.
+   */
+  readonly headerBytes: number;
   /** Byte length of the records after it, kept for diagnostics. */
   readonly uncommittedBytes: number;
   readonly uncommitted: number;
   readonly foreignRecords: number;
+  /** Engine ownership records, which a Managed log writes before its header. */
+  readonly engineRecords: number;
 }
 
 /**
@@ -768,9 +812,11 @@ async function readManagedSessionLog(
         lastRecordUuid: null,
         activation: undefined,
         committedBytes: 0,
+        headerBytes: 0,
         uncommittedBytes: 0,
         uncommitted: 0,
         foreignRecords: 0,
+        engineRecords: 0,
       };
     }
     throw error;
@@ -790,7 +836,9 @@ async function readManagedSessionLog(
   let activation: ManagedSessionActivationState | undefined;
   let scanned = 0;
   let committedBytes = 0;
+  let headerBytes = 0;
   let foreignRecords = 0;
+  let engineRecords = 0;
   let pending: ManagedSessionEvent[] = [];
 
   for (let index = 0; index < lines.length; index++) {
@@ -830,6 +878,7 @@ async function readManagedSessionLog(
         );
       }
       foreignRecords++;
+      if (subtype === 'session_execution_engine') engineRecords++;
       continue;
     }
     const body = envelope['managedSession'];
@@ -840,6 +889,7 @@ async function readManagedSessionLog(
         );
       }
       header = parseManagedSessionHeader(body);
+      headerBytes = scanned;
       if (!managedSessionKeysEqual(header.sessionKey, sessionKey)) {
         throw new ManagedSessionRecordError(
           'session log header belongs to a different session.',
@@ -924,9 +974,11 @@ async function readManagedSessionLog(
     lastRecordUuid,
     activation,
     committedBytes,
+    headerBytes,
     uncommittedBytes: Buffer.byteLength(text, 'utf8') - committedBytes,
     uncommitted: pending.length + tornTail,
     foreignRecords,
+    engineRecords,
   };
 }
 
