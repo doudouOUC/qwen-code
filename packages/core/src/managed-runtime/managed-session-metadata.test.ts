@@ -8,7 +8,10 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { SessionService } from '../services/sessionService.js';
 import { SessionWriterLease } from '../services/session-writer-lease.js';
+import { Storage } from '../config/storage.js';
+import { isManagedSessionTranscriptSync } from '../utils/sessionStorageUtils.js';
 import { readManagedSessionTitleInfoSync } from '../utils/sessionStorageUtils.js';
 import { LocalManagedSessionAuthority } from './managed-session-authority.js';
 import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
@@ -23,7 +26,7 @@ afterEach(async () => {
   temporaryDirectories.clear();
 });
 
-const sessionId = 'session-1';
+const sessionId = '550e8400-e29b-41d4-a716-446655440000';
 const sessionKey = {
   tenantId: 'tenant-1',
   workspaceId: 'workspace-1',
@@ -290,5 +293,105 @@ describe('managed session metadata', () => {
       ),
     ).rejects.toThrow(/resource store is required/);
     await lease.release();
+  });
+});
+
+describe('legacy maintenance refuses a managed session', () => {
+  interface ProjectHarness {
+    projectRoot: string;
+    runtimeBaseDir: string;
+    transcriptPath: string;
+    service: SessionService;
+  }
+
+  async function createProject(): Promise<ProjectHarness> {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'qwen-managed-rn-'));
+    temporaryDirectories.add(root);
+    const projectRoot = path.join(root, 'project');
+    const runtimeBaseDir = path.join(root, 'runtime');
+    await fs.mkdir(projectRoot, { recursive: true });
+    await fs.mkdir(runtimeBaseDir, { recursive: true });
+    const storage = new Storage(projectRoot, runtimeBaseDir);
+    const transcriptPath = path.join(
+      storage.getProjectDir(),
+      'chats',
+      `${sessionId}.jsonl`,
+    );
+    await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+    return {
+      projectRoot,
+      runtimeBaseDir,
+      transcriptPath,
+      service: new SessionService(projectRoot, { runtimeBaseDir }),
+    };
+  }
+
+  it('refuses to rename a managed session and leaves it untouched', async () => {
+    const harness = await createProject();
+    const store = LocalManagedSessionResourceStore.create({
+      runtimeBaseDir: harness.runtimeBaseDir,
+      sessionKey,
+    });
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: harness.runtimeBaseDir,
+      sessionId,
+      transcriptPath: harness.transcriptPath,
+    });
+    await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey,
+      cwd: harness.projectRoot,
+      version: 'test',
+      resources: store,
+      create: {
+        definitionRef: await store.publish(
+          'managed-definition',
+          Buffer.from('{}', 'utf8'),
+        ),
+        rootSnapshotRef: await store.publish(
+          'managed-root',
+          Buffer.from('{}', 'utf8'),
+        ),
+        createdBy: 'daemon',
+      },
+    });
+    await lease.release();
+
+    expect(isManagedSessionTranscriptSync(harness.transcriptPath)).toBe(true);
+    const before = await fs.readFile(harness.transcriptPath, 'utf8');
+
+    await expect(
+      harness.service.renameSession(sessionId, 'Renamed by the legacy path'),
+    ).rejects.toThrow(/belongs to managed/);
+
+    /* The legacy path would have appended a custom_title record, standing up a
+       second title authority beside the committed session_metadata record. */
+    const after = await fs.readFile(harness.transcriptPath, 'utf8');
+    expect(after).toBe(before);
+    expect(after).not.toContain('custom_title');
+  });
+
+  it('still renames a legacy session', async () => {
+    const harness = await createProject();
+    await fs.writeFile(
+      harness.transcriptPath,
+      `${JSON.stringify({
+        uuid: 'legacy-1',
+        parentUuid: null,
+        sessionId,
+        timestamp: new Date().toISOString(),
+        type: 'user',
+        cwd: harness.projectRoot,
+      })}\n`,
+      'utf8',
+    );
+
+    expect(isManagedSessionTranscriptSync(harness.transcriptPath)).toBe(false);
+    await expect(
+      harness.service.renameSession(sessionId, 'Legacy rename'),
+    ).resolves.toBe(true);
+    expect(await fs.readFile(harness.transcriptPath, 'utf8')).toContain(
+      'custom_title',
+    );
   });
 });

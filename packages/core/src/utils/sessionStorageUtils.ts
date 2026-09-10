@@ -534,6 +534,42 @@ function lastLineContaining(text: string, marker: string): string | undefined {
 }
 
 /**
+ * True when the transcript carries a Managed Session header.
+ *
+ * A positive identification, unlike the execution-engine reader, which reports
+ * `unavailable` for any transcript with a completeness diagnostic and so cannot
+ * gate legacy-only operations without regressing legacy sessions.
+ */
+export function isManagedSessionTranscriptSync(
+  filePath: string,
+  scratchBuffer?: Buffer,
+): boolean {
+  let fd: number | undefined;
+  try {
+    const fileSize = fs.statSync(filePath).size;
+    if (fileSize === 0) return false;
+    fd = fs.openSync(filePath, getReadOpenFlags());
+    const buffer =
+      scratchBuffer && scratchBuffer.length >= LITE_READ_BUF_SIZE
+        ? scratchBuffer
+        : Buffer.alloc(LITE_READ_BUF_SIZE);
+    const length = Math.min(fileSize, LITE_READ_BUF_SIZE);
+    const read = fs.readSync(fd, buffer, 0, length, 0);
+    return buffer.toString('utf-8', 0, read).includes(MANAGED_HEADER_MARKER);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+}
+
+/**
  * Managed sessions keep their title in a committed `session_metadata` domain
  * record whose body lives in the resource store, so the legacy scan for a
  * `custom_title` record finds nothing and would report a blank title.

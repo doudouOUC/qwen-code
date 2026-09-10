@@ -41,6 +41,7 @@ import { readRuntimeStatus } from '../utils/runtimeStatus.js';
 import {
   LITE_READ_BUF_SIZE,
   readLastJsonStringFieldSync,
+  isManagedSessionTranscriptSync,
   readManagedSessionTitleInfoSync,
   readSessionTitleInfoFromFileSync,
 } from '../utils/sessionStorageUtils.js';
@@ -67,6 +68,7 @@ import {
 } from './session-transcript-reader.js';
 import {
   assertSessionExecutionEngine,
+  SessionExecutionEngineError,
   type SessionExecutionEngineState,
 } from './session-execution-engine.js';
 import {
@@ -3351,6 +3353,20 @@ export class SessionService {
         !(await this.sessionBelongsToCurrentProject(sessionId, records[0].cwd))
       ) {
         return false;
+      }
+
+      // Appending a custom_title record to a Managed session would stand up a
+      // second title authority beside its committed session_metadata record and
+      // would touch the transcript outside its writer. Managed renames go
+      // through the authority, so refuse here and say why. Identified from the
+      // header rather than the execution-engine reader, which reports
+      // `unavailable` for any transcript with a completeness diagnostic and
+      // would therefore also reject legacy sessions that rename fine today.
+      if (isManagedSessionTranscriptSync(filePath)) {
+        throw new SessionExecutionEngineError(
+          sessionId,
+          'belongs to managed, rename must go through its session authority',
+        );
       }
 
       // Read the last record's UUID so the custom_title record is properly
