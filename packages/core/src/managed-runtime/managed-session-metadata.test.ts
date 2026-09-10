@@ -296,7 +296,7 @@ describe('managed session metadata', () => {
   });
 });
 
-describe('legacy maintenance refuses a managed session', () => {
+describe('legacy maintenance on a managed session', () => {
   interface ProjectHarness {
     projectRoot: string;
     runtimeBaseDir: string;
@@ -369,6 +369,54 @@ describe('legacy maintenance refuses a managed session', () => {
     const after = await fs.readFile(harness.transcriptPath, 'utf8');
     expect(after).toBe(before);
     expect(after).not.toContain('custom_title');
+  });
+
+  it('removes the private resources when the session is deleted', async () => {
+    const harness = await createProject();
+    const store = LocalManagedSessionResourceStore.create({
+      runtimeBaseDir: harness.runtimeBaseDir,
+      sessionKey,
+    });
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: harness.runtimeBaseDir,
+      sessionId,
+      transcriptPath: harness.transcriptPath,
+    });
+    const authority = await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey,
+      cwd: harness.projectRoot,
+      version: 'test',
+      resources: store,
+      create: {
+        definitionRef: await store.publish(
+          'managed-definition',
+          Buffer.from('{}', 'utf8'),
+        ),
+        rootSnapshotRef: await store.publish(
+          'managed-root',
+          Buffer.from('{}', 'utf8'),
+        ),
+        createdBy: 'daemon',
+      },
+    });
+    await authority.commitDomainRecord(
+      renameCommand('cmd-rename-1'),
+      {
+        domain: 'session_metadata',
+        content: { title: 'Doomed session', titleSource: 'manual' },
+      },
+      { class: 'trusted_entry' },
+    );
+    await lease.release();
+
+    await expect(fs.stat(store.sessionRoot)).resolves.toBeDefined();
+
+    await expect(harness.service.removeSession(sessionId)).resolves.toBe(true);
+
+    await expect(fs.stat(harness.transcriptPath)).rejects.toThrow();
+    /* Leaving these behind would orphan every event body the session wrote. */
+    await expect(fs.stat(store.sessionRoot)).rejects.toThrow();
   });
 
   it('still renames a legacy session', async () => {

@@ -42,6 +42,7 @@ import {
   LITE_READ_BUF_SIZE,
   readLastJsonStringFieldSync,
   isManagedSessionTranscriptSync,
+  managedSessionResourceRoot,
   readManagedSessionTitleInfoSync,
   readSessionTitleInfoFromFileSync,
 } from '../utils/sessionStorageUtils.js';
@@ -1560,6 +1561,19 @@ export class SessionService {
     );
   }
 
+  /**
+   * A Managed session stores its event bodies -- prompt content, domain records
+   * -- as resources under its own directory, so removing only the transcript
+   * would orphan them. Workspace-owned resources live under a separate root and
+   * are deliberately untouched.
+   */
+  private removeManagedSessionResources(sessionId: string): void {
+    fs.rmSync(
+      managedSessionResourceRoot(this.storage.getRuntimeBaseDir(), sessionId),
+      { recursive: true, force: true },
+    );
+  }
+
   private async removeSessionOrganization(
     sessionId: string,
     assertCleanupOwned?: () => void,
@@ -2963,6 +2977,8 @@ export class SessionService {
     this.removePromptLedgers(sessionId);
     assertCleanupOwned?.();
     this.removeFileHistoryBackups(sessionId);
+    assertCleanupOwned?.();
+    this.removeManagedSessionResources(sessionId);
   }
 
   private async removeSessionFiles(sessionId: string): Promise<boolean> {

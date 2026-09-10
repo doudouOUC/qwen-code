@@ -516,10 +516,21 @@ export function managedSessionResourceRoot(
   runtimeBaseDir: string,
   sessionId: string,
 ): string {
-  if (sessionId.length === 0 || sessionId !== path.basename(sessionId)) {
+  if (!isSinglePathSegment(sessionId)) {
     throw new Error('sessionId must be a single path segment.');
   }
   return path.join(runtimeBaseDir, 'resources', sessionId);
+}
+
+/**
+ * Checked directly rather than through `path.basename` so the guard holds even
+ * where `node:path` is stubbed, and so it cannot be weakened by a platform's
+ * separator handling.
+ */
+export function isSinglePathSegment(value: string): boolean {
+  return (
+    value.length > 0 && !/[/\\]/.test(value) && value !== '.' && value !== '..'
+  );
 }
 
 const MANAGED_HEADER_MARKER = '"subtype":"managed_session_header_v1"';
@@ -636,8 +647,8 @@ export function readManagedSessionTitleInfoSync(
       return {};
     }
     if (
-      ref.kind !== path.basename(ref.kind) ||
-      ref.resourceId !== path.basename(ref.resourceId)
+      !isSinglePathSegment(ref.kind) ||
+      !isSinglePathSegment(ref.resourceId)
     ) {
       return {};
     }
