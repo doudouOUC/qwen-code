@@ -56,6 +56,8 @@ function record(overrides: Partial<ChatRecord>): ChatRecord {
 
 interface Harness {
   sink: ManagedSessionRecordSink;
+  authority: LocalManagedSessionAuthority;
+  store: LocalManagedSessionResourceStore;
   transcriptPath: string;
   runtimeBaseDir: string;
   close(): Promise<void>;
@@ -137,6 +139,8 @@ async function createHarness(): Promise<Harness> {
       class: 'harness',
       activation: { activationId: 'act-1', epoch: 1 },
     })),
+    authority,
+    store,
     transcriptPath,
     runtimeBaseDir,
     close: () => authority.close(),
@@ -172,7 +176,6 @@ describe('managed session record sink', () => {
     const unmapped = [
       'goal_state',
       'chat_compression',
-      'turn_result',
       'file_history_snapshot',
     ] as const;
     for (const subtype of unmapped) {
@@ -225,6 +228,54 @@ describe('managed session record sink', () => {
       ),
     ).toEqual({ title: 'Recorded title', source: 'manual' });
     expect(await harness.sink.project()).toEqual([]);
+  });
+
+  it('settles the turn instead of projecting the result as a message', async () => {
+    const harness = await createHarness();
+    const result = record({
+      uuid: 'rec-turn-1',
+      type: 'system',
+      subtype: 'turn_result',
+      systemPayload: {
+        promptId: 'turn-1',
+        state: 'completed',
+        stopReason: 'end_turn',
+      },
+    } as Partial<ChatRecord>);
+    await harness.sink.write(result);
+
+    const settled = harness.authority
+      .readEvents()
+      .filter((event) => event.kind === 'turn.settled');
+    expect(settled).toHaveLength(1);
+    expect(settled[0].payload['turnId']).toBe('turn-1');
+    expect(settled[0].payload['outcome']).toBe('completed');
+    expect(settled[0].payload['stopReason']).toBe('end_turn');
+
+    /* The terminal state is an event, not message content. */
+    expect(await harness.sink.project()).toEqual([]);
+
+    /* The whole record is retained, so error detail and timings survive. */
+    const body = await harness.store.read(
+      settled[0].payload['resultRef'] as never,
+    );
+    expect(JSON.parse(body.toString('utf8'))).toEqual(result);
+    await harness.close();
+  });
+
+  it('refuses a turn result with no prompt id or state', async () => {
+    const harness = await createHarness();
+    await expect(
+      harness.sink.write(
+        record({
+          uuid: 'rec-turn-bad',
+          type: 'system',
+          subtype: 'turn_result',
+          systemPayload: { state: 'completed' },
+        } as Partial<ChatRecord>),
+      ),
+    ).rejects.toThrow(ManagedSessionUnmappedRecordError);
+    await harness.close();
   });
 
   it('refuses an unmapped record instead of appending it directly', async () => {

@@ -52,7 +52,7 @@ export class ManagedSessionRecordSink {
 
   constructor(
     private readonly authority: LocalManagedSessionAuthority,
-    resources: LocalManagedSessionResourceStore,
+    private readonly resources: LocalManagedSessionResourceStore,
     /** Supplied by the binder, which is the only party that knows the activation. */
     private readonly actor: () => ManagedSessionActor,
   ) {
@@ -62,6 +62,7 @@ export class ManagedSessionRecordSink {
   canCarry(record: ChatRecord): boolean {
     if (record.type === 'system') {
       if (record.subtype === 'custom_title') return true;
+      if (record.subtype === 'turn_result') return true;
       return (
         record.subtype !== undefined &&
         CARRIED_SYSTEM_SUBTYPES.has(record.subtype)
@@ -88,6 +89,10 @@ export class ManagedSessionRecordSink {
     }
     if (record.subtype === 'custom_title') {
       await this.commitTitle(record);
+      return;
+    }
+    if (record.subtype === 'turn_result') {
+      await this.commitTurnSettled(record);
       return;
     }
     this.sequence += 1;
@@ -134,6 +139,74 @@ export class ManagedSessionRecordSink {
         },
       },
       { class: 'trusted_entry' },
+    );
+  }
+
+  /**
+   * A turn result is the turn's terminal state, so it is committed as
+   * `turn.settled` rather than projected as a message. The whole record becomes
+   * the result body, which keeps the error detail and timings the payload
+   * carries beyond the fields the event indexes.
+   */
+  private async commitTurnSettled(record: ChatRecord): Promise<void> {
+    const payload = record.systemPayload as
+      | { promptId?: unknown; state?: unknown; stopReason?: unknown }
+      | undefined;
+    const turnId = payload?.promptId;
+    const outcome = payload?.state;
+    if (
+      typeof turnId !== 'string' ||
+      turnId.length === 0 ||
+      typeof outcome !== 'string' ||
+      outcome.length === 0
+    ) {
+      throw new ManagedSessionUnmappedRecordError(record);
+    }
+    const resultRef = await this.resources.publish(
+      'managed-turn-result',
+      Buffer.from(JSON.stringify(record), 'utf8'),
+    );
+    const actor = this.actor();
+    const held = actor.activation;
+    await this.authority.appendExecution(
+      {
+        operation: 'settleTurn',
+        commandId: `recorder:${record.uuid}`,
+        sessionKey: this.authority.sessionHeader.sessionKey,
+        contentDigest: resultRef.digest,
+      },
+      [
+        {
+          v: 1,
+          sequence: this.authority.committedSequence + 1,
+          eventId: `turn:${turnId}`,
+          sessionKey: this.authority.sessionHeader.sessionKey,
+          kind: 'turn.settled',
+          occurredAt: Date.parse(record.timestamp) || Date.now(),
+          ...(actor.class === 'harness' && held !== undefined
+            ? {
+                subject: {
+                  type: 'activation',
+                  scopeId: held.activationId,
+                  activationId: held.activationId,
+                  epoch: held.epoch,
+                },
+              }
+            : {}),
+          payload: {
+            turnId,
+            outcome,
+            stopReason:
+              typeof payload?.stopReason === 'string'
+                ? payload.stopReason
+                : null,
+            resultRef,
+            usageRef: null,
+            pendingOwnersRef: null,
+          },
+        },
+      ],
+      actor,
     );
   }
 
