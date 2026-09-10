@@ -1,6 +1,6 @@
 # Managed Harness：完整 Agent 的装配与可恢复执行
 
-更新日期：2026-09-10；源码基线 `a8360814668b3dfdff72ad3d99cbcaf26dd009a9`，前一版文档 `4dc4a90dcc`。本文是待实现的 Harness 专项设计，配合[全局架构](managed-agent-session-harness-runtime.md)、[私有协议](managed-agent-control-protocol.md)、[coordinator](managed-agent-coordinator.md)及[Session 兼容方案](managed-agent-session-compatibility.md)。新增接口和恢复能力尚未实现，本轮不改变生产行为。
+更新日期：2026-09-11；源码基线 `a8360814668b3dfdff72ad3d99cbcaf26dd009a9`，前一版文档 `4dc4a90dcc`。本文是待实现的 Harness 专项设计，配合[全局架构](managed-agent-session-harness-runtime.md)、[私有协议](managed-agent-control-protocol.md)、[coordinator](managed-agent-coordinator.md)及[Session 兼容方案](managed-agent-session-compatibility.md)。新增接口和恢复能力尚未实现，本轮不改变生产行为。
 
 ## 1. 首版实现与依赖边界
 
@@ -8,7 +8,7 @@ Harness 复用完整 `QwenAgent → Session → LlmChat` 模型路径及既有�
 
 一个物理/进程内 ACP host 可以承载多个 Session，逻辑 Harness handle 只绑定一次 activation。Factory 可借用原 channel/host 池，但不另起与 Bridge slot/ProcessRegistry 重复的容量账本。一个 handle detach 不能 kill 整个共享 host；物理 host 的最终 teardown 由原资源 owner 在所有引用排空后执行。
 
-本设计的 Harness 是**有状态**组件，恢复走 checkpoint 续跑，不是无状态实例重放事件日志重建执行状态——理由与代价见[全局架构](managed-agent-session-harness-runtime.md)§7。这决定了本专项的两条硬约束：替换 handle 只能在 §3 的已提交安全点进行，不能在任意时刻杀掉重建；`HarnessCheckpoint` 的九组字段是恢复必需资产，缺失或损坏即恢复失败，不是可选优化。阅读时不要按 Anthropic 公开架构中的无状态 Harness 推断本专项能力。
+Harness 在运行中持有 Agent 执行状态，continuation 续跑依赖持久 checkpoint，不能仅重放展示消息重建执行。需要保留的状态经 Session 外置，使用 checkpoint 不等于要求原 handle 永久存活；可恢复范围由已提交状态和原调用证明决定，见[全局架构](managed-agent-session-harness-runtime.md)§7。合作式替换须到 §3 的安全点；崩溃后从最后已验证 checkpoint 对账，不能任意 token 精确续流。已引用 checkpoint 的九组状态缺失/损坏即 blocked；新建或已提交历史维护的合法无 checkpoint 起点按存储 §2.2 初始化，不与损坏降级混同。
 
 | 注入依赖                   | owner 与要求                                                                                                                          |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -70,6 +70,8 @@ stateDiagram-v2
 
 checkpoint 复用 SessionRestoreProjection 的已提交数据/引用，另外保存 continuation 必需状态，不克隆整个运行对象。它覆盖的 sequence 不得超过 authority 已提交位置；所有 durable_wait 引用必须已受控保存。无字段依据或不能重建时拒绝该安全点，不用默认空队列/零预算补齐。
 
+Factory 必须校验 RestoreBundle 的 `restoreBasis/restoreProofRef/checkpointRef`，唯一分型与字段规则见[存储 §2.2](managed-agent-session-storage.md#22-恢复基础与空检查点)。initial 或合法 history_rewind/history_copy/format_upgrade 起点允许 null；Harness 在获得有效 activation 后初始化完整状态，先提交 before_model checkpoint（boundary=null），再运行原 Agent。null 不承接未决工具/审批，也不允许为丢失 checkpoint、坏资源或未知作用域清空历史与预算。初始化不新增 HarnessBoundary 分型；之后的合作式 detach 仍须已有完整 boundary receipt。
+
 | 分组                | v1 必需内容                                                                                                                                                      | 恢复规则                                                                                             |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | 身份与版本          | schemaVersion、SessionKey、engine、checkpointId、coveredSequence、原 activation/turn/prompt、definition/config revision、输入摘要                                | 校验所属 workspace 与持久 engine；本次新 grant 与原执行引用分开                                      |
@@ -117,17 +119,18 @@ Session close 的完整顺序由 coordinator 文档约束。关闭共享 host �
 
 ## 7. 实施与验收
 
-| 编号 | 实施/故障场景                                                     | 完成证据                                                                                                                                                                                                                                       |
-| ---- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| H01  | 完整普通 turn 到 A/D 安全点后更换 handle/host                     | 原 history/owner/config 与后续轮次保留，仅一套完整 Agent 模型循环                                                                                                                                                                              |
-| H02  | partial tool-call 流错误、retry、无 provider callId、路由恢复失败 | 正式历史与实际结果相符，稳定调用 ID 不变，未提交 partial 不派发工具，未知配置明确阻塞                                                                                                                                                          |
-| H03  | 等待权限/问答时 detach，重复/迟到/改参/无客户端答复               | 旧 waiter 不误取消原请求，原合法最终决定持久后才授权；AskUserQuestion 和一般权限分别验收                                                                                                                                                       |
-| H04  | 原工具正在写/已写而 ACK 丢失时替换 Harness                        | 原 PID/Runtime ID/invocation/history owner 保持，结果按原引用消费；保证是**原 invocation 不被二次派发**（at-most-once 派发），不是外部副作用 exactly-once——见[私有协议](managed-agent-control-protocol.md)§5；杀 worker 的未知场景另行 blocked |
-| H05  | 并行 Agent 批次部分完成、父 child 工作、原结果提交失败            | 保持 batch ordinal、未决 refs 与父快照，不提前发模型下一步或回收唯一资源                                                                                                                                                                       |
-| H06  | 用户抢占 cron/通知、Goal permit/mid-turn 恢复                     | 队列和停止预算不复位，输入不重复或丢失；延期用途继续固定 legacy                                                                                                                                                                                |
-| H07  | 同 host sibling Session 存活，detach/close/reload 分别执行        | 单 handle 脱离不杀 sibling，终结仍实际取消/排空；清理失败保留责任和真实容量                                                                                                                                                                    |
+| 编号 | 实施/故障场景                                                         | 完成证据                                                                                                                                                                                                                                       |
+| ---- | --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| H01  | 完整普通 turn 到 A/D 安全点后更换 handle/host                         | 原 history/owner/config 与后续轮次保留，仅一套完整 Agent 模型循环                                                                                                                                                                              |
+| H02  | partial tool-call 流错误、retry、无 provider callId、路由恢复失败     | 正式历史与实际结果相符，稳定调用 ID 不变，未提交 partial 不派发工具，未知配置明确阻塞                                                                                                                                                          |
+| H03  | 等待权限/问答时 detach，重复/迟到/改参/无客户端答复                   | 旧 waiter 不误取消原请求，原合法最终决定持久后才授权；AskUserQuestion 和一般权限分别验收                                                                                                                                                       |
+| H04  | 原工具正在写/已写而 ACK 丢失时替换 Harness                            | 原 PID/Runtime ID/invocation/history owner 保持，结果按原引用消费；保证是**原 invocation 不被二次派发**（at-most-once 派发），不是外部副作用 exactly-once——见[私有协议](managed-agent-control-protocol.md)§5；杀 worker 的未知场景另行 blocked |
+| H05  | 并行 Agent 批次部分完成、父 child 工作、原结果提交失败                | 保持 batch ordinal、未决 refs 与父快照，不提前发模型下一步或回收唯一资源                                                                                                                                                                       |
+| H06  | 用户抢占 cron/通知、Goal permit/mid-turn 恢复                         | 队列和停止预算不复位，输入不重复或丢失；延期用途继续固定 legacy                                                                                                                                                                                |
+| H07  | 同 host sibling Session 存活，detach/close/reload 分别执行            | 单 handle 脱离不杀 sibling，终结仍实际取消/排空；清理失败保留责任和真实容量                                                                                                                                                                    |
+| H08  | 新建首轮前冷恢复、合法历史维护无 checkpoint；对照丢失/损坏 checkpoint | 合法起点先提交 before_model checkpoint 再完成 Read/final，保留选定历史和预算；非法 null/残留 continuation 阻塞，旧工具不重跑，维护 owner 不冒充 Harness 提交检查点                                                                             |
 
-**正向门槛。** H01～H07 每条都必须同时给出应当成功的对照用例并观测到实际继续执行，不能只验证“拒绝/阻塞”分支：H02 路由恢复成功的分支要真的用同一稳定调用 ID 派发并完成该工具；H03 合法最终决定持久后必须真的授权原调用并推进模型，不能停在等待；H04 的对照是原回执可按原引用取回并被模型消费（未知场景才 blocked）；H05 部分完成的批次在剩余结果到达后必须完成整批并回到父作用域；H06 抢占后原队列必须继续执行到终态；H07 单 handle detach 后原 Session 必须能由新 handle 继续。**对任何输入都返回 `recovery_blocked` 的实现视为验收不通过**——保守阻塞是未知场景的正确结果，不是全部场景的合格结果。每条记录写明正向用例的观测点（已提交 boundary、消费的回执、客户端可见终态）。
+**正向门槛。** H01～H08 每条都必须同时给出应当成功的对照用例并观测到实际继续执行，不能只验证“拒绝/阻塞”分支：H02 路由恢复成功的分支要真的用同一稳定调用 ID 派发并完成该工具；H03 合法最终决定持久后必须真的授权原调用并推进模型，不能停在等待；H04 的对照是原回执可按原引用取回并被模型消费（未知场景才 blocked）；H05 部分完成的批次在剩余结果到达后必须完成整批并回到父作用域；H06 抢占后原队列必须继续执行到终态；H07 单 handle detach 后原 Session 必须能由新 handle 继续。**对任何输入都返回 `recovery_blocked` 的实现视为验收不通过**——保守阻塞是未知场景的正确结果，不是全部场景的合格结果。每条记录写明正向用例的观测点（已提交 boundary、消费的回执、客户端可见终态）。
 
 R2.S1 先交付 Session client、唯一 writer、稳定工具身份及提交记录；R2.S2 接 Factory、基础 activation 门禁和 A/D 安全点，验证旧 handle 已排空再替换；R2.S3 再接 B/C 的持久等待、在途门禁交接和原调用接管。基础门禁不能等到 S3 才接，否则 S2 的 RunnableGrant 与跨 host 替换缺少执行端证明。完整可恢复 child/后台、MCP/Hooks/Channels、Skills/本地初始化与完整媒体等按原后置阶段逐项验收；已实现功能不因本次抽象被删掉。不支持的等待必须有明确驻留/阻塞策略，不能空实现后报告恢复成功。
 

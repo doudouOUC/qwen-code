@@ -1,6 +1,6 @@
 # Managed Agent 全量设计与交付覆盖表
 
-更新日期：2026-09-10；生产源码基线 `a836081466`，上一轮核心设计 `4cacfbd0ed`。本稿将 daemon 默认替换的 C01～C18 全部纳入详细设计，包括原先延期能力。设计覆盖、源码实现、产品验收分别记录；本轮只交付设计，不改变首阶段默认启用范围、不重跑历史产品、不操作当前预览或用户数据。
+更新日期：2026-09-11；生产源码基线 `a836081466`，上一轮核心设计 `4cacfbd0ed`。本稿将 daemon 默认替换的 C01～C18 全部纳入详细设计，包括原先延期能力。设计覆盖、源码实现、产品验收分别记录；本轮只交付设计，不改变首阶段默认启用范围、不重跑历史产品、不操作当前预览或用户数据。
 
 ## 1. 完整目标与边界
 
@@ -10,7 +10,7 @@
 
 两条全局口径与上面的目标边界同级，各专项不得各自放宽：
 
-- **恢复模型是 checkpoint 续跑，不是无状态 Harness 重放事件日志。** 因为 Harness 复用完整 Agent，其内部执行状态无法由已提交事件唯一确定；checkpoint 因此是恢复必需资产，替换 handle 只能在已提交安全点进行。理由、代价与不选另一模型的判据见[全局架构](managed-agent-session-harness-runtime.md)§7。
+- **执行 continuation 依赖 checkpoint 与原回执恢复。** 仅有展示/领域事件不能重建完整 Agent 内部状态；已引用 checkpoint 缺失或损坏时必须阻塞。新建及已提交历史维护的合法无 checkpoint 起点采用存储 §2.2 的初始化分型，不是失败降级。状态外置后不要求原 handle 永久存活，合作式替换仍须安全点，崩溃恢复须核验原调用。理由与范围见[全局架构](managed-agent-session-harness-runtime.md)§7。
 - **执行保证是 at-most-once 派发，不是外部副作用 exactly-once。** 派发次数由稳定 executionCallId、门禁与回执去重控制且可证明；某次已派发操作在外部世界发生几次不可观测，started 无终态一律保持未知。见[私有协议](managed-agent-control-protocol.md)§5。
 
 首版可恢复范围限于原 coordinator 与原 Runtime binding 存活时更换 Harness；daemon/worker 自身重启后的未决副作用保持 recovery_blocked，跨进程接管所需的持久 binding 与门禁账本属于[恢复与运行](managed-agent-recovery-operations.md)的后续切片。
@@ -64,7 +64,7 @@
 | 自动fresh child回执不明                | 持久run/outbox+目标runId接收去重；不明先查原目标，只有证明未受理才能切换原回父路径                                                                  |
 | MCP/Hook/Skill边界与热变更             | 各域有明确definition/binding revision和执行owner；新调用采新有效版本，已批准/在途调用保留原版本，撤信任立即封工作                                   |
 | worker/daemon重启                      | 独立持久RuntimeReceiptStore和phase状态；原settled恢复、原running认证attach、unknown明确blocked；工具专用reconcile不等于任意重跑                     |
-| fork/rewind/跨engine转换               | checkpoint边界、维护排他和资源闭包；转换创建新ID，物理回滚逐文件记录和可核验恢复；不原地改engine或掩盖部分失败                                      |
+| fork/rewind/跨engine转换               | 已验证历史/检查点边界、维护排他和资源闭包；合法 null 起点遵守存储 §2.2，转换创建新ID，物理回滚逐文件记录和可核验恢复；不原地改engine或掩盖部分失败  |
 | Windows/Linux与性能                    | 原生process owner后端、存储profile和失败返回已定；固定基准方法及验收阈值，未实现/不合格profile不启用默认                                            |
 
 这些决定不是对不可证明效果的保证。unknown、unsupported、部分失败是有定义的结果，需要完整客户端呈现和恢复操作；不得在全量覆盖表中把它们写成“执行成功”。

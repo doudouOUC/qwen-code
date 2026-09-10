@@ -1,6 +1,6 @@
 # Managed daemon 默认实现：首阶段实施计划
 
-更新日期：2026-09-10；代码核对基线 `a836081466`。完整范围与 C01～C18 能力/入口/状态/验收总表见[默认替换总方案](../design/managed-agent-daemon-default.md)，三层责任与接口见[Session / Harness / Runtime 全局架构](../design/managed-agent-session-harness-runtime.md)。历史 D1～D5 不再单独决定当前执行顺序。用户最新要求补齐[全量详细设计](../design/managed-agent-full-design.md)，本轮不开始实现。后续在保留当前 4170 预览、用户数据和已验证能力的前提下，先抽出权威 Session 服务并接入完整 Harness，再完成创建时的兼容选择与普通 factory，让兼容范围明确的新 daemon 会话使用 Managed 默认实现。保持现有 Agent 行为，不把局部验收扩大为全部默认替换完成。
+更新日期：2026-09-11；代码核对基线 `a836081466`。完整范围与 C01～C18 能力/入口/状态/验收总表见[默认替换总方案](../design/managed-agent-daemon-default.md)，三层责任与接口见[Session / Harness / Runtime 全局架构](../design/managed-agent-session-harness-runtime.md)。历史 D1～D5 不再单独决定当前执行顺序。用户最新要求补齐[全量详细设计](../design/managed-agent-full-design.md)，本轮不开始实现。后续在保留当前 4170 预览、用户数据和已验证能力的前提下，先抽出权威 Session 服务并接入完整 Harness，再完成创建时的兼容选择与普通 factory，让兼容范围明确的新 daemon 会话使用 Managed 默认实现。保持现有 Agent 行为，不把局部验收扩大为全部默认替换完成。
 
 ## 当前优先顺序
 
@@ -49,6 +49,8 @@ M1 已交付；PDF 物理取消已在五阶段真实基线中复现并修复。R
 施工按三份专项细化：[Harness](../design/managed-agent-harness.md)定义完整循环与九组 checkpoint；[私有协议](../design/managed-agent-control-protocol.md)定义消息、文件同步 ACK、activation 安装、原调用结算和引用保留；[coordinator](../design/managed-agent-coordinator.md)定义单一 authority 调度与四处装配。R2.S1 将 activation 事实并入 authority，以窄适配复用 scheduler，保留实验 store；输入与唤醒一起提交。R2.S2 先实现 A/D 安全点、基础 activation 门禁及完整 Agent 读写，排空旧 handle 后再替换；禁止绕过实际 ACP Session→LlmChat/runTool 的接缝。R2.S3 再实现 B/C 工具和审批等待，在同一 installing/stage/enable/revoke 协议上支持在途交接、原 Runtime 接管与可恢复 detach；handler 返回不得再等同 turn 完成。
 
 [存储格式与限额](../design/managed-agent-session-storage.md)本轮已补齐 schema 3 锁与就地升级顺序、资源仓库与 `DurableRef` 的落盘形态、事件 union 的封闭集与扩展规则、写入/fsync 预算及新增验收；但平台文件同步与崩溃证据仍须在编码阶段取得，取得前不按“已定稿”引用它来关闭存储风险。编码按此实现 schema/validator、实际接线并取得平台文件同步/崩溃证据。恢复首版限定 coordinator 和原 worker 存活时替换 Harness；worker/daemon 丢失且未决时保持 blocked，跨 worker 重启回执后端按[恢复与运行专项](../design/managed-agent-recovery-operations.md)单列后续实施。未取得恢复证明时保留现有 `recovery_ambiguous` 保护。
+
+2026-09-11 契约修订：存储 §3.1 统一 30 个全量 domain 的原名称，按实际 capability 启用子集；schema 3 通过旧 writer 已识别的 claim 屏障认证换锁，禁止先 release 变无锁；资源按 Session/workspace 实际 owner 保留，删除来源会话不删除配置或用户 pin；非工具确认由受控 requestAction 受理；RestoreBundle 区分 checkpoint 续跑与有完整证明的合法初始化。对应 S07～S12/H08 与各领域验收要求一起落实，文档静态一致性不等于运行时证明。R2.S1 先完成适用的 schema/资格/归属基础，R2.S2 验证初始 checkpoint 与完整 Harness，历史、自动化和扩展的正向用例仍随各自后续切片交付，不把全量注册表当提前接线。
 
 | 步骤                       | 本步产物                                                                                                      | 验收边界                                                                                                                                                           |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

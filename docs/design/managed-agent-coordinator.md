@@ -1,6 +1,6 @@
 # Managed coordinator：调度、装配与关闭
 
-更新日期：2026-09-10；核对源码基线 `a8360814668b3dfdff72ad3d99cbcaf26dd009a9`，前一版文档 `4dc4a90dcc`。本文是待实现设计，细化[全局架构](managed-agent-session-harness-runtime.md)的调度与普通接入部分；配合[Harness](managed-agent-harness.md)、[私有协议](managed-agent-control-protocol.md)及[Session 兼容映射](managed-agent-session-method-map.md)。本轮不启动产品、不切换默认入口。
+更新日期：2026-09-11；核对源码基线 `a8360814668b3dfdff72ad3d99cbcaf26dd009a9`，前一版文档 `4dc4a90dcc`。本文是待实现设计，细化[全局架构](managed-agent-session-harness-runtime.md)的调度与普通接入部分；配合[Harness](managed-agent-harness.md)、[私有协议](managed-agent-control-protocol.md)及[Session 兼容映射](managed-agent-session-method-map.md)。本轮不启动产品、不切换默认入口。
 
 ## 1. 控制权与当前差距
 
@@ -33,8 +33,8 @@ coordinator 组合 Session authority、完整 Harness 和 Runtime provider，持
 1. 在普通入口沿用 Session ID reservation、workspace/directory gate、用途和固定 engine 检查。Managed 输入持久提交之前保留容量预留；已提交后即使队列索引写入或 HTTP ACK 丢失，也能从 wake intent 重建。
 2. 有空槽位时，从每个 Session 的可运行头部选择候选；保留跨 tenant 的公平轮转和总量限制（v1 的 `tenantId` 是 workspace 派生的本地键，该轮转实际按 workspace 生效，语义见[私有协议](managed-agent-control-protocol.md)§2）。队列项携带完整 sessionKey、turnId、wakeId、原因及所需已提交位置，不携带“无条件 replay_safe”承诺。
 3. authority 在单 writer 的条件提交内检查 Session 未关闭、候选仍可运行、没有有效推进者，创建带单调 epoch 的 installing activation。coordinator 对全部相关原 binding 执行 stageGate，关闭旧/新派发并取得已准入工作清单；authority 核对后提交 completeActivationInstall，再由 Runtime enableGate ACK 确认。部分成功按原安装 ID 查询重试；过期 lease 只触发恢复检查，不证明旧工具退出。
-4. 通过 HarnessFactory 获取逻辑 handle，校验定义版本、恢复包和私有协议能力；全部必要门禁 ACK 齐备才提供可运行 grant、Session client 与可信 Runtime dispatcher。能力不足明确失败，不能转回 legacy。没有工具请求时允许不创建 Runtime；首次惰性创建及新增 child 也必须先安装门禁，不能绕过激活检查。
-5. Harness `run` 到达明确 boundary。checkpoint、终态和等待记录由 Harness 自己发起（`commitCheckpoint`/`appendExecution`），authority 校验 fence 与引用闭包后提交；coordinator 不代为提交，只读取已提交回执。scheduler 只消费已提交的 boundary 回执，不能从 Promise resolve、host EOF 或 UI idle 推断 turn 完成。
+4. 通过 HarnessFactory 获取逻辑 handle，校验定义版本、恢复包的 restoreBasis/restoreProofRef/checkpointRef 合法组合与私有协议能力；全部必要门禁 ACK 齐备才提供可运行 grant、Session client 与可信 Runtime dispatcher。能力不足明确失败，不能转回 legacy。没有工具请求时允许不创建 Runtime；首次惰性创建及新增 child 也必须先安装门禁，不能绕过激活检查。
+5. Harness `run` 到达明确 boundary。执行消息由 Harness 经 appendExecution 提交，checkpoint/等待边界经 commitCheckpoint 提交；turn_complete 在该命令内与 turn.settled 同事务提交。authority 校验 fence、终态 payload 与引用闭包；coordinator 不代为提交，只读取已提交回执。scheduler 只消费已提交的 boundary 回执，不能从 Promise resolve、host EOF 或 UI idle 推断 turn 完成。
 6. durable_wait 按[Harness 专项](managed-agent-harness.md#6-detach-与终结实现约束)的唯一脱离顺序执行：先撤销该 activation 的新派发权并取得执行端 ACK、确认已准入调用与等待 owner 归 coordinator，**然后**由 Harness 提交 checkpoint/boundary，再 detach 逻辑 handle，最后记录 activation 释放并归还实际执行槽位；turn 仍等待。门禁必须早于 checkpoint，否则 checkpoint 提交期间仍可能产生新派发，使其覆盖范围失效。工具/审批回执即使早于释放到达，也由已提交状态对账生成下一候选，不丢唤醒。
 7. turn_complete 在正式终态提交后释放 activation；recovery_blocked 保留原调用和原因，撤销派发并停止该 Harness 后才释放可释放的计算资源。若停止/屏障无法证明，继续计入占用或隔离中的工作，不假装空闲。
 
