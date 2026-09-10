@@ -1,6 +1,6 @@
 # Managed Agent：Runtime invocation v2
 
-状态：阶段 1 的本地 macOS 验收通过；阶段 2 已接通 Core/ACP Session 调度、四类工具的生产注册与远端绑定，以及独立子作用域和持久父文件历史。子读写、读取隔离、后台跨父轮次、默认记忆实际写入和 cold load 五组真实验收通过，详见 [子任务与文件历史](managed-agent-child-scopes.md)。其余工具、初始化、物理历史操作和客户端兼容仍在实施，普通 daemon 默认实现尚未替换。
+状态更新：2026-09-10，源码复核基线 `a836081466`。阶段 1 的本地 macOS 验收与阶段 2 已记录的 Core/ACP 调度、独立子作用域、父文件历史结果保留；当前注册九种工具代理（Read/Write/Edit/Shell、Glob/可选 LS、Grep、NotebookEdit、Zoom），各自证据见[总方案能力表](managed-agent-daemon-default.md)及专项文档，不能将注册等同全部语义验收。四处普通默认入口与共同兼容 selector 尚未接线；当前先实施[首阶段计划](../plans/2026-09-09-managed-daemon-default.md)，MCP/Hooks/Channels 迁移及完整初始化/媒体/后台/历史能力后置。下文按切片保留当时结果，“四类工具”等指历史注册切片，不是当前总能力清单。
 
 目标是让普通 daemon 的完整 Agent 留在常驻 Gateway，并把工作区工具真实执行交给独立 Tool-only Runtime worker。保留现有权限、调度、客户端事件和结果语义；不能用只读工具集作为最终替换验收。
 
@@ -154,7 +154,7 @@ ReadFile 内部的 PDF 视觉转换也属于模型调用。Tool-only Session 的
 
 Remote provider 复用已认证 endpoint/lease，在 owned worker 的工具调用、文件历史和终结释放 v2 路由上保持同一 Session 身份。execute 只发送一次，丢失响应由代理通过原引用 status/cancel 恢复，不重发或降级 v1。AutoLocal 每 Session 保存一次 use/client；释放先封住新调用，等待远端 Session 关闭，再释放 use。若 worker 已丢失，则必须等待 activator 提供的真实进程退出结果；失败保留 retiring binding，阻止复用而允许清理重试。单个 Session 释放不应提前停止同 generation 的其他 Session。
 
-这一切片首先接通四种内置工具及完整 ACP host，不能据此声明默认迁移或完整初始化边界已经达成。该注册切片当时尚未接通子作用域；其后实现与验收见下文。Gateway 的文件/Skill/MCP/Hook 初始化、其他工具迁移及物理撤销仍需继续实现。父子 Agent 不能共享当前只允许单 prompt 的 Runtime client，也不能仅放开并发而破坏 FileHistory 快照。生产默认三处 channel factory 在这些功能与消费者验收完成后统一切换；真实验收必须通过 create/prompt 模型循环，禁止测试手工替换注册表冒充生产接线。
+这一切片首先接通四种内置工具及完整 ACP host，不能据此声明默认迁移或完整初始化边界已经达成。该注册切片当时尚未接通子作用域；其后实现与验收见下文。Gateway 的文件/Skill/MCP/Hook 初始化、其他工具迁移及物理撤销仍需继续实现。父子 Agent 不能共享当前只允许单 prompt 的 Runtime client，也不能仅放开并发而破坏 FileHistory 快照。当前改为先完成兼容配置与四处默认 factory 接线，在已验收范围有限启用，再按总方案逐项扩展；真实验收必须通过 create/prompt 模型循环，禁止测试手工替换注册表冒充生产接线。
 
 ### 完整 host 与默认记忆验收（2026-09-09）
 
@@ -196,4 +196,4 @@ macOS 五组真实完整 host 验收通过：A 父未用文件工具而子 Read/
 
 ## Glob 与可选 LS 后续接线
 
-[搜索工具方案](managed-agent-search-tools.md)在同一 v2 invocation 链加入 Glob/LS，共享原生声明且不在 Gateway 构造或执行这两个本地工具。已有 bind-history DTO 增加可选执行上下文，实际新 producer 总是携带父子各自的目录、过滤、记忆根和 LS opt-in；Runtime 派生视图执行并保持原权限与共享父历史。macOS 四组真实搜索验收和既有子任务 prior-read 回归通过。没有新增公共路由或宽松 fallback；未识别上下文的旧 worker 明确报错。配置热更新、其他工具、完整初始化及三处默认 factory 替换继续实施。
+[搜索工具方案](managed-agent-search-tools.md)在同一 v2 invocation 链加入 Glob/LS，共享原生声明且不在 Gateway 构造或执行这两个本地工具。已有 bind-history DTO 增加可选执行上下文，实际新 producer 总是携带父子各自的目录、过滤、记忆根和 LS opt-in；Runtime 派生视图执行并保持原权限与共享父历史。macOS 四组真实搜索验收和既有子任务 prior-read 回归通过。没有新增公共路由或宽松 fallback；未识别上下文的旧 worker 明确报错。后续 Grep、NotebookEdit、媒体 M1/PDF 物理取消已有各自限定验收；配置热更新、其余工具、本地初始化和物理历史仍须补齐。三处 workspace factory 加自有嵌入入口共四处，当前按首阶段计划接入，不将后置能力作为有限启用的无条件前置。
