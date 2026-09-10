@@ -58,6 +58,27 @@ export interface ManagedSessionActor {
   };
 }
 
+/**
+ * Which basis a Harness may resume from. `blocked` is a real outcome, not an
+ * error path: execution continuation depends on a checkpoint, so a session that
+ * has model or tool history but no checkpoint must not silently restart from an
+ * older state or an empty history.
+ */
+export type ManagedSessionRestoreBasis = 'checkpoint' | 'initial' | 'blocked';
+
+export interface ManagedSessionCheckpoint {
+  readonly checkpointId: string;
+  readonly coveredSequence: number;
+  readonly previousCheckpointId: string | null;
+  readonly stateRef: ManagedSessionDurableRef;
+  readonly boundary: string | null;
+}
+
+export interface ManagedSessionCheckpointReceipt {
+  readonly receipt: ManagedSessionCommitReceipt;
+  readonly checkpoint: ManagedSessionCheckpoint;
+}
+
 export interface ManagedSessionDomainReceipt {
   readonly receipt: ManagedSessionCommitReceipt;
   readonly recordRef: ManagedSessionDurableRef;
@@ -170,6 +191,8 @@ export class LocalManagedSessionAuthority {
   private writeFailure: Error | undefined;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly eventIds = new Set<string>();
+  private checkpoint: ManagedSessionCheckpoint | undefined;
+  private hasContinuation = false;
   private readonly domainRecords = new Map<
     string,
     { revision: number; recordRef: ManagedSessionDurableRef }
@@ -277,6 +300,7 @@ export class LocalManagedSessionAuthority {
       if (event.kind === 'domain.committed') {
         authority.recordDomainEvent(event);
       }
+      authority.recordRecoveryFacts(event);
     }
     return authority;
   }
@@ -458,6 +482,102 @@ export class LocalManagedSessionAuthority {
         events.map(() => actor),
       ),
     );
+  }
+
+  /** The newest committed checkpoint, if the session has one. */
+  get latestCheckpoint(): ManagedSessionCheckpoint | undefined {
+    return this.checkpoint;
+  }
+
+  /**
+   * Decides what a Harness may resume from, per the storage spec's closed set.
+   * The authority decides this; a Harness must not pick a weaker basis for
+   * itself.
+   */
+  restoreBasis(): ManagedSessionRestoreBasis {
+    if (this.checkpoint !== undefined) return 'checkpoint';
+    return this.hasContinuation ? 'blocked' : 'initial';
+  }
+
+  /**
+   * Publishes the Harness state and commits the checkpoint that covers the log
+   * up to this point. `boundary` is null for the first checkpoint a legitimate
+   * initialisation establishes before any model request.
+   */
+  async commitCheckpoint(
+    command: ManagedSessionCommand,
+    request: { state: Buffer; boundary: string | null },
+    actor: ManagedSessionActor,
+  ): Promise<ManagedSessionCheckpointReceipt> {
+    const store = this.resources;
+    if (store === undefined) {
+      throw new ManagedSessionRecordError(
+        'a resource store is required to commit checkpoints.',
+      );
+    }
+    const held = actor.activation;
+    if (actor.class !== 'harness' || held === undefined) {
+      throw new ManagedSessionConflictError(
+        'only the current harness may commit a checkpoint.',
+      );
+    }
+    return this.runSerial(async () => {
+      const stateRef = await store.publish('managed-checkpoint', request.state);
+      const previous = this.checkpoint;
+      const checkpointId = `ckpt-${this.committed + 1}`;
+      const covered = this.committed;
+      const receipt = await this.commit(
+        command,
+        [
+          {
+            v: MANAGED_SESSION_FORMAT_VERSION,
+            sequence: this.committed + 1,
+            eventId: checkpointId,
+            sessionKey: command.sessionKey,
+            kind: 'checkpoint.committed',
+            occurredAt: this.now(),
+            subject: {
+              type: 'activation',
+              scopeId: held.activationId,
+              activationId: held.activationId,
+              epoch: held.epoch,
+            },
+            payload: {
+              checkpointId,
+              coveredSequence: covered,
+              previousCheckpointId: previous?.checkpointId ?? null,
+              stateRef,
+              boundary: request.boundary,
+            },
+          },
+        ],
+        [actor],
+      );
+      const checkpoint = this.checkpoint;
+      if (checkpoint === undefined) {
+        throw new ManagedSessionRecordError(
+          'checkpoint was committed but not recorded.',
+        );
+      }
+      return { receipt, checkpoint };
+    });
+  }
+
+  /**
+   * Reads the state the newest checkpoint references. A checkpoint whose body
+   * cannot be resolved is a blocked recovery, not an empty one, so the failure
+   * from the resource store is allowed to propagate.
+   */
+  async readCheckpointState(): Promise<Buffer | undefined> {
+    const current = this.checkpoint;
+    if (current === undefined) return undefined;
+    const store = this.resources;
+    if (store === undefined) {
+      throw new ManagedSessionRecordError(
+        'a resource store is required to read checkpoints.',
+      );
+    }
+    return store.read(current.stateRef);
   }
 
   /**
@@ -673,6 +793,7 @@ export class LocalManagedSessionAuthority {
       if (event.kind === 'domain.committed') {
         this.recordDomainEvent(event);
       }
+      this.recordRecoveryFacts(event);
     }
     this.committed = marker.lastSequence;
     this.lastMarkerDigest = managedToolDigest(
@@ -700,6 +821,30 @@ export class LocalManagedSessionAuthority {
    * the authority would assign. A new activation advances the epoch by one, and
    * a phase change keeps the epoch of the activation it describes.
    */
+  /**
+   * Tracks the two facts recovery turns on: the newest checkpoint, and whether
+   * any execution has happened that a checkpoint would have to cover.
+   */
+  private recordRecoveryFacts(event: ManagedSessionEvent): void {
+    if (event.kind === 'checkpoint.committed') {
+      this.checkpoint = {
+        checkpointId: event.payload['checkpointId'] as string,
+        coveredSequence: event.payload['coveredSequence'] as number,
+        previousCheckpointId: event.payload['previousCheckpointId'] as
+          | string
+          | null,
+        stateRef: event.payload[
+          'stateRef'
+        ] as unknown as ManagedSessionDurableRef,
+        boundary: event.payload['boundary'] as string | null,
+      };
+      return;
+    }
+    if (event.kind === 'model.attempt' || event.kind === 'tool.intent') {
+      this.hasContinuation = true;
+    }
+  }
+
   private recordDomainEvent(event: ManagedSessionEvent): void {
     const domain = event.payload['domain'] as string;
     const previous = this.domainRecords.get(domain);

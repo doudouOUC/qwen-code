@@ -12,6 +12,7 @@ import { assertSessionExecutionEngine } from '../services/session-execution-engi
 import { readSessionTranscriptSnapshot } from '../services/session-transcript-reader.js';
 import { SessionWriterLease } from '../services/session-writer-lease.js';
 import { Storage } from '../config/storage.js';
+import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
 import {
   LocalManagedSessionAuthority,
   ManagedSessionConflictError,
@@ -1401,5 +1402,272 @@ describe('managed session write barrier at rest', () => {
         transcriptPath: fixture.transcriptPath,
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe('managed session checkpoints', () => {
+  const HOLDS = {
+    class: 'harness',
+    activation: { activationId: 'act-1', epoch: 1 },
+  } as const;
+
+  interface CheckpointHarness {
+    fixture: Fixture;
+    authority: LocalManagedSessionAuthority;
+    store: LocalManagedSessionResourceStore;
+    close(): Promise<void>;
+  }
+
+  async function openWithResources(
+    fixture: Fixture,
+    options: { create?: boolean } = {},
+  ): Promise<CheckpointHarness> {
+    const store = LocalManagedSessionResourceStore.create({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionKey: sessionKeyFor(fixture),
+    });
+    const lease = await LocalManagedSessionAuthority.acquireWriter({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    const authority = await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey: sessionKeyFor(fixture),
+      cwd: '/workspace',
+      version: 'test',
+      resources: store,
+      ...(options.create === false
+        ? {}
+        : {
+            create: {
+              definitionRef: ref('managed-definition'),
+              rootSnapshotRef: ref('managed-root'),
+              createdBy: 'daemon',
+            },
+          }),
+    });
+    return {
+      fixture,
+      authority,
+      store,
+      close: () => authority.close(),
+    };
+  }
+
+  async function activate(
+    harness: CheckpointHarness,
+    sequence: number,
+  ): Promise<void> {
+    await harness.authority.appendExecution(
+      inputCommand(harness.fixture, {
+        operation: 'claimActivation',
+        commandId: `cmd-act-${sequence}`,
+      }),
+      [
+        {
+          v: 1,
+          sequence,
+          eventId: `evt-act-${sequence}`,
+          sessionKey: sessionKeyFor(harness.fixture),
+          kind: 'activation.changed',
+          occurredAt: 1,
+          payload: {
+            activationId: 'act-1',
+            epoch: 1,
+            workerId: 'worker-1',
+            subject: {
+              type: 'activation',
+              scopeId: 'act-1',
+              activationId: 'act-1',
+              epoch: 1,
+            },
+            phase: 'active',
+            leaseDurationMs: 60_000,
+            expiresAt: 2,
+            installRef: ref(),
+            boundaryRef: null,
+          },
+        },
+      ],
+      { class: 'coordinator' },
+    );
+  }
+
+  function modelAttempt(fixture: Fixture, sequence: number) {
+    return {
+      v: 1,
+      sequence,
+      eventId: `evt-model-${sequence}`,
+      sessionKey: sessionKeyFor(fixture),
+      kind: 'model.attempt',
+      occurredAt: 1,
+      subject: {
+        type: 'activation',
+        scopeId: 'act-1',
+        activationId: 'act-1',
+        epoch: 1,
+      },
+      payload: {
+        attemptId: `att-${sequence}`,
+        routeRef: ref(),
+        inputCheckpointRef: null,
+        state: 'started',
+        usageRef: null,
+      },
+    };
+  }
+
+  it('treats a session with no execution as an initial basis', async () => {
+    const harness = await openWithResources(await createFixture());
+    expect(harness.authority.restoreBasis()).toBe('initial');
+    expect(harness.authority.latestCheckpoint).toBeUndefined();
+    await harness.authority.submitInput(
+      inputCommand(harness.fixture),
+      inputRequest,
+    );
+    /* Accepted input is not execution continuation. */
+    expect(harness.authority.restoreBasis()).toBe('initial');
+    await harness.close();
+  });
+
+  it('blocks recovery when execution ran without a checkpoint', async () => {
+    const harness = await openWithResources(await createFixture());
+    await harness.authority.submitInput(
+      inputCommand(harness.fixture),
+      inputRequest,
+    );
+    await activate(harness, 3);
+    await harness.authority.appendExecution(
+      inputCommand(harness.fixture, {
+        operation: 'appendExecution',
+        commandId: 'cmd-model',
+      }),
+      [modelAttempt(harness.fixture, 4)],
+      HOLDS,
+    );
+    expect(harness.authority.restoreBasis()).toBe('blocked');
+    await harness.close();
+  });
+
+  it('commits a checkpoint and reads its state back', async () => {
+    const harness = await openWithResources(await createFixture());
+    await harness.authority.submitInput(
+      inputCommand(harness.fixture),
+      inputRequest,
+    );
+    await activate(harness, 3);
+
+    const state = Buffer.from('{"turn":1,"pending":[]}', 'utf8');
+    const committed = await harness.authority.commitCheckpoint(
+      inputCommand(harness.fixture, {
+        operation: 'commitCheckpoint',
+        commandId: 'cmd-ckpt-1',
+      }),
+      { state, boundary: null },
+      HOLDS,
+    );
+    expect(committed.checkpoint.coveredSequence).toBe(3);
+    expect(committed.checkpoint.previousCheckpointId).toBeNull();
+    expect(committed.checkpoint.boundary).toBeNull();
+    expect(harness.authority.restoreBasis()).toBe('checkpoint');
+    expect(await harness.authority.readCheckpointState()).toEqual(state);
+    await harness.close();
+  });
+
+  it('chains each checkpoint and recovers the newest after a cold reopen', async () => {
+    const fixture = await createFixture();
+    const first = await openWithResources(fixture);
+    await first.authority.submitInput(inputCommand(fixture), inputRequest);
+    await activate(first, 3);
+    const one = await first.authority.commitCheckpoint(
+      inputCommand(fixture, {
+        operation: 'commitCheckpoint',
+        commandId: 'cmd-ckpt-1',
+      }),
+      { state: Buffer.from('first', 'utf8'), boundary: null },
+      HOLDS,
+    );
+    const two = await first.authority.commitCheckpoint(
+      inputCommand(fixture, {
+        operation: 'commitCheckpoint',
+        commandId: 'cmd-ckpt-2',
+      }),
+      { state: Buffer.from('second', 'utf8'), boundary: 'before_model' },
+      HOLDS,
+    );
+    expect(two.checkpoint.previousCheckpointId).toBe(
+      one.checkpoint.checkpointId,
+    );
+    await first.close();
+
+    const reopened = await openWithResources(fixture, { create: false });
+    expect(reopened.authority.restoreBasis()).toBe('checkpoint');
+    expect(reopened.authority.latestCheckpoint?.checkpointId).toBe(
+      two.checkpoint.checkpointId,
+    );
+    expect(reopened.authority.latestCheckpoint?.boundary).toBe('before_model');
+    expect(await reopened.authority.readCheckpointState()).toEqual(
+      Buffer.from('second', 'utf8'),
+    );
+    await reopened.close();
+  });
+
+  it('lets only the current harness commit a checkpoint', async () => {
+    const harness = await openWithResources(await createFixture());
+    await harness.authority.submitInput(
+      inputCommand(harness.fixture),
+      inputRequest,
+    );
+    await activate(harness, 3);
+    await expect(
+      harness.authority.commitCheckpoint(
+        inputCommand(harness.fixture, {
+          operation: 'commitCheckpoint',
+          commandId: 'cmd-ckpt-entry',
+        }),
+        { state: Buffer.from('x', 'utf8'), boundary: null },
+        { class: 'trusted_entry' },
+      ),
+    ).rejects.toThrow(/only the current harness/);
+    await expect(
+      harness.authority.commitCheckpoint(
+        inputCommand(harness.fixture, {
+          operation: 'commitCheckpoint',
+          commandId: 'cmd-ckpt-stale',
+        }),
+        { state: Buffer.from('x', 'utf8'), boundary: null },
+        { class: 'harness', activation: { activationId: 'act-9', epoch: 1 } },
+      ),
+    ).rejects.toThrow(/is not the committed activation/);
+    await harness.close();
+  });
+
+  it('surfaces a missing checkpoint body instead of an empty state', async () => {
+    const harness = await openWithResources(await createFixture());
+    await harness.authority.submitInput(
+      inputCommand(harness.fixture),
+      inputRequest,
+    );
+    await activate(harness, 3);
+    const committed = await harness.authority.commitCheckpoint(
+      inputCommand(harness.fixture, {
+        operation: 'commitCheckpoint',
+        commandId: 'cmd-ckpt-1',
+      }),
+      { state: Buffer.from('state', 'utf8'), boundary: null },
+      HOLDS,
+    );
+    await fs.rm(
+      path.join(
+        harness.store.sessionRoot,
+        committed.checkpoint.stateRef.kind,
+        committed.checkpoint.stateRef.resourceId,
+      ),
+    );
+    await expect(harness.authority.readCheckpointState()).rejects.toThrow(
+      /is not present for session/,
+    );
+    await harness.close();
   });
 });
