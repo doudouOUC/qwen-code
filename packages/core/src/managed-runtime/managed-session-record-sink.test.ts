@@ -16,6 +16,7 @@ import {
   ManagedSessionUnmappedRecordError,
 } from './managed-session-record-sink.js';
 import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
+import { readManagedSessionTitleInfoSync } from '../utils/sessionStorageUtils.js';
 import type { ManagedSessionDurableRef } from './managed-session-records.js';
 
 const DIGEST = 'f'.repeat(64);
@@ -56,6 +57,7 @@ function record(overrides: Partial<ChatRecord>): ChatRecord {
 interface Harness {
   sink: ManagedSessionRecordSink;
   transcriptPath: string;
+  runtimeBaseDir: string;
   close(): Promise<void>;
 }
 
@@ -136,6 +138,7 @@ async function createHarness(): Promise<Harness> {
       activation: { activationId: 'act-1', epoch: 1 },
     })),
     transcriptPath,
+    runtimeBaseDir,
     close: () => authority.close(),
   };
 }
@@ -167,7 +170,6 @@ describe('managed session record sink', () => {
   it('refuses shapes that have their own home and are not mapped yet', async () => {
     const harness = await createHarness();
     const unmapped = [
-      'custom_title',
       'goal_state',
       'chat_compression',
       'turn_result',
@@ -200,6 +202,29 @@ describe('managed session record sink', () => {
         'managed_session_commit_v1',
       ]),
     );
+  });
+
+  it('routes a title into the session_metadata record the directory reads', async () => {
+    const harness = await createHarness();
+    await harness.sink.write(
+      record({
+        uuid: 'rec-title-1',
+        type: 'system',
+        subtype: 'custom_title',
+        systemPayload: { customTitle: 'Recorded title', titleSource: 'manual' },
+      } as Partial<ChatRecord>),
+    );
+    await harness.close();
+
+    /* A title is not message content, so it must reach the directory through
+       the session_metadata domain record, not the message projection. */
+    expect(
+      readManagedSessionTitleInfoSync(
+        harness.transcriptPath,
+        harness.runtimeBaseDir,
+      ),
+    ).toEqual({ title: 'Recorded title', source: 'manual' });
+    expect(await harness.sink.project()).toEqual([]);
   });
 
   it('refuses an unmapped record instead of appending it directly', async () => {

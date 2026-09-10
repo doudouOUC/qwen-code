@@ -61,6 +61,7 @@ export class ManagedSessionRecordSink {
 
   canCarry(record: ChatRecord): boolean {
     if (record.type === 'system') {
+      if (record.subtype === 'custom_title') return true;
       return (
         record.subtype !== undefined &&
         CARRIED_SYSTEM_SUBTYPES.has(record.subtype)
@@ -85,6 +86,10 @@ export class ManagedSessionRecordSink {
     if (!this.canCarry(record)) {
       throw new ManagedSessionUnmappedRecordError(record);
     }
+    if (record.subtype === 'custom_title') {
+      await this.commitTitle(record);
+      return;
+    }
     this.sequence += 1;
     await this.projection.commit(
       {
@@ -95,6 +100,40 @@ export class ManagedSessionRecordSink {
       },
       { record },
       this.actor(),
+    );
+  }
+
+  /**
+   * A title is not message content: it belongs to the `session_metadata` domain
+   * record the session directory reads, so it is committed there rather than
+   * projected as a message.
+   */
+  private async commitTitle(record: ChatRecord): Promise<void> {
+    const payload = record.systemPayload as
+      | { customTitle?: unknown; titleSource?: unknown }
+      | undefined;
+    const title = payload?.customTitle;
+    if (typeof title !== 'string' || title.length === 0) {
+      throw new ManagedSessionUnmappedRecordError(record);
+    }
+    await this.authority.commitDomainRecord(
+      {
+        operation: 'renameSession',
+        commandId: `recorder:${record.uuid}`,
+        sessionKey: this.authority.sessionHeader.sessionKey,
+        contentDigest: this.authority.sessionHeader.definitionRef.digest,
+      },
+      {
+        domain: 'session_metadata',
+        content: {
+          title,
+          ...(payload?.titleSource === 'auto' ||
+          payload?.titleSource === 'manual'
+            ? { titleSource: payload.titleSource }
+            : {}),
+        },
+      },
+      { class: 'trusted_entry' },
     );
   }
 
