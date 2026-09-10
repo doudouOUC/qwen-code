@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import type { SessionWriterLease } from '../services/session-writer-lease.js';
+import { SessionWriterLease } from '../services/session-writer-lease.js';
 import type { LocalManagedSessionResourceStore } from './managed-session-resources.js';
 import { managedToolDigest } from '../tools/managed-tool-protocol.js';
 import {
@@ -287,6 +287,41 @@ export class LocalManagedSessionAuthority {
    * reports the tail and refuses to write, because a read-only owner or a
    * compatibility probe must never rewrite a transcript.
    */
+  /**
+   * Acquires the writer for a Managed session.
+   *
+   * Managed sessions leave a sealed lock behind on close rather than removing
+   * it, so reacquiring one means taking over that seal. The certified takeover
+   * verifies the sealed transcript proof against the live file, which is what
+   * makes the barrier meaningful: a writer that never sealed cannot silently
+   * adopt the log.
+   */
+  static acquireWriter(options: {
+    runtimeBaseDir: string;
+    sessionId: string;
+    transcriptPath: string;
+  }): Promise<SessionWriterLease> {
+    return SessionWriterLease.acquire({
+      runtimeBaseDir: options.runtimeBaseDir,
+      sessionId: options.sessionId,
+      transcriptPath: options.transcriptPath,
+      takeoverPolicy: 'certified',
+    });
+  }
+
+  /**
+   * Seals the writer instead of releasing it.
+   *
+   * `release()` deletes the lock, which leaves a Managed transcript with no
+   * barrier at all: any writer can then acquire it and append legacy records,
+   * and the authority afterwards refuses to reopen the log at all. Sealing
+   * keeps a lock that a default acquire declines, so the authoritative log
+   * stays closed to writers that do not know how to take it over.
+   */
+  async close(): Promise<void> {
+    await this.lease.sealForHandoff();
+  }
+
   static async recoverUncommittedTail(options: {
     lease: SessionWriterLease;
     sessionKey: ManagedSessionKey;

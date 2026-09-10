@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { assertSessionExecutionEngine } from '../services/session-execution-engine.js';
 import { readSessionTranscriptSnapshot } from '../services/session-transcript-reader.js';
 import { SessionWriterLease } from '../services/session-writer-lease.js';
+import { Storage } from '../config/storage.js';
 import {
   LocalManagedSessionAuthority,
   ManagedSessionConflictError,
@@ -54,9 +55,18 @@ async function createFixture(sessionId = 'managed-session'): Promise<Fixture> {
   );
   temporaryDirectories.add(root);
   const runtimeBaseDir = path.join(root, 'runtime');
-  const transcriptPath = path.join(root, 'chats', `${sessionId}.jsonl`);
-  await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+  const projectRoot = path.join(root, 'project');
+  await fs.mkdir(projectRoot, { recursive: true });
   await fs.mkdir(runtimeBaseDir, { recursive: true });
+  /* Sealing records the transcript path relative to the runtime base
+     directory, so the transcript has to live under it, as it does in a real
+     workspace. */
+  const transcriptPath = path.join(
+    new Storage(projectRoot, runtimeBaseDir).getProjectDir(),
+    'chats',
+    `${sessionId}.jsonl`,
+  );
+  await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
   return { runtimeBaseDir, transcriptPath, sessionId };
 }
 
@@ -1287,5 +1297,109 @@ describe('managed session first transaction recovery', () => {
       }),
     ).rejects.toThrow(/precedes the Managed header/);
     await lease.release();
+  });
+});
+
+describe('managed session write barrier at rest', () => {
+  async function seedSealedSession(fixture: Fixture): Promise<void> {
+    const lease = await LocalManagedSessionAuthority.acquireWriter({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    const authority = await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey: sessionKeyFor(fixture),
+      cwd: '/workspace',
+      version: 'test',
+      create: {
+        definitionRef: ref('managed-definition'),
+        rootSnapshotRef: ref('managed-root'),
+        createdBy: 'daemon',
+      },
+    });
+    await authority.submitInput(inputCommand(fixture), inputRequest);
+    await authority.close();
+  }
+
+  it('declines a writer that cannot take over the seal', async () => {
+    const fixture = await createFixture();
+    await seedSealedSession(fixture);
+
+    /* Releasing would have removed the lock outright, letting any writer
+       acquire the transcript and append legacy records into the authoritative
+       log -- after which the authority could not reopen it at all. */
+    await expect(
+      SessionWriterLease.acquire({
+        runtimeBaseDir: fixture.runtimeBaseDir,
+        sessionId: fixture.sessionId,
+        transcriptPath: fixture.transcriptPath,
+      }),
+    ).rejects.toThrow(/conflict|in use|another/i);
+
+    expect(await readLines(fixture)).toHaveLength(5);
+  });
+
+  it('lets the managed writer take over its own seal and continue', async () => {
+    const fixture = await createFixture();
+    await seedSealedSession(fixture);
+
+    const lease = await LocalManagedSessionAuthority.acquireWriter({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    const authority = await LocalManagedSessionAuthority.open({
+      lease,
+      sessionKey: sessionKeyFor(fixture),
+      cwd: '/workspace',
+      version: 'test',
+    });
+    expect(authority.committedSequence).toBe(2);
+    const receipt = await authority.submitInput(
+      inputCommand(fixture, { commandId: 'cmd-after-seal' }),
+      { ...inputRequest, inputId: 'in-after-seal' },
+    );
+    expect(receipt.firstSequence).toBe(3);
+    await authority.close();
+
+    const reopenLease = await LocalManagedSessionAuthority.acquireWriter({
+      runtimeBaseDir: fixture.runtimeBaseDir,
+      sessionId: fixture.sessionId,
+      transcriptPath: fixture.transcriptPath,
+    });
+    const reopened = await LocalManagedSessionAuthority.open({
+      lease: reopenLease,
+      sessionKey: sessionKeyFor(fixture),
+      cwd: '/workspace',
+      version: 'test',
+    });
+    expect(reopened.committedSequence).toBe(4);
+    await reopened.close();
+  });
+
+  it('refuses a takeover when the sealed transcript was altered', async () => {
+    const fixture = await createFixture();
+    await seedSealedSession(fixture);
+
+    await fs.appendFile(
+      fixture.transcriptPath,
+      `${JSON.stringify({
+        uuid: 'intruder',
+        parentUuid: null,
+        sessionId: fixture.sessionId,
+        timestamp: new Date().toISOString(),
+        type: 'user',
+      })}\n`,
+      'utf8',
+    );
+
+    await expect(
+      LocalManagedSessionAuthority.acquireWriter({
+        runtimeBaseDir: fixture.runtimeBaseDir,
+        sessionId: fixture.sessionId,
+        transcriptPath: fixture.transcriptPath,
+      }),
+    ).rejects.toThrow();
   });
 });
