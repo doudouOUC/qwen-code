@@ -341,61 +341,63 @@ describe('managed session authority', () => {
 });
 
 describe('managed session authority activation fences', () => {
-  async function withActivation(fixture: Fixture): Promise<OpenedAuthority> {
-    const opened = await openAuthority(fixture);
-    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
-    await opened.authority.appendExecution(
-      inputCommand(fixture, {
-        operation: 'claimActivation',
-        commandId: 'cmd-act-2',
-      }),
-      [
-        {
-          v: 1,
-          sequence: 3,
-          eventId: 'evt-act-2',
-          sessionKey: sessionKeyFor(fixture),
-          kind: 'activation.changed',
-          occurredAt: 1,
-          payload: {
-            activationId: 'act-2',
-            epoch: 2,
-            workerId: 'worker-1',
-            subject: {
-              type: 'activation',
-              scopeId: 'scope-1',
-              activationId: 'act-2',
-              epoch: 2,
-            },
-            phase: 'active',
-            leaseDurationMs: 60_000,
-            expiresAt: 2,
-            installRef: ref(),
-            boundaryRef: null,
-          },
+  function activationEvent(
+    fixture: Fixture,
+    options: {
+      sequence: number;
+      activationId: string;
+      epoch: number;
+      phase: string;
+    },
+  ) {
+    const closed = options.phase === 'released' || options.phase === 'revoked';
+    return {
+      v: 1,
+      sequence: options.sequence,
+      eventId: `evt-${options.activationId}-${options.phase}`,
+      sessionKey: sessionKeyFor(fixture),
+      kind: 'activation.changed',
+      occurredAt: 1,
+      payload: {
+        activationId: options.activationId,
+        epoch: options.epoch,
+        workerId: 'worker-1',
+        subject: {
+          type: 'activation',
+          scopeId: 'scope-1',
+          activationId: options.activationId,
+          epoch: options.epoch,
         },
-      ],
-      { class: 'coordinator' },
-    );
-    return opened;
+        phase: options.phase,
+        leaseDurationMs: 60_000,
+        expiresAt: 2,
+        installRef: ref(),
+        boundaryRef: closed ? ref() : null,
+      },
+    };
   }
 
-  function modelAttempt(fixture: Fixture, sequence: number, epoch: number) {
+  function modelAttempt(
+    fixture: Fixture,
+    sequence: number,
+    activationId: string,
+    epoch: number,
+  ) {
     return {
       v: 1,
       sequence,
-      eventId: `evt-model-${epoch}-${sequence}`,
+      eventId: `evt-model-${activationId}-${sequence}`,
       sessionKey: sessionKeyFor(fixture),
       kind: 'model.attempt',
       occurredAt: 1,
       subject: {
         type: 'activation',
         scopeId: 'scope-1',
-        activationId: `act-${epoch}`,
+        activationId,
         epoch,
       },
       payload: {
-        attemptId: `att-${epoch}`,
+        attemptId: `att-${sequence}`,
         routeRef: ref(),
         inputCheckpointRef: null,
         state: 'started',
@@ -404,50 +406,73 @@ describe('managed session authority activation fences', () => {
     };
   }
 
-  it('tracks the committed activation epoch', async () => {
+  async function withActivation(fixture: Fixture): Promise<OpenedAuthority> {
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await opened.authority.appendExecution(
+      inputCommand(fixture, {
+        operation: 'claimActivation',
+        commandId: 'cmd-act-1',
+      }),
+      [
+        activationEvent(fixture, {
+          sequence: 3,
+          activationId: 'act-1',
+          epoch: 1,
+          phase: 'active',
+        }),
+      ],
+      { class: 'coordinator' },
+    );
+    return opened;
+  }
+
+  const holds = (activationId: string, epoch: number) =>
+    ({ class: 'harness', activation: { activationId, epoch } }) as const;
+
+  it('tracks the committed activation', async () => {
     const fixture = await createFixture();
     const opened = await withActivation(fixture);
-    expect(opened.authority.currentActivationEpoch).toBe(2);
+    expect(opened.authority.currentActivation).toEqual({
+      activationId: 'act-1',
+      epoch: 1,
+      phase: 'active',
+    });
     await opened.release();
   });
 
-  it('recovers the activation epoch from a cold reopen', async () => {
+  it('recovers the committed activation from a cold reopen', async () => {
     const fixture = await createFixture();
     const opened = await withActivation(fixture);
     await opened.release();
 
     const reopened = await openAuthority(fixture, { create: false });
-    expect(reopened.authority.currentActivationEpoch).toBe(2);
-    await expect(
-      reopened.authority.appendExecution(
-        inputCommand(fixture, {
-          operation: 'appendExecution',
-          commandId: 'cmd-stale-cold',
-        }),
-        [modelAttempt(fixture, 4, 1)],
-        { class: 'harness', activation: { activationId: 'act-1', epoch: 1 } },
-      ),
-    ).rejects.toThrow(/epoch 1 is stale/);
+    expect(reopened.authority.currentActivation).toEqual({
+      activationId: 'act-1',
+      epoch: 1,
+      phase: 'active',
+    });
     await reopened.release();
   });
 
-  it('rejects an append from a stale activation epoch', async () => {
+  it('refuses a harness append when no activation is committed', async () => {
     const fixture = await createFixture();
-    const opened = await withActivation(fixture);
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
     await expect(
       opened.authority.appendExecution(
         inputCommand(fixture, {
           operation: 'appendExecution',
-          commandId: 'cmd-stale',
+          commandId: 'cmd-unproven',
         }),
-        [modelAttempt(fixture, 4, 1)],
-        { class: 'harness', activation: { activationId: 'act-1', epoch: 1 } },
+        [modelAttempt(fixture, 3, 'act-999', 999)],
+        holds('act-999', 999),
       ),
-    ).rejects.toThrow(/epoch 1 is stale/);
+    ).rejects.toThrow(/no activation is committed/);
     await opened.release();
   });
 
-  it('accepts an append from the current activation', async () => {
+  it('accepts an append from the committed activation', async () => {
     const fixture = await createFixture();
     const opened = await withActivation(fixture);
     const receipt = await opened.authority.appendExecution(
@@ -456,14 +481,116 @@ describe('managed session authority activation fences', () => {
         commandId: 'cmd-current',
         expectedSequence: 3,
       }),
-      [modelAttempt(fixture, 4, 2)],
-      { class: 'harness', activation: { activationId: 'act-2', epoch: 2 } },
+      [modelAttempt(fixture, 4, 'act-1', 1)],
+      holds('act-1', 1),
     );
     expect(receipt.committedSequence).toBe(4);
     await opened.release();
   });
 
-  it('rejects a harness append whose subject names another activation', async () => {
+  it('refuses an append from a superseded activation', async () => {
+    const fixture = await createFixture();
+    const opened = await withActivation(fixture);
+    await opened.authority.appendExecution(
+      inputCommand(fixture, {
+        operation: 'claimActivation',
+        commandId: 'cmd-act-2',
+      }),
+      [
+        activationEvent(fixture, {
+          sequence: 4,
+          activationId: 'act-2',
+          epoch: 2,
+          phase: 'active',
+        }),
+      ],
+      { class: 'coordinator' },
+    );
+    await expect(
+      opened.authority.appendExecution(
+        inputCommand(fixture, {
+          operation: 'appendExecution',
+          commandId: 'cmd-stale',
+        }),
+        [modelAttempt(fixture, 5, 'act-1', 1)],
+        holds('act-1', 1),
+      ),
+    ).rejects.toThrow(/is not the committed activation act-2\/2/);
+    await opened.release();
+  });
+
+  it('refuses an append once the activation is released', async () => {
+    const fixture = await createFixture();
+    const opened = await withActivation(fixture);
+    await opened.authority.appendExecution(
+      inputCommand(fixture, {
+        operation: 'releaseActivation',
+        commandId: 'cmd-release',
+      }),
+      [
+        activationEvent(fixture, {
+          sequence: 4,
+          activationId: 'act-1',
+          epoch: 1,
+          phase: 'released',
+        }),
+      ],
+      { class: 'coordinator' },
+    );
+    await expect(
+      opened.authority.appendExecution(
+        inputCommand(fixture, {
+          operation: 'appendExecution',
+          commandId: 'cmd-after-release',
+        }),
+        [modelAttempt(fixture, 5, 'act-1', 1)],
+        holds('act-1', 1),
+      ),
+    ).rejects.toThrow(/is released and may not append/);
+    await opened.release();
+  });
+
+  it('refuses an epoch the authority would not assign', async () => {
+    const fixture = await createFixture();
+    const opened = await withActivation(fixture);
+    await expect(
+      opened.authority.appendExecution(
+        inputCommand(fixture, {
+          operation: 'claimActivation',
+          commandId: 'cmd-jump',
+        }),
+        [
+          activationEvent(fixture, {
+            sequence: 4,
+            activationId: 'act-9',
+            epoch: 9,
+            phase: 'active',
+          }),
+        ],
+        { class: 'coordinator' },
+      ),
+    ).rejects.toThrow(/must use epoch 2, not 9/);
+    await expect(
+      opened.authority.appendExecution(
+        inputCommand(fixture, {
+          operation: 'releaseActivation',
+          commandId: 'cmd-rewrite-epoch',
+        }),
+        [
+          activationEvent(fixture, {
+            sequence: 4,
+            activationId: 'act-1',
+            epoch: 5,
+            phase: 'released',
+          }),
+        ],
+        { class: 'coordinator' },
+      ),
+    ).rejects.toThrow(/is at epoch 1 and cannot change to 5/);
+    await opened.release();
+  });
+
+  it('refuses a harness append whose subject names another activation', async () => {
     const fixture = await createFixture();
     const opened = await withActivation(fixture);
     await expect(
@@ -472,8 +599,8 @@ describe('managed session authority activation fences', () => {
           operation: 'appendExecution',
           commandId: 'cmd-mismatch',
         }),
-        [modelAttempt(fixture, 4, 2)],
-        { class: 'harness', activation: { activationId: 'act-3', epoch: 2 } },
+        [modelAttempt(fixture, 4, 'act-2', 1)],
+        holds('act-1', 1),
       ),
     ).rejects.toThrow(/does not match the activation the harness holds/);
     await opened.release();
@@ -488,7 +615,7 @@ describe('managed session authority activation fences', () => {
           operation: 'appendExecution',
           commandId: 'cmd-none',
         }),
-        [modelAttempt(fixture, 4, 2)],
+        [modelAttempt(fixture, 4, 'act-1', 1)],
         { class: 'harness' },
       ),
     ).rejects.toThrow(/must present the activation it holds/);
@@ -505,8 +632,8 @@ describe('managed session authority activation fences', () => {
           operation: 'appendExecution',
           commandId: 'cmd-rejected',
         }),
-        [modelAttempt(fixture, 4, 1)],
-        { class: 'harness', activation: { activationId: 'act-1', epoch: 1 } },
+        [modelAttempt(fixture, 4, 'act-2', 2)],
+        holds('act-2', 2),
       ),
     ).rejects.toThrow(ManagedSessionConflictError);
     expect(await readLines(fixture)).toEqual(before);
@@ -685,5 +812,126 @@ describe('managed session authority log integrity', () => {
         { ...inputRequest, inputId: 'in-2' },
       ),
     ).rejects.toThrow(/writes stopped after an earlier failure/);
+  });
+});
+
+describe('managed session authority serialisation', () => {
+  it('serialises concurrent transactions into one increasing sequence', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+
+    /* Started together, so neither can observe the other's committed
+       sequence before choosing its own. */
+    const [first, second] = await Promise.all([
+      opened.authority.submitInput(inputCommand(fixture), inputRequest),
+      opened.authority.submitInput(
+        inputCommand(fixture, { commandId: 'cmd-2' }),
+        { ...inputRequest, inputId: 'in-2' },
+      ),
+    ]);
+    await opened.release();
+
+    expect([
+      first.firstSequence,
+      first.lastSequence,
+      second.firstSequence,
+      second.lastSequence,
+    ]).toEqual([1, 2, 3, 4]);
+
+    const bodies = await readBodies(fixture);
+    const eventSequences = bodies
+      .filter((body) => body['sequence'] !== undefined)
+      .map((body) => body['sequence']);
+    expect(eventSequences).toEqual([1, 2, 3, 4]);
+
+    const reopened = await openAuthority(fixture, { create: false });
+    expect(reopened.authority.committedSequence).toBe(4);
+    await reopened.release();
+  });
+
+  it('refuses to reuse an event id under a different command id', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await expect(
+      opened.authority.submitInput(
+        inputCommand(fixture, { commandId: 'cmd-different' }),
+        inputRequest,
+      ),
+    ).rejects.toThrow(/event id in-1:accepted is already committed/);
+    await opened.release();
+    expect(await readLines(fixture)).toHaveLength(4);
+  });
+
+  it('refuses an event id repeated inside one transaction', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+    const duplicate = {
+      v: 1,
+      sequence: 1,
+      eventId: 'evt-same',
+      sessionKey: sessionKeyFor(fixture),
+      kind: 'cancel.requested',
+      occurredAt: 1,
+      payload: {
+        requestId: 'req-1',
+        target: { turnId: 'turn-1' },
+        reason: 'user',
+        requestedBy: 'web_shell',
+      },
+    };
+    await expect(
+      opened.authority.appendExecution(
+        inputCommand(fixture, {
+          operation: 'requestCancel',
+          commandId: 'cmd-dup',
+        }),
+        [duplicate, { ...duplicate, sequence: 2 }],
+        { class: 'trusted_entry' },
+      ),
+    ).rejects.toThrow(/must not repeat an event id/);
+    await opened.release();
+  });
+});
+
+describe('managed session authority scan strictness', () => {
+  it('refuses an unknown record after the header', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await opened.release();
+
+    const lines = await readLines(fixture);
+    lines.splice(
+      2,
+      0,
+      JSON.stringify({
+        uuid: 'intruder',
+        parentUuid: null,
+        sessionId: fixture.sessionId,
+        timestamp: new Date().toISOString(),
+        type: 'user',
+      }),
+    );
+    await rewrite(fixture, lines);
+
+    await expect(openAuthority(fixture, { create: false })).rejects.toThrow(
+      /unknown subtype undefined after the Managed header/,
+    );
+  });
+
+  it('refuses a blank line inside the log', async () => {
+    const fixture = await createFixture();
+    const opened = await openAuthority(fixture);
+    await opened.authority.submitInput(inputCommand(fixture), inputRequest);
+    await opened.release();
+
+    const lines = await readLines(fixture);
+    lines.splice(2, 0, '');
+    await rewrite(fixture, lines);
+
+    await expect(openAuthority(fixture, { create: false })).rejects.toThrow(
+      /is blank/,
+    );
   });
 });

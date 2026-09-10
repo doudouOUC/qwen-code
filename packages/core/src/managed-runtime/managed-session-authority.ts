@@ -55,6 +55,12 @@ export interface ManagedSessionActor {
   };
 }
 
+export interface ManagedSessionActivationState {
+  readonly activationId: string;
+  readonly epoch: number;
+  readonly phase: string;
+}
+
 export interface ManagedSessionCommitReceipt {
   readonly transactionId: string;
   readonly commandId: string;
@@ -146,10 +152,12 @@ export class LocalManagedSessionAuthority {
     private committed: number,
     private lastMarkerDigest: string | null,
     private lastRecordUuid: string | null,
-    private activationEpoch: number,
+    private activation: ManagedSessionActivationState | undefined,
   ) {}
 
   private writeFailure: Error | undefined;
+  private queue: Promise<unknown> = Promise.resolve();
+  private readonly eventIds = new Set<string>();
 
   get committedSequence(): number {
     return this.committed;
@@ -160,8 +168,9 @@ export class LocalManagedSessionAuthority {
   }
 
   /** The highest activation epoch committed so far; 0 when none exists. */
-  get currentActivationEpoch(): number {
-    return this.activationEpoch;
+  /** The activation the log currently records, if any. */
+  get currentActivation(): ManagedSessionActivationState | undefined {
+    return this.activation;
   }
 
   static async open(
@@ -214,7 +223,7 @@ export class LocalManagedSessionAuthority {
       });
       lastRecordUuid = uuid;
     }
-    return new LocalManagedSessionAuthority(
+    const authority = new LocalManagedSessionAuthority(
       options.lease,
       options.sessionKey,
       options.cwd,
@@ -226,8 +235,10 @@ export class LocalManagedSessionAuthority {
       scan.committed,
       scan.lastMarkerDigest,
       lastRecordUuid,
-      scan.activationEpoch,
+      scan.activation,
     );
+    for (const event of scan.events) authority.eventIds.add(event.eventId);
+    return authority;
   }
 
   /**
@@ -262,44 +273,48 @@ export class LocalManagedSessionAuthority {
     command: ManagedSessionCommand,
     input: ManagedSessionInputRequest,
   ): Promise<ManagedSessionCommitReceipt> {
-    const first = this.committed + 1;
-    const occurredAt = this.now();
-    const accepted = {
-      v: MANAGED_SESSION_FORMAT_VERSION,
-      sequence: first,
-      eventId: `${input.inputId}:accepted`,
-      sessionKey: command.sessionKey,
-      kind: 'input.accepted',
-      occurredAt,
-      payload: {
-        inputId: input.inputId,
-        turnId: input.turnId,
-        source: input.source,
-        contentRef: input.contentRef,
-        deadline: input.deadline,
-        admissionRef: input.admissionRef,
-      },
-    };
-    const wake = {
-      v: MANAGED_SESSION_FORMAT_VERSION,
-      sequence: first + 1,
-      eventId: `${input.inputId}:wake`,
-      sessionKey: command.sessionKey,
-      kind: 'wake.requested',
-      occurredAt,
-      payload: {
-        wakeId: `${input.inputId}:wake`,
-        reason: input.wakeReason,
-        subject: { type: 'turn', turnId: input.turnId },
-        sourceEventId: `${input.inputId}:accepted`,
-        requiredSequence: first,
-      },
-    };
-    return this.commit(
-      command,
-      [accepted, wake],
-      [{ class: 'trusted_entry' }, { class: 'authority' }],
-    );
+    return this.runSerial(() => {
+      // Read inside the lock: the committed sequence moves as other
+      // transactions commit.
+      const first = this.committed + 1;
+      const occurredAt = this.now();
+      const accepted = {
+        v: MANAGED_SESSION_FORMAT_VERSION,
+        sequence: first,
+        eventId: `${input.inputId}:accepted`,
+        sessionKey: command.sessionKey,
+        kind: 'input.accepted',
+        occurredAt,
+        payload: {
+          inputId: input.inputId,
+          turnId: input.turnId,
+          source: input.source,
+          contentRef: input.contentRef,
+          deadline: input.deadline,
+          admissionRef: input.admissionRef,
+        },
+      };
+      const wake = {
+        v: MANAGED_SESSION_FORMAT_VERSION,
+        sequence: first + 1,
+        eventId: `${input.inputId}:wake`,
+        sessionKey: command.sessionKey,
+        kind: 'wake.requested',
+        occurredAt,
+        payload: {
+          wakeId: `${input.inputId}:wake`,
+          reason: input.wakeReason,
+          subject: { type: 'turn', turnId: input.turnId },
+          sourceEventId: `${input.inputId}:accepted`,
+          requiredSequence: first,
+        },
+      };
+      return this.commit(
+        command,
+        [accepted, wake],
+        [{ class: 'trusted_entry' }, { class: 'authority' }],
+      );
+    });
   }
 
   /**
@@ -311,11 +326,27 @@ export class LocalManagedSessionAuthority {
     events: readonly unknown[],
     actor: ManagedSessionActor,
   ): Promise<ManagedSessionCommitReceipt> {
-    return this.commit(
-      command,
-      events,
-      events.map(() => actor),
+    return this.runSerial(() =>
+      this.commit(
+        command,
+        events,
+        events.map(() => actor),
+      ),
     );
+  }
+
+  /**
+   * One transaction at a time. The writer lease serialises individual lines,
+   * which is not enough: concurrent transactions would interleave their event
+   * records around each other's commit markers.
+   */
+  private runSerial<T>(operation: () => Promise<T>): Promise<T> {
+    const pending = this.queue.then(operation, operation);
+    this.queue = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
   }
 
   private async commit(
@@ -341,7 +372,11 @@ export class LocalManagedSessionAuthority {
           `command ${command.commandId} was already committed with different content.`,
         );
       }
-      return { ...previous.receipt, replayed: true };
+      return {
+        ...previous.receipt,
+        committedSequence: this.committed,
+        replayed: true,
+      };
     }
     if (
       command.expectedSequence !== undefined &&
@@ -362,11 +397,24 @@ export class LocalManagedSessionAuthority {
         );
       }
       this.assertActorFence(event, actor);
+      if (event.kind === 'activation.changed') {
+        this.assertActivationEpoch(event);
+      }
+      if (this.eventIds.has(event.eventId)) {
+        throw new ManagedSessionConflictError(
+          `event id ${event.eventId} is already committed.`,
+        );
+      }
       return event;
     });
     if (events.length === 0) {
       throw new ManagedSessionRecordError(
         'a transaction must contain at least one event.',
+      );
+    }
+    if (new Set(events.map((event) => event.eventId)).size !== events.length) {
+      throw new ManagedSessionConflictError(
+        'a transaction must not repeat an event id.',
       );
     }
     if (events[0].sequence !== this.committed + 1) {
@@ -433,11 +481,9 @@ export class LocalManagedSessionAuthority {
 
     for (const event of events) {
       this.events.push(event);
+      this.eventIds.add(event.eventId);
       if (event.kind === 'activation.changed') {
-        this.activationEpoch = Math.max(
-          this.activationEpoch,
-          event.payload['epoch'] as number,
-        );
+        this.activation = activationStateFrom(event);
       }
     }
     this.committed = marker.lastSequence;
@@ -461,6 +507,30 @@ export class LocalManagedSessionAuthority {
     return receipt;
   }
 
+  /**
+   * The authority decides the epoch; a coordinator may only submit the value
+   * the authority would assign. A new activation advances the epoch by one, and
+   * a phase change keeps the epoch of the activation it describes.
+   */
+  private assertActivationEpoch(event: ManagedSessionEvent): void {
+    const next = activationStateFrom(event);
+    const current = this.activation;
+    if (current === undefined || next.activationId !== current.activationId) {
+      const expected = (current?.epoch ?? 0) + 1;
+      if (next.epoch !== expected) {
+        throw new ManagedSessionConflictError(
+          `activation ${next.activationId} must use epoch ${expected}, not ${next.epoch}.`,
+        );
+      }
+      return;
+    }
+    if (next.epoch !== current.epoch) {
+      throw new ManagedSessionConflictError(
+        `activation ${next.activationId} is at epoch ${current.epoch} and cannot change to ${next.epoch}.`,
+      );
+    }
+  }
+
   private assertActorFence(
     event: ManagedSessionEvent,
     actor: ManagedSessionActor,
@@ -472,9 +542,23 @@ export class LocalManagedSessionAuthority {
         'a harness append must present the activation it holds.',
       );
     }
-    if (held.epoch < this.activationEpoch) {
+    const current = this.activation;
+    if (current === undefined) {
       throw new ManagedSessionConflictError(
-        `activation epoch ${held.epoch} is stale; the session is at epoch ${this.activationEpoch}.`,
+        'no activation is committed for this session, so no harness may append.',
+      );
+    }
+    if (
+      held.activationId !== current.activationId ||
+      held.epoch !== current.epoch
+    ) {
+      throw new ManagedSessionConflictError(
+        `activation ${held.activationId}/${held.epoch} is not the committed activation ${current.activationId}/${current.epoch}.`,
+      );
+    }
+    if (current.phase !== 'installing' && current.phase !== 'active') {
+      throw new ManagedSessionConflictError(
+        `activation ${current.activationId} is ${current.phase} and may not append.`,
       );
     }
     const subject = event.subject;
@@ -518,7 +602,7 @@ interface ManagedSessionLogScan {
   readonly committed: number;
   readonly lastMarkerDigest: string | null;
   readonly lastRecordUuid: string | null;
-  readonly activationEpoch: number;
+  readonly activation: ManagedSessionActivationState | undefined;
   readonly uncommitted: number;
   readonly foreignRecords: number;
 }
@@ -543,7 +627,7 @@ async function readManagedSessionLog(
         committed: 0,
         lastMarkerDigest: null,
         lastRecordUuid: null,
-        activationEpoch: 0,
+        activation: undefined,
         uncommitted: 0,
         foreignRecords: 0,
       };
@@ -562,13 +646,17 @@ async function readManagedSessionLog(
   let committed = 0;
   let lastMarkerDigest: string | null = null;
   let lastRecordUuid: string | null = null;
-  let activationEpoch = 0;
+  let activation: ManagedSessionActivationState | undefined;
   let foreignRecords = 0;
   let pending: ManagedSessionEvent[] = [];
 
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    if (line === '') continue;
+    if (line === '') {
+      throw new ManagedSessionRecordError(
+        `session log line ${index + 1} is blank.`,
+      );
+    }
     const record = parseManagedSessionRecordJson(
       line,
       MANAGED_SESSION_LIMITS.maxEventBytes,
@@ -592,6 +680,11 @@ async function readManagedSessionLog(
       subtype !== MANAGED_SESSION_EVENT_SUBTYPE &&
       subtype !== MANAGED_SESSION_COMMIT_SUBTYPE
     ) {
+      if (header !== undefined) {
+        throw new ManagedSessionRecordError(
+          `session log line ${index + 1} has the unknown subtype ${String(subtype)} after the Managed header.`,
+        );
+      }
       foreignRecords++;
       continue;
     }
@@ -654,10 +747,7 @@ async function readManagedSessionLog(
     for (const event of pending) {
       events.push(event);
       if (event.kind === 'activation.changed') {
-        activationEpoch = Math.max(
-          activationEpoch,
-          event.payload['epoch'] as number,
-        );
+        activation = activationStateFrom(event);
       }
     }
     committed = marker.lastSequence;
@@ -687,8 +777,18 @@ async function readManagedSessionLog(
     committed,
     lastMarkerDigest,
     lastRecordUuid,
-    activationEpoch,
+    activation,
     uncommitted: pending.length + tornTail,
     foreignRecords,
+  };
+}
+
+function activationStateFrom(
+  event: ManagedSessionEvent,
+): ManagedSessionActivationState {
+  return {
+    activationId: event.payload['activationId'] as string,
+    epoch: event.payload['epoch'] as number,
+    phase: event.payload['phase'] as string,
   };
 }
