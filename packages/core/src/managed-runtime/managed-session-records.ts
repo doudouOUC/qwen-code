@@ -24,6 +24,8 @@ export const MANAGED_SESSION_LIMITS = {
   maxCommitMarkerBytes: 64 * 1024,
   maxTransactionEvents: 256,
   maxTransactionBytes: 8 * 1024 * 1024,
+  defaultReadEvents: 100,
+  maxReadEvents: 256,
 } as const;
 
 export const MANAGED_SESSION_EVENT_KINDS = [
@@ -183,7 +185,7 @@ export interface ManagedSessionCommitMarker {
 }
 
 export class ManagedSessionRecordError extends Error {
-  readonly code = 'managed_session_invalid_record';
+  readonly code: string = 'managed_session_invalid_record';
 
   constructor(message: string) {
     super(message);
