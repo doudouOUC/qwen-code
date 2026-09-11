@@ -223,6 +223,31 @@ describe('managed session log activation', () => {
     });
   });
 
+  it('restores the goal a managed session recorded', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      await recorder.recordGoalState('550e8400-e29b-41d4-a716-4466554400b1', {
+        v: 2,
+        cause: 'create',
+        snapshot: { activity: 'idle' },
+      } as never);
+      await fixture.config.closeSessionWriter();
+
+      const projection = await fixture.config
+        .getSessionService()
+        .readRestoreProjection(sessionId, {
+          replay: { kind: 'all', hideInheritedHistory: false },
+        });
+
+      // Reported as a recovery candidate, so a resumed session still has its
+      // goal rather than silently losing it.
+      expect(
+        projection?.runtime.goalRecords.map((entry) => entry.subtype),
+      ).toEqual(['goal_state']);
+    });
+  });
+
   it('restores a compacted managed session from its summary', async () => {
     await withWorkspace(async (activate) => {
       const fixture = await activate({ managedSessionLog: true });

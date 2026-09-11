@@ -173,7 +173,7 @@ describe('managed session record sink', () => {
 
   it('refuses shapes that have their own home and are not mapped yet', async () => {
     const harness = await createHarness();
-    const unmapped = ['goal_state', 'file_history_snapshot'] as const;
+    const unmapped = ['file_history_snapshot'] as const;
     for (const subtype of unmapped) {
       expect(harness.sink.canCarry(record({ type: 'system', subtype }))).toBe(
         false,
@@ -321,11 +321,64 @@ describe('managed session record sink', () => {
     await harness.close();
   });
 
+  it('commits a goal snapshot as the goal domain record', async () => {
+    const harness = await createHarness();
+    const goal = record({
+      uuid: 'rec-goal-1',
+      type: 'system',
+      subtype: 'goal_state',
+      systemPayload: {
+        v: 2,
+        cause: 'create',
+        snapshot: { activity: 'idle' },
+      },
+    } as unknown as Partial<ChatRecord>);
+    await harness.sink.write(goal);
+
+    const committed = harness.authority
+      .readEvents()
+      .filter((event) => event.kind === 'domain.committed');
+    expect(committed).toHaveLength(1);
+    expect(committed[0].payload['domain']).toBe('goal_state');
+
+    // The whole record is the body, so goal recovery reads what was written,
+    // and the goal stays out of the message channel.
+    const body = JSON.parse(
+      (
+        await harness.store.read(
+          committed[0].payload[
+            'recordRef'
+          ] as unknown as ManagedSessionDurableRef,
+        )
+      ).toString('utf8'),
+    ) as { record: unknown; revision: number };
+    expect(body.record).toEqual(goal);
+    expect(body.revision).toBe(1);
+    expect(await harness.sink.project()).toEqual([]);
+    await harness.close();
+  });
+
+  it('carries a subtyped user message on the message channel', async () => {
+    const harness = await createHarness();
+    const runtimeMessage = record({
+      uuid: 'rec-goal-runtime-1',
+      subtype: 'goal_runtime',
+      message: { role: 'user', parts: [{ text: 'continue the goal' }] },
+    } as Partial<ChatRecord>);
+    await harness.sink.write(runtimeMessage);
+
+    // The subtype survives the round trip, which is why it can ride here.
+    expect(await harness.sink.project()).toEqual([runtimeMessage]);
+    await harness.close();
+  });
+
   it('refuses an unmapped record instead of appending it directly', async () => {
     const harness = await createHarness();
     const before = await fs.readFile(harness.transcriptPath, 'utf8');
     await expect(
-      harness.sink.write(record({ type: 'system', subtype: 'goal_state' })),
+      harness.sink.write(
+        record({ type: 'system', subtype: 'file_history_snapshot' }),
+      ),
     ).rejects.toThrow(ManagedSessionUnmappedRecordError);
 
     // A silent fallback would put content in the transcript that the

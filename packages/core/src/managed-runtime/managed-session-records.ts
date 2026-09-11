@@ -93,9 +93,8 @@ export type ManagedSessionDomain = (typeof MANAGED_SESSION_DOMAINS)[number];
  * closed v1 name space; recognising a name never means the capability is
  * implemented or admitted, so submission is gated separately.
  */
-export const MANAGED_SESSION_ENABLED_DOMAINS: readonly ManagedSessionDomain[] = [
-  'session_metadata',
-];
+export const MANAGED_SESSION_ENABLED_DOMAINS: readonly ManagedSessionDomain[] =
+  ['goal_state', 'session_metadata'];
 
 export function assertManagedSessionDomainEnabled(
   domain: ManagedSessionDomain,

@@ -2701,6 +2701,7 @@ export class SessionTranscriptReader {
     const resumeTokenCounts = new ResumeTokenCountsAccumulator();
     const turnState = new SessionTurnStateAccumulator(sessionId);
     const uiTelemetryEvents: UiEvent[] = [];
+    const goalRecords: GoalRecoveryRecord[] = [];
     let attributionSnapshot: AttributionSnapshot | undefined;
     let lastAssistantModel: string | undefined;
     let lastTokenCountsRecord: ChatRecord | undefined;
@@ -2711,6 +2712,10 @@ export class SessionTranscriptReader {
       // filtering by type here would rebuild history from before a compaction.
       apiHistory.add(record);
       if (isResumeTokenCountsCandidate(record)) lastTokenCountsRecord = record;
+      if (isGoalRecoveryCandidate(record)) {
+        const normalized = normalizeGoalRecoveryRecord(record);
+        if (normalized) goalRecords.push(normalized);
+      }
       if (record.subtype === 'ui_telemetry') {
         const uiEvent = (
           record.systemPayload as UiTelemetryRecordPayload | undefined
@@ -2740,6 +2745,7 @@ export class SessionTranscriptReader {
         this.storage.getRuntimeBaseDir(),
       ) ?? {};
     const turnStateValue = turnState.finish();
+    const goalRecovery = selectGoalRecoveryFromRecords(goalRecords);
     const restoredTokenCounts = resumeTokenCounts.finish();
     const runtime: SessionRuntimeResumeState = {
       apiHistory: apiHistory.finish(),
@@ -2765,7 +2771,10 @@ export class SessionTranscriptReader {
           ? { executionEngine: index.executionEngine.engine }
           : {}),
       },
-      goalRecords: [],
+      goalRecords,
+      ...(goalRecovery.sourceUuid
+        ? { goalRecoverySourceUuid: goalRecovery.sourceUuid }
+        : {}),
       initialTurn: turnStateValue.initialTurn,
       backgroundNotificationTaskIds:
         turnStateValue.backgroundNotificationTaskIds,

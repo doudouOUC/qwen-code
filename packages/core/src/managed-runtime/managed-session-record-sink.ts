@@ -18,14 +18,24 @@ import type { LocalManagedSessionResourceStore } from './managed-session-resourc
  * A Managed log keeps domain content once and projects reader-facing records
  * back out of it, so a record may only be routed here if the projection can
  * reproduce it. Shapes with their own home in the event union or the domain
- * registry -- titles, goal state, artifacts, compaction, turn results, file
- * history -- are deliberately absent until each is mapped.
+ * registry are routed there instead; what remains unmapped -- file history --
+ * is refused until it has one.
  */
 const CARRIED_SYSTEM_SUBTYPES = new Set([
   'slash_command',
   'at_command',
   'ui_telemetry',
   'attribution_snapshot',
+]);
+
+/**
+ * Message subtypes the projection restores as they were. A subtype on a user
+ * record marks where the message came from rather than making it another kind
+ * of content, so it belongs on the message channel.
+ */
+const CARRIED_MESSAGE_SUBTYPES = new Set([
+  'goal_runtime',
+  'mid_turn_user_message',
 ]);
 
 export class ManagedSessionUnmappedRecordError extends Error {
@@ -63,6 +73,7 @@ export class ManagedSessionRecordSink {
       if (record.subtype === 'custom_title') return true;
       if (record.subtype === 'turn_result') return true;
       if (record.subtype === 'chat_compression') return true;
+      if (record.subtype === 'goal_state') return true;
       return (
         record.subtype !== undefined &&
         CARRIED_SYSTEM_SUBTYPES.has(record.subtype)
@@ -73,7 +84,10 @@ export class ManagedSessionRecordSink {
       record.type === 'assistant' ||
       record.type === 'tool_result'
     ) {
-      return record.subtype === undefined;
+      return (
+        record.subtype === undefined ||
+        CARRIED_MESSAGE_SUBTYPES.has(record.subtype)
+      );
     }
     return false;
   }
@@ -89,6 +103,10 @@ export class ManagedSessionRecordSink {
     }
     if (record.subtype === 'custom_title') {
       await this.commitTitle(record);
+      return;
+    }
+    if (record.subtype === 'goal_state') {
+      await this.commitGoalState(record);
       return;
     }
     if (record.subtype === 'turn_result') {
@@ -141,6 +159,37 @@ export class ManagedSessionRecordSink {
             : {}),
         },
       },
+      { class: 'trusted_entry' },
+    );
+  }
+
+  /**
+   * A goal snapshot is the goal domain's state, so it is committed there rather
+   * than projected as a message. The body carries the whole record, because goal
+   * recovery reads the original record and the domain holds the complete goal
+   * state.
+   */
+  private async commitGoalState(record: ChatRecord): Promise<void> {
+    if (record.systemPayload === undefined) {
+      throw new ManagedSessionUnmappedRecordError(record);
+    }
+    await this.authority.commitDomainRecord(
+      {
+        operation: 'commitGoalState',
+        commandId: `recorder:${record.uuid}`,
+        sessionKey: this.authority.sessionHeader.sessionKey,
+        contentDigest: this.authority.sessionHeader.definitionRef.digest,
+      },
+      {
+        domain: 'goal_state',
+        // Nested rather than spread: the authority composes its envelope
+        // (operationId, revision, previousRecordRef) around the content, and a
+        // spread record would sit beside those fields and could collide.
+        content: { record: record as unknown as Record<string, unknown> },
+      },
+      // A domain record admits only a trusted entry: the update reaches the log
+      // through the authorised entry, and the activation is an eligibility
+      // condition rather than the author.
       { class: 'trusted_entry' },
     );
   }

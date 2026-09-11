@@ -161,16 +161,44 @@ export async function readManagedSessionRecords(options: {
   });
   const records: ChatRecord[] = [];
   for (const event of scan.events) {
-    const ref =
-      event.kind === 'message.committed'
-        ? event.payload['contentRef']
-        : event.kind === 'turn.settled'
-          ? event.payload['resultRef']
-          : event.kind === 'context.compacted'
-            ? event.payload['summaryRef']
-            : undefined;
-    if (ref === undefined) continue;
-    records.push(await readRecordBody(resources, ref));
+    const carried = readerFacingBody(event);
+    if (carried === undefined) continue;
+    const body = await readRecordBody(resources, carried.ref);
+    records.push(
+      carried.inDomainEnvelope
+        ? (body as unknown as { record: ChatRecord }).record
+        : body,
+    );
   }
   return records;
+}
+
+/**
+ * Where a whole reader-facing record lives, for the channels that carry one.
+ *
+ * Only the goal domain stores records; every other domain body has its own
+ * shape and is not something a reader replays. A domain body is the authority's
+ * envelope wrapping the content, so the record sits under its own key there,
+ * unlike the event channels whose body is the record itself.
+ */
+function readerFacingBody(event: ManagedSessionEvent):
+  | {
+      ref: ManagedSessionEvent['payload'][string];
+      inDomainEnvelope: boolean;
+    }
+  | undefined {
+  switch (event.kind) {
+    case 'message.committed':
+      return { ref: event.payload['contentRef'], inDomainEnvelope: false };
+    case 'turn.settled':
+      return { ref: event.payload['resultRef'], inDomainEnvelope: false };
+    case 'context.compacted':
+      return { ref: event.payload['summaryRef'], inDomainEnvelope: false };
+    case 'domain.committed':
+      return event.payload['domain'] === 'goal_state'
+        ? { ref: event.payload['recordRef'], inDomainEnvelope: true }
+        : undefined;
+    default:
+      return undefined;
+  }
 }
