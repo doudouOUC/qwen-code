@@ -264,6 +264,17 @@ import {
   SessionWriterLostError,
   SessionWriterUnavailableError,
 } from '../services/session-writer-lease.js';
+import {
+  openManagedSession,
+  type ManagedSession,
+} from '../managed-runtime/managed-session-assembly.js';
+import { LocalManagedSessionResourceStore } from '../managed-runtime/managed-session-resources.js';
+import type {
+  ManagedSessionDurableRef,
+  ManagedSessionKey,
+} from '../managed-runtime/managed-session-records.js';
+import { isManagedSessionTranscriptSync } from '../utils/sessionStorageUtils.js';
+import { getProjectHash } from '../utils/paths.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { loadServerHierarchicalMemory } from '../memory/memoryDiscovery.js';
 import { ConditionalRulesRegistry } from './rulesDiscovery.js';
@@ -1064,6 +1075,12 @@ export interface ConfigParameters {
    */
   restoreAskUserQuestion?: boolean;
   sessionWriterLeaseEnabled?: boolean;
+  /**
+   * Opt-in for the authoritative Managed session log. Only a managed host can
+   * enable it, and enabling it changes the on-disk shape of new sessions, so it
+   * stays off until a host asks for it explicitly.
+   */
+  managedSessionLogEnabled?: boolean;
   cronEnabled?: boolean;
   /**
    * Days a recurring cron job lives before auto-expiring. `0` disables
@@ -2312,6 +2329,7 @@ export class Config {
    */
   private preserveRestorableAskUserQuestion = false;
   private readonly sessionWriterLeaseEnabled: boolean = false;
+  private readonly managedSessionLogEnabled: boolean = false;
   private readonly cronEnabled: boolean = true;
   /** Recurring cron max age in days, resolved once at construction
    * (the setting declares `requiresRestart`); `Infinity` = no expiry. */
@@ -2654,6 +2672,10 @@ export class Config {
     this.sessionWriterLeaseEnabled =
       this.experimentalZedIntegration === true &&
       params.sessionWriterLeaseEnabled === true;
+    this.managedSessionLogEnabled =
+      this.sessionWriterLeaseEnabled &&
+      params.managedToolSessionFactory !== undefined &&
+      params.managedSessionLogEnabled === true;
     this.cronEnabled = params.cronEnabled ?? true;
     this.cronRecurringMaxAgeDays = resolveCronRecurringMaxAgeDays(
       params.cronRecurringMaxAgeDays,
@@ -3629,6 +3651,83 @@ export class Config {
     }
   }
 
+  /**
+   * Opens the authoritative Managed session log on the writer that is about to
+   * become the recorder's. Two writers for one session cannot coexist, so the
+   * lease is adopted rather than acquired, and ending it stays with whoever
+   * holds it -- the recorder, once activation completes.
+   */
+  private async openManagedSessionLog(
+    lease: SessionWriterLease,
+  ): Promise<ManagedSession> {
+    const transcriptPath = this.getTranscriptPath();
+    const projectRoot = this.getProjectRoot();
+    const sessionKey: ManagedSessionKey = {
+      tenantId: 'local',
+      workspaceId: getProjectHash(projectRoot),
+      sessionId: this.sessionId,
+    };
+    return openManagedSession({
+      runtimeBaseDir: this.sessionRuntimeBaseDir,
+      sessionId: this.sessionId,
+      transcriptPath,
+      sessionKey,
+      // Matches what the recorder stamps on every record it projects.
+      cwd: projectRoot,
+      version: this.getCliVersion() || 'unknown',
+      // No Harness is advancing the session yet, so records are written as a
+      // trusted entry until activation lands.
+      activation: () => undefined,
+      lease,
+      // Only avoids republishing resources a reopened session already has; the
+      // authority reads the log itself and ignores these once a header exists.
+      ...(isManagedSessionTranscriptSync(transcriptPath)
+        ? {}
+        : { create: await this.publishManagedSessionRoot(sessionKey) }),
+    });
+  }
+
+  /**
+   * Publishes the two resources a new Managed session header must reference.
+   * Carries configuration identity only -- never credentials, which stay out of
+   * the log and out of anything it references.
+   */
+  private async publishManagedSessionRoot(
+    sessionKey: ManagedSessionKey,
+  ): Promise<{
+    definitionRef: ManagedSessionDurableRef;
+    rootSnapshotRef: ManagedSessionDurableRef;
+    createdBy: string;
+  }> {
+    const resources = LocalManagedSessionResourceStore.create({
+      runtimeBaseDir: this.sessionRuntimeBaseDir,
+      sessionKey,
+    });
+    const [definitionRef, rootSnapshotRef] = await Promise.all([
+      resources.publish(
+        'managed-session-definition',
+        Buffer.from(
+          JSON.stringify({
+            version: 1,
+            engine: 'managed',
+            model: this.getModel(),
+            approvalMode: this.getApprovalMode(),
+          }),
+          'utf8',
+        ),
+      ),
+      resources.publish(
+        'managed-session-root-snapshot',
+        Buffer.from(JSON.stringify({ version: 1, messages: [] }), 'utf8'),
+      ),
+    ]);
+    return {
+      definitionRef,
+      rootSnapshotRef,
+      createdBy: `qwen-code/${this.getCliVersion() || 'unknown'}`,
+    };
+  }
+
   private async activateChatRecording(
     executionEngine?: SessionExecutionEngine,
   ): Promise<void> {
@@ -3673,7 +3772,12 @@ export class Config {
         processKind: 'acp',
         qwenVersion: this.cliVersion ?? null,
         reclaimPolicy: this.sessionWriterReclaimPolicy,
-        takeoverPolicy: this.sessionWriterTakeoverPolicy,
+        // A Managed session closes by sealing, and only a certified takeover
+        // may reacquire a sealed lock -- without this, reopening one raises a
+        // writer conflict. A live lock still conflicts either way.
+        takeoverPolicy: this.managedSessionLogEnabled
+          ? 'certified'
+          : this.sessionWriterTakeoverPolicy,
         onOwnershipAcquired: (acquiredLease) => {
           lease = acquiredLease;
           this.pendingSessionWriterLease = acquiredLease;
@@ -3744,6 +3848,12 @@ export class Config {
         throw new SessionWriterShutdownError();
       }
       this.sessionData = authoritative;
+      // Opened before the recorder accepts writes: `activate()` starts
+      // accepting them synchronously, and a record that took the legacy append
+      // path would land raw in an authoritative log.
+      const managedSession = this.managedSessionLogEnabled
+        ? await this.openManagedSessionLog(lease)
+        : undefined;
       recorder.activate(
         lease,
         authoritative,
@@ -3752,7 +3862,13 @@ export class Config {
       );
       this.pendingSessionWriterLease = undefined;
       lease = undefined;
-      if (executionEngine) {
+      if (managedSession) {
+        // The authority already wrote the engine record and the header, and the
+        // sink refuses records it cannot map, so no engine record is written
+        // here.
+        recorder.bindManagedSink(managedSession.sink);
+        this.sessionExecutionEngine = 'managed';
+      } else if (executionEngine) {
         await recorder.recordSessionExecutionEngine(executionEngine);
         this.sessionExecutionEngine = executionEngine;
       }

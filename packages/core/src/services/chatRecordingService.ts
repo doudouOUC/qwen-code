@@ -1800,7 +1800,10 @@ export class ChatRecordingService {
     }
     const lease = this.binding?.lease;
     try {
-      if (this.handoffRequested) {
+      // Releasing deletes the lock, which would leave a Managed log with no
+      // at-rest barrier at all: a legacy writer could then acquire it and
+      // append, and the authority would refuse to reopen the log afterwards.
+      if (this.handoffRequested || this.managedSink) {
         await lease?.sealForHandoff();
       } else {
         await lease?.release();

@@ -9,6 +9,7 @@ import {
   type ManagedSessionActor,
 } from './managed-session-authority.js';
 import { ManagedSessionRecordSink } from './managed-session-record-sink.js';
+import type { SessionWriterLease } from '../services/session-writer-lease.js';
 import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
 import type {
   ManagedSessionDurableRef,
@@ -36,6 +37,14 @@ export interface OpenManagedSessionOptions {
   readonly activation: () =>
     | { readonly activationId: string; readonly epoch: number }
     | undefined;
+  /**
+   * An already-held writer to adopt instead of acquiring one.
+   *
+   * Two writers for one session cannot coexist, so a caller that already owns
+   * the session's writer hands it in. Its owner keeps the lifecycle: `close()`
+   * then leaves the lease alone rather than sealing it.
+   */
+  readonly lease?: SessionWriterLease;
 }
 
 export interface ManagedSession {
@@ -62,11 +71,14 @@ export async function openManagedSession(
     runtimeBaseDir: options.runtimeBaseDir,
     sessionKey: options.sessionKey,
   });
-  const lease = await LocalManagedSessionAuthority.acquireWriter({
-    runtimeBaseDir: options.runtimeBaseDir,
-    sessionId: options.sessionId,
-    transcriptPath: options.transcriptPath,
-  });
+  const adopted = options.lease !== undefined;
+  const lease =
+    options.lease ??
+    (await LocalManagedSessionAuthority.acquireWriter({
+      runtimeBaseDir: options.runtimeBaseDir,
+      sessionId: options.sessionId,
+      transcriptPath: options.transcriptPath,
+    }));
   let authority: LocalManagedSessionAuthority;
   try {
     authority = await LocalManagedSessionAuthority.open({
@@ -78,9 +90,13 @@ export async function openManagedSession(
       ...(options.create === undefined ? {} : { create: options.create }),
     });
   } catch (cause) {
-    // The writer must not be left held when the session cannot be opened, and
-    // sealing an unopened session would leave a barrier with nothing behind it.
-    await lease.release().catch(() => undefined);
+    // An adopted writer is not ours to end: releasing it would pull the lease
+    // out from under its owner. One we acquired must be released, since sealing
+    // an unopened session leaves a barrier with nothing behind it and leaving it
+    // held blocks every later attempt.
+    if (!adopted) {
+      await lease.release().catch(() => undefined);
+    }
     throw cause;
   }
 
@@ -97,6 +113,7 @@ export async function openManagedSession(
     authority,
     resources,
     sink,
-    close: () => authority.close(),
+    // Sealing is the at-rest barrier, but only the lease's owner may end it.
+    close: adopted ? async () => undefined : () => authority.close(),
   };
 }

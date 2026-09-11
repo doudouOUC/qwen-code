@@ -65,7 +65,7 @@ async function createWorkspace(): Promise<Workspace> {
 
 function open(
   workspace: Workspace,
-  options: { create?: boolean } = {},
+  options: { create?: boolean; lease?: SessionWriterLease } = {},
 ): Promise<ManagedSession> {
   return openManagedSession({
     runtimeBaseDir: workspace.runtimeBaseDir,
@@ -75,6 +75,7 @@ function open(
     cwd: workspace.projectRoot,
     version: 'test',
     activation: () => workspace.activation,
+    ...(options.lease === undefined ? {} : { lease: options.lease }),
     ...(options.create === false
       ? {}
       : {
@@ -234,5 +235,51 @@ describe('managed session assembly', () => {
     const session = await open(workspace);
     expect(session.authority.committedSequence).toBe(0);
     await session.close();
+  });
+
+  it('leaves an adopted writer to its owner', async () => {
+    const workspace = await createWorkspace();
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: workspace.runtimeBaseDir,
+      sessionId,
+      transcriptPath: workspace.transcriptPath,
+    });
+    const session = await open(workspace, { lease });
+    await session.sink.write(record({ uuid: 'rec-user-1' }));
+    await session.close();
+
+    // Closing the session must not end a lease it never acquired: the owner is
+    // still writing through it after this point.
+    expect(lease.isReleased).toBe(false);
+
+    // The barrier arrives when the owner seals, which is the owner's decision
+    // to make -- releasing instead would leave the Managed log unguarded.
+    await lease.sealForHandoff();
+    await expect(
+      SessionWriterLease.acquire({
+        runtimeBaseDir: workspace.runtimeBaseDir,
+        sessionId,
+        transcriptPath: workspace.transcriptPath,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('leaves an adopted writer intact when opening fails', async () => {
+    const workspace = await createWorkspace();
+    const lease = await SessionWriterLease.acquire({
+      runtimeBaseDir: workspace.runtimeBaseDir,
+      sessionId,
+      transcriptPath: workspace.transcriptPath,
+    });
+
+    await expect(open(workspace, { create: false, lease })).rejects.toThrow();
+    expect(lease.isReleased).toBe(false);
+
+    // Still the same writer, so the owner can retry through it.
+    const session = await open(workspace, { lease });
+    await session.sink.write(record({ uuid: 'rec-user-1' }));
+    expect(await session.sink.project()).toHaveLength(1);
+    await session.close();
+    await lease.sealForHandoff();
   });
 });
