@@ -184,6 +184,59 @@ describe('managed session record sink', () => {
     await harness.close();
   });
 
+  it('chains a branch checkpoint to the previous one past a page of events', async () => {
+    const harness = await createHarness();
+    const checkpoint = (uuid: string) =>
+      record({
+        uuid,
+        type: 'system',
+        subtype: 'branch_checkpoint',
+        systemPayload: {
+          v: 1,
+          startExclusiveRecordUuid: null,
+          assistantRecordUuid: 'rec-assistant',
+        },
+      });
+    const filler = async (prefix: string, count: number) => {
+      for (let index = 0; index < count; index++) {
+        await harness.sink.write(
+          record({
+            uuid: `rec-${prefix}-${index}`,
+            message: { role: 'user', parts: [{ text: `${prefix} ${index}` }] },
+          }),
+        );
+      }
+    };
+    // The first checkpoint has to land beyond `defaultReadEvents`, or a paged
+    // scan from the start would still reach it and the chain would look sound.
+    await filler('early', 110);
+    await harness.sink.write(checkpoint('rec-checkpoint-1'));
+    await filler('late', 2);
+    await harness.sink.write(checkpoint('rec-checkpoint-2'));
+
+    const latest = harness.authority.lastEventOfKind('checkpoint.committed');
+    expect(latest?.payload['checkpointId']).toBe('rec-checkpoint-2');
+    expect(latest?.payload['previousCheckpointId']).toBe('rec-checkpoint-1');
+
+    // A compaction describes the range it replaces, so it has to name every
+    // message in it — a page would have listed only the first hundred.
+    await harness.sink.write(
+      record({
+        uuid: 'rec-compact-1',
+        type: 'system',
+        subtype: 'chat_compression',
+        systemPayload: {
+          compressedHistory: [{ role: 'user', parts: [{ text: 'summary' }] }],
+        },
+      } as Partial<ChatRecord>),
+    );
+    const compaction = harness.authority.lastEventOfKind('context.compacted');
+    expect((compaction?.payload['replacedMessageIds'] as string[]).length).toBe(
+      112,
+    );
+    await harness.close();
+  });
+
   it('commits a compaction as the range of history it replaces', async () => {
     const harness = await createHarness();
     const message = record({

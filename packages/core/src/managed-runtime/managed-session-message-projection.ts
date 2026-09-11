@@ -176,7 +176,7 @@ export async function readManagedSessionRecords(options: {
  * Domains whose body is a whole reader-facing record. The rest carry their own
  * shape and are not something a reader replays.
  */
-const RECORD_CARRYING_DOMAINS: ReadonlySet<string> = new Set([
+const RECORD_CARRYING_DOMAINS: ReadonlySet<unknown> = new Set([
   'goal_state',
   'file_history',
   'session_source',
@@ -205,7 +205,7 @@ function readerFacingBody(event: ManagedSessionEvent):
     case 'checkpoint.committed':
       return { ref: event.payload['stateRef'], inDomainEnvelope: false };
     case 'domain.committed':
-      return RECORD_CARRYING_DOMAINS.has(event.payload['domain'] as string)
+      return RECORD_CARRYING_DOMAINS.has(event.payload['domain'])
         ? { ref: event.payload['recordRef'], inDomainEnvelope: true }
         : undefined;
     default:

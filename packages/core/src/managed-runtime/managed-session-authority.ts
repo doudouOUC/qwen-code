@@ -31,6 +31,7 @@ import {
   type ManagedSessionCommitMarker,
   type ManagedSessionDurableRef,
   type ManagedSessionEvent,
+  type ManagedSessionEventKind,
   type ManagedSessionHeader,
   type ManagedSessionKey,
 } from './managed-session-records.js';
@@ -400,6 +401,38 @@ export class LocalManagedSessionAuthority {
     }
     await rename(pendingPath, diagnosticPath);
     return { discardedBytes: discarded.byteLength, diagnosticPath };
+  }
+
+  /**
+   * The newest committed event of a kind.
+   *
+   * Separate from the paged read on purpose: that one starts at the beginning
+   * and caps at `maxReadEvents`, so a caller looking for the latest of
+   * something would silently find nothing once the log outgrows a page.
+   */
+  lastEventOfKind(
+    kind: ManagedSessionEventKind,
+  ): ManagedSessionEvent | undefined {
+    for (let index = this.events.length - 1; index >= 0; index--) {
+      if (this.events[index].kind === kind) return this.events[index];
+    }
+    return undefined;
+  }
+
+  /**
+   * Every committed event in an inclusive sequence range.
+   *
+   * Same reason as {@link lastEventOfKind} for not going through the paged
+   * read: a caller describing a range has to see all of it, and a page would
+   * silently truncate the description.
+   */
+  eventsInSequenceRange(
+    fromSequence: number,
+    toSequence: number,
+  ): readonly ManagedSessionEvent[] {
+    return this.events.filter(
+      (event) => event.sequence >= fromSequence && event.sequence <= toSequence,
+    );
   }
 
   /**

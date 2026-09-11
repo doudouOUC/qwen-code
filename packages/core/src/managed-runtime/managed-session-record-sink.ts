@@ -349,13 +349,8 @@ export class ManagedSessionRecordSink {
     const fromSequence = this.authority.compactedThroughSequence + 1;
     const toSequence = this.authority.committedSequence;
     const replacedMessageIds = this.authority
-      .readEvents()
-      .filter(
-        (event) =>
-          event.kind === 'message.committed' &&
-          event.sequence >= fromSequence &&
-          event.sequence <= toSequence,
-      )
+      .eventsInSequenceRange(fromSequence, toSequence)
+      .filter((event) => event.kind === 'message.committed')
       .map((event) => event.payload['messageId'] as string);
     const summaryRef = await this.resources.publish(
       'managed-compaction-summary',
@@ -414,10 +409,7 @@ export class ManagedSessionRecordSink {
       throw new ManagedSessionUnmappedRecordError(record);
     }
     const coveredSequence = this.authority.committedSequence;
-    const previous = this.authority
-      .readEvents()
-      .filter((event) => event.kind === 'checkpoint.committed')
-      .at(-1);
+    const previous = this.authority.lastEventOfKind('checkpoint.committed');
     const stateRef = await this.resources.publish(
       'managed-branch-checkpoint',
       Buffer.from(JSON.stringify(record), 'utf8'),
