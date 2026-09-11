@@ -320,6 +320,11 @@ const ACTIVE_TODO_REMINDER_REFRESH_TURNS = 3;
 // mirrors the settings-schema default in packages/cli.
 const DEFAULT_TOOL_SEARCH_THRESHOLD = 10;
 
+// Horizon an installed Managed activation records. Real liveness is the writer
+// lock's pid check, so this only bounds how long a reader treats a lock-less
+// activation as possibly still live.
+const MANAGED_ACTIVATION_LEASE_MS = 5 * 60 * 1000;
+
 import {
   ModelsConfig,
   type ModelProvidersConfig,
@@ -2332,6 +2337,8 @@ export class Config {
   private preserveRestorableAskUserQuestion = false;
   private readonly sessionWriterLeaseEnabled: boolean = false;
   private readonly managedSessionLogEnabled: boolean = false;
+  /** Held for its activation, which the close path has to release. */
+  private managedSession?: ManagedSession;
   private readonly cronEnabled: boolean = true;
   /** Recurring cron max age in days, resolved once at construction
    * (the setting declares `requiresRestart`); `Infinity` = no expiry. */
@@ -3676,9 +3683,15 @@ export class Config {
       // Matches what the recorder stamps on every record it projects.
       cwd: projectRoot,
       version: this.getCliVersion() || 'unknown',
-      // No Harness is advancing the session yet, so records are written as a
-      // trusted entry until activation lands.
-      activation: () => undefined,
+      // The embedded harness runs in the process that owns the writer, so the
+      // session it holds identifies the worker advancing the log.
+      workerId: this.sessionId,
+      // The activation really lives as long as this process holds the writer
+      // lock, whose liveness is a pid check, so this horizon is only what a
+      // reader compares against once the lock is gone. Nothing renews it yet, so
+      // a long session's activation can read as expired while its writer is
+      // still live.
+      activationLeaseDurationMs: MANAGED_ACTIVATION_LEASE_MS,
       lease,
       // Only avoids republishing resources a reopened session already has; the
       // authority reads the log itself and ignores these once a header exists.
@@ -3868,6 +3881,7 @@ export class Config {
         // sink refuses records it cannot map, so no engine record is written
         // here.
         recorder.bindManagedSink(managedSession.sink);
+        this.managedSession = managedSession;
         this.sessionExecutionEngine = 'managed';
       } else if (executionEngine) {
         await recorder.recordSessionExecutionEngine(executionEngine);
@@ -9147,6 +9161,21 @@ export class Config {
       await activation;
     } catch (error) {
       if (!(error instanceof SessionWriterShutdownError)) {
+        failures.push(error);
+      }
+    }
+    const managedSession = this.managedSession;
+    if (managedSession) {
+      this.managedSession = undefined;
+      try {
+        // `beginClose()` has already stopped the recorder accepting writes, so
+        // this is the one point where no further record can arrive to name a
+        // released activation -- which the fence would refuse.
+        await this.chatRecordingService?.flush();
+        await managedSession.releaseActivation();
+      } catch (error) {
+        // Collected rather than thrown: the seal below is the at-rest barrier,
+        // and losing it is worse than an activation left looking abandoned.
         failures.push(error);
       }
     }

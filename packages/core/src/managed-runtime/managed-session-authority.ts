@@ -88,7 +88,10 @@ export interface ManagedSessionDomainReceipt {
 export interface ManagedSessionActivationState {
   readonly activationId: string;
   readonly epoch: number;
+  readonly workerId: string;
   readonly phase: string;
+  /** The horizon the install recorded; a release restates it unchanged. */
+  readonly expiresAt: number;
 }
 
 export interface ManagedSessionCommitReceipt {
@@ -817,10 +820,146 @@ export class LocalManagedSessionAuthority {
   }
 
   /**
-   * The authority decides the epoch; a coordinator may only submit the value
-   * the authority would assign. A new activation advances the epoch by one, and
-   * a phase change keeps the epoch of the activation it describes.
+   * Installs a new activation, which is what allows a Harness to append at all.
+   *
+   * The epoch is the authority's to assign, so the caller supplies an identity
+   * and gets back the activation to present on every later append. Only a
+   * coordinator may record the transition, so the actor is not a parameter.
    */
+  async installActivation(input: {
+    readonly activationId: string;
+    readonly workerId: string;
+    /**
+     * How long the install claims the activation stays live. The format
+     * requires a horizon; a reader compares it against the writer lock to judge
+     * whether the holder is still there.
+     */
+    readonly leaseDurationMs: number;
+  }): Promise<{ activationId: string; epoch: number }> {
+    const epoch = (this.activation?.epoch ?? 0) + 1;
+    const installRef = await this.publishActivationBody(
+      'managed-activation-install',
+      {
+        version: 1,
+        activationId: input.activationId,
+        epoch,
+        workerId: input.workerId,
+        leaseDurationMs: input.leaseDurationMs,
+      },
+    );
+    await this.commitActivation({
+      activationId: input.activationId,
+      epoch,
+      workerId: input.workerId,
+      phase: 'active',
+      leaseDurationMs: input.leaseDurationMs,
+      expiresAt: this.now() + input.leaseDurationMs,
+      installRef,
+      boundaryRef: null,
+      operation: 'installActivation',
+    });
+    return { activationId: input.activationId, epoch };
+  }
+
+  /**
+   * Records that the current activation stopped advancing the session.
+   *
+   * Without it a reader cannot tell a holder that finished from one that
+   * vanished, so the boundary is what recovery reads. Releasing an activation
+   * that is already gone is not an error: there is nothing left to fence.
+   */
+  async releaseActivation(): Promise<void> {
+    const current = this.activation;
+    if (
+      current === undefined ||
+      current.phase === 'released' ||
+      current.phase === 'revoked'
+    ) {
+      return;
+    }
+    const boundaryRef = await this.publishActivationBody(
+      'managed-activation-boundary',
+      {
+        version: 1,
+        activationId: current.activationId,
+        epoch: current.epoch,
+        committedSequence: this.committed,
+        lastRecordUuid: this.lastRecordUuid,
+      },
+    );
+    await this.commitActivation({
+      activationId: current.activationId,
+      epoch: current.epoch,
+      workerId: current.workerId,
+      phase: 'released',
+      leaseDurationMs: null,
+      expiresAt: current.expiresAt,
+      installRef: null,
+      boundaryRef,
+      operation: 'releaseActivation',
+    });
+  }
+
+  private async publishActivationBody(
+    kind: string,
+    body: Record<string, unknown>,
+  ): Promise<ManagedSessionDurableRef> {
+    const store = this.resources;
+    if (store === undefined) {
+      throw new ManagedSessionRecordError(
+        'a resource store is required to change the activation.',
+      );
+    }
+    return store.publish(kind, Buffer.from(JSON.stringify(body), 'utf8'));
+  }
+
+  private async commitActivation(input: {
+    readonly activationId: string;
+    readonly epoch: number;
+    readonly workerId: string;
+    readonly phase: string;
+    readonly leaseDurationMs: number | null;
+    readonly expiresAt: number | null;
+    readonly installRef: ManagedSessionDurableRef | null;
+    readonly boundaryRef: ManagedSessionDurableRef | null;
+    readonly operation: string;
+  }): Promise<void> {
+    const event = {
+      v: MANAGED_SESSION_FORMAT_VERSION,
+      sequence: this.committed + 1,
+      eventId: `activation:${input.activationId}:${input.phase}`,
+      sessionKey: this.sessionKey,
+      kind: 'activation.changed',
+      occurredAt: this.now(),
+      payload: {
+        activationId: input.activationId,
+        epoch: input.epoch,
+        workerId: input.workerId,
+        subject: {
+          type: 'activation',
+          scopeId: input.activationId,
+          activationId: input.activationId,
+          epoch: input.epoch,
+        },
+        phase: input.phase,
+        leaseDurationMs: input.leaseDurationMs,
+        expiresAt: input.expiresAt,
+        installRef: input.installRef,
+        boundaryRef: input.boundaryRef,
+      },
+    };
+    await this.appendExecution(
+      {
+        operation: input.operation,
+        commandId: `${input.activationId}:${input.phase}`,
+        sessionKey: this.sessionKey,
+        contentDigest: this.header.definitionRef.digest,
+      },
+      [event],
+      { class: 'coordinator' },
+    );
+  }
+
   /**
    * Tracks the two facts recovery turns on: the newest checkpoint, and whether
    * any execution has happened that a checkpoint would have to cover.
@@ -1168,6 +1307,8 @@ function activationStateFrom(
   return {
     activationId: event.payload['activationId'] as string,
     epoch: event.payload['epoch'] as number,
+    workerId: event.payload['workerId'] as string,
     phase: event.payload['phase'] as string,
+    expiresAt: event.payload['expiresAt'] as number,
   };
 }

@@ -44,7 +44,6 @@ interface Workspace {
   runtimeBaseDir: string;
   projectRoot: string;
   transcriptPath: string;
-  activation: { activationId: string; epoch: number } | undefined;
 }
 
 async function createWorkspace(): Promise<Workspace> {
@@ -60,7 +59,7 @@ async function createWorkspace(): Promise<Workspace> {
     `${sessionId}.jsonl`,
   );
   await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
-  return { runtimeBaseDir, projectRoot, transcriptPath, activation: undefined };
+  return { runtimeBaseDir, projectRoot, transcriptPath };
 }
 
 function open(
@@ -74,7 +73,8 @@ function open(
     sessionKey,
     cwd: workspace.projectRoot,
     version: 'test',
-    activation: () => workspace.activation,
+    workerId: 'worker-1',
+    activationLeaseDurationMs: 60_000,
     ...(options.lease === undefined ? {} : { lease: options.lease }),
     ...(options.create === false
       ? {}
@@ -106,51 +106,21 @@ describe('managed session assembly', () => {
     const workspace = await createWorkspace();
     const session = await open(workspace);
 
-    // Before a Harness advances the session there is no activation to name, so
-    // the accepted input is written as a trusted entry.
+    // Opening installed the activation, so every record names it as its harness
+    // without the caller arranging anything.
+    expect(session.activation.epoch).toBe(1);
+    const installed = session.authority
+      .readEvents()
+      .filter((event) => event.kind === 'activation.changed');
+    expect(installed).toHaveLength(1);
+    expect(installed[0].payload['workerId']).toBe('worker-1');
+    expect(installed[0].payload['phase']).toBe('active');
+
     const userRecord = record({
       uuid: 'rec-user-1',
       message: { role: 'user', parts: [{ text: 'summarise the docs' }] },
     });
     await session.sink.write(userRecord);
-
-    // A Harness claims the session, and from here records name its activation.
-    await session.authority.appendExecution(
-      {
-        operation: 'claimActivation',
-        commandId: 'cmd-act-1',
-        sessionKey,
-        contentDigest: DIGEST,
-      },
-      [
-        {
-          v: 1,
-          sequence: session.authority.committedSequence + 1,
-          eventId: 'evt-act-1',
-          sessionKey,
-          kind: 'activation.changed',
-          occurredAt: 1,
-          payload: {
-            activationId: 'act-1',
-            epoch: 1,
-            workerId: 'worker-1',
-            subject: {
-              type: 'activation',
-              scopeId: 'act-1',
-              activationId: 'act-1',
-              epoch: 1,
-            },
-            phase: 'active',
-            leaseDurationMs: 60_000,
-            expiresAt: 2,
-            installRef: ref(),
-            boundaryRef: null,
-          },
-        },
-      ],
-      { class: 'coordinator' },
-    );
-    workspace.activation = { activationId: 'act-1', epoch: 1 };
 
     const assistantRecord = record({
       uuid: 'rec-assistant-1',
@@ -233,7 +203,7 @@ describe('managed session assembly', () => {
     // The writer was released rather than left held or sealed, so a fresh open
     // succeeds instead of colliding with an abandoned lock.
     const session = await open(workspace);
-    expect(session.authority.committedSequence).toBe(0);
+    expect(session.authority.committedSequence).toBe(1);
     await session.close();
   });
 

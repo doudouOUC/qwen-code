@@ -124,6 +124,44 @@ describe('managed session log activation', () => {
     });
   });
 
+  it('attributes records to the activation it installed and releases it', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      fixture.config.getChatRecordingService()!.recordUserMessage('first turn');
+      await fixture.config.closeSessionWriter();
+
+      const events = (await transcriptRecords(fixture.transcriptPath))
+        .filter((entry) => entry['subtype'] === MANAGED_SESSION_EVENT_SUBTYPE)
+        .map((entry) => entry['managedSession'] as Record<string, unknown>);
+      const activations = events.filter(
+        (event) => event['kind'] === 'activation.changed',
+      );
+
+      // Installed on open, released on close: a reader can tell a holder that
+      // finished from one that vanished.
+      expect(
+        activations.map(
+          (event) =>
+            (event['payload'] as Record<string, unknown>)['phase'] as string,
+        ),
+      ).toEqual(['active', 'released']);
+      const installed = activations[0]['payload'] as Record<string, unknown>;
+      const released = activations[1]['payload'] as Record<string, unknown>;
+      expect(installed['workerId']).toBe(sessionId);
+      expect(installed['installRef']).not.toBeNull();
+      expect(released['boundaryRef']).not.toBeNull();
+
+      // The message names that activation, so the fence accepted it as harness
+      // output rather than as an untethered entry.
+      const message = events.find(
+        (event) => event['kind'] === 'message.committed',
+      );
+      expect(
+        (message?.['subject'] as Record<string, unknown>)['activationId'],
+      ).toBe(installed['activationId']);
+    });
+  });
+
   it('reopens a sealed managed session and continues the same log', async () => {
     await withWorkspace(async (activate) => {
       const first = await activate({ managedSessionLog: true });

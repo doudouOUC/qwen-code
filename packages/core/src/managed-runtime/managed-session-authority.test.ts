@@ -458,7 +458,9 @@ describe('managed session authority activation fences', () => {
     expect(opened.authority.currentActivation).toEqual({
       activationId: 'act-1',
       epoch: 1,
+      workerId: 'worker-1',
       phase: 'active',
+      expiresAt: 2,
     });
     await opened.release();
   });
@@ -472,7 +474,9 @@ describe('managed session authority activation fences', () => {
     expect(reopened.authority.currentActivation).toEqual({
       activationId: 'act-1',
       epoch: 1,
+      workerId: 'worker-1',
       phase: 'active',
+      expiresAt: 2,
     });
     await reopened.release();
   });

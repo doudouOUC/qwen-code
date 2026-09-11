@@ -4,10 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {
-  LocalManagedSessionAuthority,
-  type ManagedSessionActor,
-} from './managed-session-authority.js';
+import { randomUUID } from 'node:crypto';
+import { LocalManagedSessionAuthority } from './managed-session-authority.js';
 import { ManagedSessionRecordSink } from './managed-session-record-sink.js';
 import type { SessionWriterLease } from '../services/session-writer-lease.js';
 import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
@@ -30,13 +28,17 @@ export interface OpenManagedSessionOptions {
     readonly createdBy: string;
   };
   /**
-   * The activation the Harness currently holds, or undefined when no Harness is
-   * advancing the session. Read per record rather than captured, because a
-   * session outlives any one activation.
+   * Identifies the worker advancing the session. Opening installs an activation
+   * under this identity, because a writer that opens the log is by definition
+   * the party advancing it, and only an activation lets a Harness append.
    */
-  readonly activation: () =>
-    | { readonly activationId: string; readonly epoch: number }
-    | undefined;
+  readonly workerId: string;
+  /**
+   * How long the installed activation claims to stay live. Required because the
+   * format records a horizon and the policy belongs to the caller: nothing here
+   * knows how long that worker is supervised for.
+   */
+  readonly activationLeaseDurationMs: number;
   /**
    * An already-held writer to adopt instead of acquiring one.
    *
@@ -51,6 +53,19 @@ export interface ManagedSession {
   readonly authority: LocalManagedSessionAuthority;
   readonly resources: LocalManagedSessionResourceStore;
   readonly sink: ManagedSessionRecordSink;
+  /** The activation this session installed, which its records name. */
+  readonly activation: {
+    readonly activationId: string;
+    readonly epoch: number;
+  };
+  /**
+   * Records that this activation stopped advancing the session.
+   *
+   * Separate from `close()` because it must land after the last record and
+   * before the writer is sealed: a record naming a released activation is
+   * refused by the fence.
+   */
+  releaseActivation(): Promise<void>;
   /** Seals the writer, leaving the at-rest barrier in place. */
   close(): Promise<void>;
 }
@@ -100,20 +115,33 @@ export async function openManagedSession(
     throw cause;
   }
 
-  const sink = new ManagedSessionRecordSink(authority, resources, () => {
-    const held = options.activation();
-    // A record with no activation to name comes from a trusted entry -- an
-    // accepted input, projected before any Harness advances the session.
-    return held === undefined
-      ? ({ class: 'trusted_entry' } satisfies ManagedSessionActor)
-      : ({ class: 'harness', activation: held } satisfies ManagedSessionActor);
+  const activation = await authority.installActivation({
+    activationId: randomUUID(),
+    workerId: options.workerId,
+    leaseDurationMs: options.activationLeaseDurationMs,
   });
+
+  // Installed before the sink exists, so there is no window in which a record
+  // has no activation to name.
+  const sink = new ManagedSessionRecordSink(authority, resources, () => ({
+    class: 'harness',
+    activation,
+  }));
 
   return {
     authority,
     resources,
     sink,
+    activation,
+    releaseActivation: () => authority.releaseActivation(),
     // Sealing is the at-rest barrier, but only the lease's owner may end it.
-    close: adopted ? async () => undefined : () => authority.close(),
+    // A call that owns the whole lifecycle also records the boundary, or the
+    // activation would read as abandoned.
+    close: adopted
+      ? async () => undefined
+      : async () => {
+          await authority.releaseActivation();
+          await authority.close();
+        },
   };
 }
