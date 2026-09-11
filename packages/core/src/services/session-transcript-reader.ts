@@ -56,6 +56,7 @@ import {
   type GoalRecoverySelection,
 } from '../goals/goal-persistence.js';
 import {
+  buildGoalEvidenceCheckpointWindow,
   EvidenceSourceUnavailableError,
   GoalEvidenceCheckpointAccumulator,
   GoalEvidenceRecordIndexAccumulator,
@@ -2100,6 +2101,38 @@ function selectArtifactUuids(index: TranscriptIndex): string[] {
   );
 }
 
+/**
+ * The evidence window a resumed goal validates its cursor against.
+ *
+ * Scoped to the pending goal and its permit, so it can only be built once the
+ * recovery source is known. The records handed to the shared builder are the
+ * projected ones, because a Managed log's content lives in resource bodies the
+ * index cannot see.
+ */
+function managedGoalCheckpointWindow(
+  records: readonly ChatRecord[],
+  recovery: GoalRecoverySelection,
+): GoalEvidenceCheckpointWindow | undefined {
+  const pendingGoal =
+    recovery.recovery.kind === 'v2' ? recovery.recovery.payload : undefined;
+  const pendingCheckpoint = pendingGoal?.checkpointPending;
+  const goal = pendingGoal?.snapshot.goal;
+  if (!pendingCheckpoint || !goal) return undefined;
+  try {
+    return buildGoalEvidenceCheckpointWindow({
+      records,
+      goal,
+      permit: pendingCheckpoint.permit,
+    });
+  } catch (error) {
+    if (!(error instanceof EvidenceSourceUnavailableError)) throw error;
+    debugLogger.warn(
+      `restore projection: deferring unavailable Goal checkpoint evidence: ${error.message}`,
+    );
+    return undefined;
+  }
+}
+
 function indexHasManagedHeader(index: TranscriptIndex): boolean {
   return index.physicalRecords.some(
     (record) => record.subtype === MANAGED_SESSION_HEADER_SUBTYPE,
@@ -2746,6 +2779,10 @@ export class SessionTranscriptReader {
       ) ?? {};
     const turnStateValue = turnState.finish();
     const goalRecovery = selectGoalRecoveryFromRecords(goalRecords);
+    const goalCheckpointWindow = managedGoalCheckpointWindow(
+      records,
+      goalRecovery,
+    );
     const restoredTokenCounts = resumeTokenCounts.finish();
     const runtime: SessionRuntimeResumeState = {
       apiHistory: apiHistory.finish(),
@@ -2775,6 +2812,7 @@ export class SessionTranscriptReader {
       ...(goalRecovery.sourceUuid
         ? { goalRecoverySourceUuid: goalRecovery.sourceUuid }
         : {}),
+      ...(goalCheckpointWindow ? { goalCheckpointWindow } : {}),
       initialTurn: turnStateValue.initialTurn,
       backgroundNotificationTaskIds:
         turnStateValue.backgroundNotificationTaskIds,

@@ -10,6 +10,7 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Config, type ConfigParameters } from './config.js';
 import { CompressionStatus } from '../core/turn.js';
+import { buildGoalEvidenceCheckpointWindow } from '../goals/goal-evidence.js';
 import { Storage } from './storage.js';
 import { getSessionWriterLockPath } from '../services/session-writer-lease.js';
 import {
@@ -227,10 +228,39 @@ describe('managed session log activation', () => {
     await withWorkspace(async (activate) => {
       const fixture = await activate({ managedSessionLog: true });
       const recorder = fixture.config.getChatRecordingService()!;
+      const permit = {
+        goalId: 'goal-1',
+        revision: 1,
+        turnId: 'turn-1',
+      } as never;
+      recorder.recordUserMessage('set the goal');
+      recorder.recordAssistantTurn({
+        model: 'qwen3-coder-plus',
+        message: 'evidence for the goal',
+        goalContext: permit,
+      });
+      await recorder.flush();
+      const written = (await fixture.config
+        .getSessionService()
+        .loadSession(sessionId))!.conversation.messages;
+      const [cursorRecord, evidenceRecord] = written;
+      const goal = {
+        goalId: 'goal-1',
+        revision: 1,
+        objective: 'verify the result',
+        status: 'active',
+        evidenceCursor: { recordId: cursorRecord.uuid },
+        turnCount: 1,
+        activeTimeMs: 0,
+        tokensUsed: 0,
+        createdAt: 1,
+        updatedAt: 2,
+      };
       await recorder.recordGoalState('550e8400-e29b-41d4-a716-4466554400b1', {
         v: 2,
-        cause: 'create',
-        snapshot: { activity: 'idle' },
+        cause: 'turn_finished',
+        snapshot: { v: 2, activity: 'idle', goal },
+        checkpointPending: { permit, recordUuid: evidenceRecord.uuid },
       } as never);
       await fixture.config.closeSessionWriter();
 
@@ -245,6 +275,23 @@ describe('managed session log activation', () => {
       expect(
         projection?.runtime.goalRecords.map((entry) => entry.subtype),
       ).toEqual(['goal_state']);
+
+      // Equal to what the shared builder computes over the same records: the
+      // Managed path agrees with the legacy one rather than merely producing
+      // some window of its own.
+      expect(projection?.runtime.goalCheckpointWindow).toEqual(
+        buildGoalEvidenceCheckpointWindow({
+          records: projection!.replay!.records,
+          goal: goal as never,
+          permit,
+        }),
+      );
+      // One evidence record is below the entry and byte thresholds, so no
+      // checkpoint is due; what matters is that a window is produced and that
+      // it agrees.
+      expect(projection?.runtime.goalCheckpointWindow?.shouldCheckpoint).toBe(
+        false,
+      );
     });
   });
 
