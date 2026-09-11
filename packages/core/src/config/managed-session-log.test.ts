@@ -131,10 +131,28 @@ describe('managed session log activation', () => {
       await first.config.closeSessionWriter();
       const afterFirst = await transcriptRecords(first.transcriptPath);
 
+      // A reader sees the conversation, not the wrapper records carrying it.
+      const loaded = await first.config
+        .getSessionService()
+        .loadSession(sessionId);
+      expect(loaded?.conversation.messages.map((entry) => entry.type)).toEqual([
+        'user',
+      ]);
+      expect(loaded?.lastCompletedUuid).toBe(
+        loaded?.conversation.messages[0].uuid,
+      );
+
       // Taking over the seal, not colliding with it.
       const second = await activate({ managedSessionLog: true });
       second.config.getChatRecordingService()!.recordUserMessage('second turn');
       await second.config.closeSessionWriter();
+
+      const reloaded = await second.config
+        .getSessionService()
+        .loadSession(sessionId);
+      expect(
+        reloaded?.conversation.messages.map((entry) => entry.type),
+      ).toEqual(['user', 'user']);
 
       const records = await transcriptRecords(second.transcriptPath);
       const subtypes = records.map((entry) => entry['subtype']);
@@ -163,6 +181,29 @@ describe('managed session log activation', () => {
         ),
       ) as Record<string, unknown>;
       expect(lock['state']).toBe('sealed');
+    });
+  });
+
+  it('loads a managed session that nothing has been said in yet', async () => {
+    await withWorkspace(async (activate) => {
+      const first = await activate({ managedSessionLog: true });
+      await first.config.closeSessionWriter();
+
+      // The header is proof the session exists, so an empty history must not
+      // read as a missing session -- that would make the session unopenable.
+      const loaded = await first.config
+        .getSessionService()
+        .loadSession(sessionId);
+      expect(loaded?.conversation.messages).toEqual([]);
+      expect(loaded?.lastCompletedUuid).toBeNull();
+
+      const second = await activate({ managedSessionLog: true });
+      second.config.getChatRecordingService()!.recordUserMessage('first turn');
+      await second.config.closeSessionWriter();
+      const reloaded = await second.config
+        .getSessionService()
+        .loadSession(sessionId);
+      expect(reloaded?.conversation.messages).toHaveLength(1);
     });
   });
 

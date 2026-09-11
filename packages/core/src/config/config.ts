@@ -273,8 +273,10 @@ import type {
   ManagedSessionDurableRef,
   ManagedSessionKey,
 } from '../managed-runtime/managed-session-records.js';
-import { isManagedSessionTranscriptSync } from '../utils/sessionStorageUtils.js';
-import { getProjectHash } from '../utils/paths.js';
+import {
+  isManagedSessionTranscriptSync,
+  localManagedSessionKey,
+} from '../utils/sessionStorageUtils.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { loadServerHierarchicalMemory } from '../memory/memoryDiscovery.js';
 import { ConditionalRulesRegistry } from './rulesDiscovery.js';
@@ -3662,11 +3664,10 @@ export class Config {
   ): Promise<ManagedSession> {
     const transcriptPath = this.getTranscriptPath();
     const projectRoot = this.getProjectRoot();
-    const sessionKey: ManagedSessionKey = {
-      tenantId: 'local',
-      workspaceId: getProjectHash(projectRoot),
-      sessionId: this.sessionId,
-    };
+    const sessionKey: ManagedSessionKey = localManagedSessionKey(
+      projectRoot,
+      this.sessionId,
+    );
     return openManagedSession({
       runtimeBaseDir: this.sessionRuntimeBaseDir,
       sessionId: this.sessionId,

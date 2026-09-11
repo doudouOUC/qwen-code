@@ -13,6 +13,7 @@
 
 import fs from 'node:fs';
 import * as path from 'node:path';
+import { getProjectHash } from './paths.js';
 
 /** Size of the head/tail buffer for lite metadata reads (64KB). */
 export const LITE_READ_BUF_SIZE = 64 * 1024;
@@ -505,6 +506,25 @@ export function readSessionTitleInfoFromFileSync(
   const source =
     rawSource === 'auto' || rawSource === 'manual' ? rawSource : undefined;
   return { title, source };
+}
+
+/**
+ * The Managed session key for a locally stored session.
+ *
+ * The key addresses both the log's records and the resource bodies they
+ * reference, so the writer and every reader must derive it identically -- a
+ * second derivation that disagreed would leave published bodies unreadable.
+ * Structurally a `ManagedSessionKey`, defined here so `utils/` stays a leaf.
+ */
+export function localManagedSessionKey(
+  projectRoot: string,
+  sessionId: string,
+): { tenantId: string; workspaceId: string; sessionId: string } {
+  return {
+    tenantId: 'local',
+    workspaceId: getProjectHash(projectRoot),
+    sessionId,
+  };
 }
 
 /**

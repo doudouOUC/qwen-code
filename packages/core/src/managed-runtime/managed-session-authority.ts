@@ -975,7 +975,7 @@ interface ManagedSessionLogScan {
  * the scan rather than being skipped, because skipping it would resume
  * execution from an incomplete state.
  */
-async function readManagedSessionLog(
+export async function readManagedSessionLog(
   path: string,
   sessionKey: ManagedSessionKey,
 ): Promise<ManagedSessionLogScan> {

@@ -9,14 +9,17 @@ import {
   MANAGED_SESSION_FORMAT_VERSION,
   MANAGED_SESSION_LIMITS,
   ManagedSessionRecordError,
+  type ManagedSessionEvent,
+  type ManagedSessionKey,
 } from './managed-session-records.js';
-import type {
-  LocalManagedSessionAuthority,
-  ManagedSessionActor,
-  ManagedSessionCommand,
-  ManagedSessionCommitReceipt,
+import {
+  readManagedSessionLog,
+  type LocalManagedSessionAuthority,
+  type ManagedSessionActor,
+  type ManagedSessionCommand,
+  type ManagedSessionCommitReceipt,
 } from './managed-session-authority.js';
-import type { LocalManagedSessionResourceStore } from './managed-session-resources.js';
+import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
 
 /**
  * Carries the existing transcript history inside the authoritative log.
@@ -106,15 +109,56 @@ export class ManagedSessionMessageProjection {
       for (const event of page) {
         after = event.sequence;
         if (event.kind !== 'message.committed') continue;
-        const ref = event.payload['contentRef'];
-        const body = await this.resources.read(
-          ref as unknown as Parameters<
-            LocalManagedSessionResourceStore['read']
-          >[0],
-        );
-        records.push(JSON.parse(body.toString('utf8')) as ChatRecord);
+        records.push(await readMessageBody(this.resources, event.payload));
       }
     }
     return records;
   }
+}
+
+async function readMessageBody(
+  resources: LocalManagedSessionResourceStore,
+  payload: ManagedSessionEvent['payload'],
+): Promise<ChatRecord> {
+  const body = await resources.read(
+    payload['contentRef'] as unknown as Parameters<
+      LocalManagedSessionResourceStore['read']
+    >[0],
+  );
+  return JSON.parse(body.toString('utf8')) as ChatRecord;
+}
+
+/**
+ * Projects a Managed session's message history without taking the writer.
+ *
+ * Session loading runs on paths that never write, so it cannot go through the
+ * authority: acquiring a lease there would fight the live writer and fail for a
+ * session that is merely being read. The committed prefix is the whole history,
+ * so a torn or uncommitted tail left by a crashed writer is simply not part of
+ * what a reader sees.
+ */
+export async function readManagedSessionMessages(options: {
+  readonly transcriptPath: string;
+  readonly runtimeBaseDir: string;
+  readonly sessionKey: ManagedSessionKey;
+}): Promise<ChatRecord[]> {
+  const scan = await readManagedSessionLog(
+    options.transcriptPath,
+    options.sessionKey,
+  );
+  if (scan.header === undefined) {
+    throw new ManagedSessionRecordError(
+      'session log has no Managed header, so it cannot be projected.',
+    );
+  }
+  const resources = LocalManagedSessionResourceStore.create({
+    runtimeBaseDir: options.runtimeBaseDir,
+    sessionKey: options.sessionKey,
+  });
+  const records: ChatRecord[] = [];
+  for (const event of scan.events) {
+    if (event.kind !== 'message.committed') continue;
+    records.push(await readMessageBody(resources, event.payload));
+  }
+  return records;
 }

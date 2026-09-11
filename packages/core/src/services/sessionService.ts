@@ -42,10 +42,13 @@ import {
   LITE_READ_BUF_SIZE,
   readLastJsonStringFieldSync,
   isManagedSessionTranscriptSync,
+  localManagedSessionKey,
   managedSessionResourceRoot,
   readManagedSessionTitleInfoSync,
   readSessionTitleInfoFromFileSync,
 } from '../utils/sessionStorageUtils.js';
+import { readManagedSessionMessages } from '../managed-runtime/managed-session-message-projection.js';
+import { MANAGED_SESSION_HEADER_SUBTYPE } from '../managed-runtime/managed-session-records.js';
 import {
   isSessionArtifactRecord,
   rebuildSessionArtifactSnapshot,
@@ -2652,11 +2655,30 @@ export class SessionService {
       return;
     }
 
-    // Reconstruct linear history
-    const { messages, gaps } = this.reconstructHistory(records, {
-      detectGaps: true,
-    });
-    if (messages.length === 0) {
+    // A Managed log keeps the conversation inside committed events, with the
+    // bodies in the session's resource store, and writes no equivalent legacy
+    // line. Walking physical records would hand back the wrappers instead.
+    const managed = records.some(
+      (record) => record.subtype === MANAGED_SESSION_HEADER_SUBTYPE,
+    );
+    const { messages, gaps } = managed
+      ? {
+          messages: await readManagedSessionMessages({
+            transcriptPath: filePath,
+            runtimeBaseDir: this.storage.getRuntimeBaseDir(),
+            sessionKey: localManagedSessionKey(
+              this.storage.getProjectRoot(),
+              firstRecord.sessionId,
+            ),
+          }),
+          gaps: [] as HistoryGap[],
+        }
+      : this.reconstructHistory(records, {
+          detectGaps: true,
+        });
+    // The header proves the session exists, so an empty Managed history is a
+    // session nothing has been said in yet, not a missing one.
+    if (messages.length === 0 && !managed) {
       return;
     }
 
@@ -2709,7 +2731,7 @@ export class SessionService {
       conversation,
       filePath,
       executionEngine: snapshot!.executionEngine,
-      lastCompletedUuid: lastMessage.uuid,
+      lastCompletedUuid: lastMessage?.uuid ?? null,
       fileHistorySnapshots,
       ...(artifactSnapshot ? { artifactSnapshot } : {}),
       historyGaps: gaps.length > 0 ? gaps : undefined,
