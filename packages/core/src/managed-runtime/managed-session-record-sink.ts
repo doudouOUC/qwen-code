@@ -73,6 +73,7 @@ export class ManagedSessionRecordSink {
       if (record.subtype === 'custom_title') return true;
       if (record.subtype === 'turn_result') return true;
       if (record.subtype === 'chat_compression') return true;
+      if (record.subtype === 'branch_checkpoint') return true;
       if (record.subtype === 'goal_state') return true;
       if (record.subtype === 'file_history_snapshot') return true;
       return (
@@ -120,6 +121,10 @@ export class ManagedSessionRecordSink {
     }
     if (record.subtype === 'chat_compression') {
       await this.commitContextCompacted(record);
+      return;
+    }
+    if (record.subtype === 'branch_checkpoint') {
+      await this.commitBranchCheckpoint(record);
       return;
     }
     await this.projection.commit(
@@ -359,6 +364,67 @@ export class ManagedSessionRecordSink {
             summaryRef,
             replacedMessageIds,
             tokenCountsRef: null,
+          },
+        },
+      ],
+      actor,
+    );
+  }
+
+  /**
+   * A branch checkpoint marks the point a completed turn can be branched from,
+   * so it is committed as `checkpoint.committed` chained to the previous
+   * checkpoint. The whole record becomes the state body: the branch readers
+   * parse the original payload, and the covered sequence is everything the log
+   * had committed when the turn settled.
+   */
+  private async commitBranchCheckpoint(record: ChatRecord): Promise<void> {
+    if (record.systemPayload === undefined) {
+      throw new ManagedSessionUnmappedRecordError(record);
+    }
+    const coveredSequence = this.authority.committedSequence;
+    const previous = this.authority
+      .readEvents()
+      .filter((event) => event.kind === 'checkpoint.committed')
+      .at(-1);
+    const stateRef = await this.resources.publish(
+      'managed-branch-checkpoint',
+      Buffer.from(JSON.stringify(record), 'utf8'),
+    );
+    const actor = this.actor();
+    const held = actor.activation;
+    await this.authority.appendExecution(
+      {
+        operation: 'commitBranchCheckpoint',
+        commandId: `recorder:${record.uuid}`,
+        sessionKey: this.authority.sessionHeader.sessionKey,
+        contentDigest: stateRef.digest,
+      },
+      [
+        {
+          v: 1,
+          sequence: coveredSequence + 1,
+          eventId: `checkpoint:${record.uuid}`,
+          sessionKey: this.authority.sessionHeader.sessionKey,
+          kind: 'checkpoint.committed',
+          occurredAt: Date.parse(record.timestamp) || Date.now(),
+          ...(held === undefined
+            ? {}
+            : {
+                subject: {
+                  type: 'activation',
+                  scopeId: held.activationId,
+                  activationId: held.activationId,
+                  epoch: held.epoch,
+                },
+              }),
+          payload: {
+            checkpointId: record.uuid,
+            coveredSequence,
+            previousCheckpointId:
+              (previous?.payload['checkpointId'] as string | undefined) ?? null,
+            stateRef,
+            boundary: null,
           },
         },
       ],

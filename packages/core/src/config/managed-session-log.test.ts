@@ -14,12 +14,16 @@ import { buildGoalEvidenceCheckpointWindow } from '../goals/goal-evidence.js';
 import { Storage } from './storage.js';
 import { getSessionWriterLockPath } from '../services/session-writer-lease.js';
 import { SessionTranscriptReader } from '../services/session-transcript-reader.js';
+import { readManagedSessionRecords } from '../managed-runtime/managed-session-message-projection.js';
 import {
   MANAGED_SESSION_COMMIT_SUBTYPE,
   MANAGED_SESSION_EVENT_SUBTYPE,
   MANAGED_SESSION_HEADER_SUBTYPE,
 } from '../managed-runtime/managed-session-records.js';
-import { isManagedSessionTranscriptSync } from '../utils/sessionStorageUtils.js';
+import {
+  isManagedSessionTranscriptSync,
+  localManagedSessionKey,
+} from '../utils/sessionStorageUtils.js';
 
 const sessionId = '550e8400-e29b-41d4-a716-4466554400aa';
 const temporaryDirectories = new Set<string>();
@@ -460,6 +464,64 @@ describe('managed session log activation', () => {
       expect(
         committedDomains.filter((domain) => domain === 'file_history'),
       ).toHaveLength(2);
+    });
+  });
+
+  it('carries the branch checkpoint a completed turn recorded', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      const cursor = recorder.getBranchCheckpointCursor();
+      recorder.recordUserMessage('branch me');
+      recorder.recordAssistantTurn({
+        model: 'qwen3-coder-plus',
+        message: [{ text: 'sure' }],
+      });
+      const point = await recorder.recordBranchCheckpointTransaction({
+        cursor,
+        stopReason: 'end_turn',
+      });
+      expect(point?.checkpointUuid).toBeDefined();
+
+      // Every ordinary end_turn prompt records one of these, and a refused
+      // record degrades the recorder for the rest of the session — so the
+      // message after it is the real evidence that nothing was refused.
+      recorder.recordUserMessage('after the checkpoint');
+      await recorder.flush();
+      await fixture.config.closeSessionWriter();
+
+      const records = await transcriptRecords(fixture.transcriptPath);
+      expect(
+        records.filter((record) => record['subtype'] === 'branch_checkpoint'),
+      ).toEqual([]);
+      const checkpoints = records
+        .filter((record) => record['subtype'] === MANAGED_SESSION_EVENT_SUBTYPE)
+        .map((record) => record['managedSession'] as Record<string, unknown>)
+        .filter((event) => event['kind'] === 'checkpoint.committed');
+      expect(checkpoints).toHaveLength(1);
+      expect(
+        (checkpoints[0]['payload'] as { checkpointId?: unknown })?.checkpointId,
+      ).toBe(point!.checkpointUuid);
+
+      // The branch readers parse the original payload, so the record has to
+      // come back as it was written.
+      const projected = await readManagedSessionRecords({
+        transcriptPath: fixture.transcriptPath,
+        runtimeBaseDir: fixture.runtimeBaseDir,
+        sessionKey: localManagedSessionKey(
+          fixture.config.getProjectRoot(),
+          sessionId,
+        ),
+      });
+      const restored = projected.find(
+        (record) => record.subtype === 'branch_checkpoint',
+      );
+      expect(restored?.uuid).toBe(point!.checkpointUuid);
+      expect(restored?.systemPayload).toEqual({
+        v: 1,
+        startExclusiveRecordUuid: cursor.recordId,
+        assistantRecordUuid: point!.assistantRecordUuid,
+      });
     });
   });
 

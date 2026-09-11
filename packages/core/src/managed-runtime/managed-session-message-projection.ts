@@ -137,9 +137,8 @@ async function readRecordBody(
  * so a torn or uncommitted tail left by a crashed writer is simply not part of
  * what a reader sees.
  *
- * Both channels that carry a whole original record are projected, in commit
- * order: the conversation itself, and the turn terminal states a legacy
- * transcript would have written as `turn_result` records.
+ * Every channel that carries a whole original record is projected, in commit
+ * order; `readerFacingBody` is the list of them.
  */
 export async function readManagedSessionRecords(options: {
   readonly transcriptPath: string;
@@ -195,6 +194,8 @@ function readerFacingBody(event: ManagedSessionEvent):
       return { ref: event.payload['resultRef'], inDomainEnvelope: false };
     case 'context.compacted':
       return { ref: event.payload['summaryRef'], inDomainEnvelope: false };
+    case 'checkpoint.committed':
+      return { ref: event.payload['stateRef'], inDomainEnvelope: false };
     case 'domain.committed':
       return event.payload['domain'] === 'goal_state' ||
         event.payload['domain'] === 'file_history'

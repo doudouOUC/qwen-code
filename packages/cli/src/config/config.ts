@@ -2377,6 +2377,12 @@ export async function loadCliConfig(
       argv.restoreAskUserQuestion === true,
     sessionWriterLeaseEnabled:
       settings.experimental?.sessionWriterLease === true,
+    // The engine a host declares comes from this same fact, so deriving the
+    // log from it too keeps the declaration and the physical format in step —
+    // otherwise a Managed host stamps a `managed` engine record on a legacy
+    // transcript that no Managed reader can then interpret.
+    managedSessionLogEnabled:
+      hostPolicy?.managedToolSessionFactory !== undefined,
     cronEnabled: settings.experimental?.cron ?? true,
     cronRecurringMaxAgeDays: settings.experimental?.cronRecurringMaxAgeDays,
     sessionWorkflowEnabled: settings.experimental?.sessionWorkflow ?? false,

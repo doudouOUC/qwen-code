@@ -4388,6 +4388,43 @@ describe('loadCliConfig Managed project configuration', () => {
       expect(managedToolSessionFactory).not.toHaveBeenCalled();
     },
   );
+
+  it('puts a host that owns the Managed tool factory on the Managed log', async () => {
+    const argv = await parseArguments();
+    await loadCliConfig(
+      { experimental: { sessionWriterLease: true } },
+      argv,
+      cwd,
+      [],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+      { managedToolSessionFactory },
+    );
+    expect(mockConfigConstructorParams).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        sessionWriterLeaseEnabled: true,
+        managedSessionLogEnabled: true,
+      }),
+    );
+  });
+
+  it('leaves a host without the Managed tool factory on the legacy log', async () => {
+    const argv = await parseArguments();
+    await loadCliConfig(
+      { experimental: { sessionWriterLease: true } },
+      argv,
+      cwd,
+    );
+    expect(mockConfigConstructorParams).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        sessionWriterLeaseEnabled: true,
+        managedSessionLogEnabled: false,
+      }),
+    );
+  });
 });
 
 describe('loadCliConfig model selection', () => {
