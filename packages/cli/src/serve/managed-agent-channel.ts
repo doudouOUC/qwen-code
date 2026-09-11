@@ -39,7 +39,7 @@ import {
 } from '../config/config.js';
 import { readSettingsSnapshot } from '../config/settings.js';
 import type { WorkspaceGenerationGuard } from './workspace-registry.js';
-import type { AutoLocalManagedRuntimeProvider } from './auto-local-managed-runtime-provider.js';
+import type { ManagedRuntimeProvider } from './managed-runtime-provider.js';
 import { createManagedToolSessionFactory } from './managed-tool-session.js';
 
 const HOST_PRIVATE_ENV_KEYS = new Set([
@@ -59,7 +59,7 @@ export interface ManagedAgentChannelFactoryOptions {
   generationGuard: WorkspaceGenerationGuard;
   argv: CliArgs;
   toolRuntime?: {
-    provider: AutoLocalManagedRuntimeProvider;
+    resolveProvider: () => ManagedRuntimeProvider | undefined;
     tenantId: string;
     workspaceId: string;
     shellConfiguration: ShellConfiguration;
@@ -78,14 +78,28 @@ export function createManagedAgentChannelFactory(
   } = options;
   const sourceEnv = Object.freeze({ ...options.runtimeEnvironment });
   const sourceArgv = structuredClone(options.argv);
-  const managedToolSessionFactory = options.toolRuntime
-    ? createManagedToolSessionFactory({
+  const toolRuntime = options.toolRuntime
+    ? {
         ...options.toolRuntime,
-        workspaceCwd,
-        workspaceTrusted,
-        generationGuard,
-      })
+        shellConfiguration: structuredClone(
+          options.toolRuntime.shellConfiguration,
+        ),
+      }
     : undefined;
+  const createManagedTools = () => {
+    if (!toolRuntime) return undefined;
+    const provider = toolRuntime.resolveProvider();
+    if (!provider) {
+      throw new Error('Managed Agent channels require a tool Runtime.');
+    }
+    return createManagedToolSessionFactory({
+      ...toolRuntime,
+      provider,
+      workspaceCwd,
+      workspaceTrusted,
+      generationGuard,
+    });
+  };
 
   const createChannel = async (
     requestedCwd: string,
@@ -175,6 +189,7 @@ export function createManagedAgentChannelFactory(
             runtimeEnvironment,
             workspaceTrusted,
           });
+          const managedToolSessionFactory = createManagedTools();
           config = await loadCliConfig(
             managedToolSessionFactory
               ? {

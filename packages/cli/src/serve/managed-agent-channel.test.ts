@@ -30,8 +30,11 @@ import {
   readSettingsSnapshot,
   type LoadedSettings,
 } from '../config/settings.js';
-import { createManagedAgentChannelFactory } from './managed-agent-channel.js';
-import type { AutoLocalManagedRuntimeProvider } from './auto-local-managed-runtime-provider.js';
+import {
+  createManagedAgentChannelFactory,
+  type ManagedAgentChannelFactoryOptions,
+} from './managed-agent-channel.js';
+import type { ManagedRuntimeProvider } from './managed-runtime-provider.js';
 import { createWorkspaceGenerationGuard } from './workspace-registry.js';
 
 vi.mock('../acp-integration/acpAgent.js', () => ({
@@ -59,6 +62,10 @@ describe('managed Agent channel', () => {
   let cwd: string;
   let guard: ReturnType<typeof createWorkspaceGenerationGuard>;
   let closed: ReturnType<typeof deferred<void>>;
+  let provider: ManagedRuntimeProvider;
+  let toolRuntime: NonNullable<
+    ManagedAgentChannelFactoryOptions['toolRuntime']
+  >;
   const shutdown = vi.fn<Config['shutdown']>();
   const dispose =
     vi.fn<Awaited<ReturnType<typeof createAcpAgentHost>>['dispose']>();
@@ -76,6 +83,24 @@ describe('managed Agent channel', () => {
     await mkdir(cwd);
     guard = createWorkspaceGenerationGuard();
     closed = deferred<void>();
+    provider = {
+      getToolV2Client: vi.fn(),
+      prepare: vi.fn(),
+      cancel: vi.fn(),
+      release: vi.fn().mockResolvedValue(true),
+      dispose: vi.fn(),
+    };
+    toolRuntime = {
+      resolveProvider: vi.fn(() => provider),
+      tenantId: 'tenant',
+      workspaceId: 'workspace',
+      shellConfiguration: {
+        executable: 'bash',
+        argsPrefix: ['-c'],
+        shell: 'bash',
+      },
+      platform: 'darwin',
+    };
     vi.mocked(readSettingsSnapshot).mockReturnValue({
       merged: {},
       getUserHooks: () => ({}),
@@ -100,7 +125,11 @@ describe('managed Agent channel', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  function factory(environment: NodeJS.ProcessEnv = {}, argv = {} as CliArgs) {
+  function factory(
+    environment: NodeJS.ProcessEnv = {},
+    argv = {} as CliArgs,
+    toolRuntime?: ManagedAgentChannelFactoryOptions['toolRuntime'],
+  ) {
     return createManagedAgentChannelFactory({
       workspaceCwd: cwd,
       sessionRuntimeBaseDir: join(root, 'output'),
@@ -108,35 +137,23 @@ describe('managed Agent channel', () => {
       workspaceTrusted: false,
       generationGuard: guard,
       argv,
+      toolRuntime,
     });
   }
 
   it('passes the same lazy tool Session producer to bootstrap and actual Session hosts', async () => {
-    const acquire = vi.fn();
-    const provider = {
-      getToolV2Client: acquire,
-      release: vi.fn(),
-    } as unknown as AutoLocalManagedRuntimeProvider;
-    const create = createManagedAgentChannelFactory({
-      workspaceCwd: cwd,
-      sessionRuntimeBaseDir: join(root, 'output'),
-      runtimeEnvironment: {},
-      workspaceTrusted: true,
-      generationGuard: guard,
-      argv: {} as CliArgs,
-      toolRuntime: {
-        provider,
-        tenantId: 'tenant',
-        workspaceId: 'workspace',
-        shellConfiguration: {
-          executable: 'bash',
-          argsPrefix: ['-c'],
-          shell: 'bash',
-        },
-        platform: 'darwin',
-      },
-    });
+    let availableProvider: ManagedRuntimeProvider | undefined = undefined;
+    const resolveProvider = vi.fn(() => availableProvider);
+    toolRuntime.resolveProvider = resolveProvider;
+    const create = factory({}, {} as CliArgs, toolRuntime);
+    expect(resolveProvider).not.toHaveBeenCalled();
+    availableProvider = provider;
+    toolRuntime.resolveProvider = () => undefined;
+    toolRuntime.shellConfiguration.executable = 'changed';
+    toolRuntime.shellConfiguration.argsPrefix.push('changed');
+    toolRuntime.platform = 'linux';
     const channel = await create(cwd, privateOverrides);
+    expect(resolveProvider).toHaveBeenCalledOnce();
     const bootstrap =
       vi.mocked(loadCliConfig).mock.calls[0][9]?.managedToolSessionFactory;
     expect(
@@ -162,10 +179,95 @@ describe('managed Agent channel', () => {
       getTruncateToolOutputLines: () => 1000,
       isTruncateToolOutputThresholdExplicit: () => false,
     } as unknown as Config);
+    expect(session.shellConfiguration).toEqual({
+      executable: 'bash',
+      argsPrefix: ['-c'],
+      shell: 'bash',
+    });
+    expect(session.platform).toBe('darwin');
     await session.close();
-    expect(acquire).not.toHaveBeenCalled();
+    expect(provider.getToolV2Client).not.toHaveBeenCalled();
     await channel.kill();
     await channel.exited;
+  });
+
+  it.each(['unavailable', 'incompatible', 'throws'] as const)(
+    'refuses a %s Runtime before Config loading and permits retry',
+    async (failure) => {
+      const resolveProvider = vi.mocked(toolRuntime.resolveProvider);
+      if (failure === 'unavailable')
+        resolveProvider.mockReturnValueOnce(undefined);
+      if (failure === 'incompatible') {
+        resolveProvider.mockReturnValueOnce({
+          ...provider,
+          getToolV2Client: undefined,
+        });
+      }
+      if (failure === 'throws') {
+        resolveProvider.mockImplementationOnce(() => {
+          throw new Error('Runtime lookup failed.');
+        });
+      }
+      const addListener = vi.spyOn(guard.signal, 'addEventListener');
+      const removeListener = vi.spyOn(guard.signal, 'removeEventListener');
+      const create = factory({}, {} as CliArgs, toolRuntime);
+      await expect(create(cwd, privateOverrides)).rejects.toThrow(
+        failure === 'throws' ? 'Runtime lookup failed' : 'tool Runtime',
+      );
+      expect(loadCliConfig).not.toHaveBeenCalled();
+      expect(createAcpAgentHost).not.toHaveBeenCalled();
+      expect(removeListener).toHaveBeenCalledWith(
+        'abort',
+        addListener.mock.calls[0][1],
+      );
+      const channel = await create(cwd, privateOverrides);
+      expect(resolveProvider).toHaveBeenCalledTimes(2);
+      expect(createAcpAgentHost).toHaveBeenCalledOnce();
+      await channel.kill();
+      await channel.exited;
+    },
+  );
+
+  it('resolves a replacement Runtime only after prior host disposal', async () => {
+    const cleanup = deferred<void>();
+    dispose.mockReturnValueOnce(cleanup.promise);
+    const create = factory({}, {} as CliArgs, toolRuntime);
+    const first = await create(cwd, privateOverrides);
+    const stopping = first.kill();
+    const next = create(cwd, privateOverrides);
+    await first.transportFailed;
+    expect(toolRuntime.resolveProvider).toHaveBeenCalledOnce();
+    const replacementClient = vi.fn();
+    const readReplacementClient = vi.fn(() => replacementClient);
+    provider = {
+      ...provider,
+      get getToolV2Client() {
+        return readReplacementClient();
+      },
+    };
+    cleanup.resolve();
+    await stopping;
+    const second = await next;
+    expect(toolRuntime.resolveProvider).toHaveBeenCalledTimes(2);
+    expect(readReplacementClient).toHaveBeenCalled();
+    expect(replacementClient).not.toHaveBeenCalled();
+    await second.kill();
+    await second.exited;
+  });
+
+  it('does not resolve a queued Runtime after generation closure', async () => {
+    const cleanup = deferred<void>();
+    dispose.mockReturnValueOnce(cleanup.promise);
+    const create = factory({}, {} as CliArgs, toolRuntime);
+    const first = await create(cwd, privateOverrides);
+    const next = create(cwd, privateOverrides);
+    void next.catch(() => {});
+    guard.close();
+    cleanup.resolve();
+    await first.exited;
+    await expect(next).rejects.toThrow('no longer active');
+    expect(toolRuntime.resolveProvider).toHaveBeenCalledOnce();
+    expect(createAcpAgentHost).toHaveBeenCalledOnce();
   });
 
   it('pins copied settings, argv, environment and output while consuming private markers', async () => {
@@ -223,31 +325,34 @@ describe('managed Agent channel', () => {
   it('rejects another workspace and missing private parent before config creation', async () => {
     const other = join(root, 'other');
     await mkdir(other);
-    const create = factory();
+    const create = factory({}, {} as CliArgs, toolRuntime);
     await expect(create(other, privateOverrides)).rejects.toThrow('workspace');
     await expect(create(cwd)).rejects.toThrow('private ACP parent');
     expect(loadCliConfig).not.toHaveBeenCalled();
+    expect(toolRuntime.resolveProvider).not.toHaveBeenCalled();
   });
 
   it('rejects a closed generation before config creation', async () => {
-    const create = factory();
+    const create = factory({}, {} as CliArgs, toolRuntime);
     guard.close();
     await expect(create(cwd, privateOverrides)).rejects.toThrow(
       'no longer active',
     );
     expect(loadCliConfig).not.toHaveBeenCalled();
+    expect(toolRuntime.resolveProvider).not.toHaveBeenCalled();
   });
 
   it('rejects unreadable settings before creating a Config or ACP host', async () => {
     vi.mocked(readSettingsSnapshot).mockImplementation(() => {
       throw new Error('Settings file contains invalid JSON.');
     });
-    await expect(factory()(cwd, privateOverrides)).rejects.toThrow(
-      'Settings file contains invalid JSON.',
-    );
+    await expect(
+      factory({}, {} as CliArgs, toolRuntime)(cwd, privateOverrides),
+    ).rejects.toThrow('Settings file contains invalid JSON.');
     expect(loadCliConfig).not.toHaveBeenCalled();
     expect(createAcpAgentHost).not.toHaveBeenCalled();
     expect(shutdown).not.toHaveBeenCalled();
+    expect(toolRuntime.resolveProvider).not.toHaveBeenCalled();
   });
 
   it('cleans a Config that finishes loading after generation closure', async () => {
