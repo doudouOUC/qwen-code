@@ -13,6 +13,7 @@ import { CompressionStatus } from '../core/turn.js';
 import { buildGoalEvidenceCheckpointWindow } from '../goals/goal-evidence.js';
 import { Storage } from './storage.js';
 import { getSessionWriterLockPath } from '../services/session-writer-lease.js';
+import { SessionTranscriptReader } from '../services/session-transcript-reader.js';
 import {
   MANAGED_SESSION_COMMIT_SUBTYPE,
   MANAGED_SESSION_EVENT_SUBTYPE,
@@ -407,6 +408,42 @@ describe('managed session log activation', () => {
         .getSessionService()
         .loadSession(sessionId);
       expect(reloaded?.conversation.messages).toHaveLength(1);
+    });
+  });
+
+  it('navigates the turns of a managed session', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      recorder.recordUserMessage('first turn');
+      recorder.recordUserMessage('second turn');
+      await fixture.config.closeSessionWriter();
+
+      // The physical log holds only wrapper records, which carry no navigation
+      // kind, so turn navigation has to read the projection — otherwise a
+      // Managed session silently reports no turns at all.
+      const page = await new SessionTranscriptReader(
+        fixture.config.getTargetDir(),
+      ).readTurnIndexPage(sessionId);
+      expect(page.totalTurns).toBe(2);
+      expect(page.turns.map((turn) => turn.label)).toEqual([
+        'first turn',
+        'second turn',
+      ]);
+      expect(page.turns.map((turn) => turn.ordinal)).toEqual([0, 1]);
+
+      // Paging is derived from the projection too, so start and the snapshot
+      // round trip have to hold there and not just on the legacy index.
+      const reader = new SessionTranscriptReader(fixture.config.getTargetDir());
+      const newest = await reader.readTurnIndexPage(sessionId, { limit: 1 });
+      expect(newest.start).toBe(1);
+      expect(newest.turns.map((turn) => turn.label)).toEqual(['second turn']);
+      const oldest = await reader.readTurnIndexPage(sessionId, {
+        snapshot: newest.snapshot,
+        start: 0,
+        limit: 1,
+      });
+      expect(oldest.turns.map((turn) => turn.label)).toEqual(['first turn']);
     });
   });
 

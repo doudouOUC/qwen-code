@@ -26,7 +26,7 @@ M1 已交付；PDF 物理取消已在五阶段真实基线中复现并修复。R
 
 同一 Bridge 的双通道和 SessionEntry 归属绑定已实现并验收：共享会话限额、ID reservation、事件及资源账本，在创建/冷恢复时调用服务端 selector，核验实际引擎回执后绑定 entry；发送/取消/关闭沿已绑定通道运行。build/typecheck/bundle、885 项定向测试、自审和独立审查通过。两组真实 host 验收证明同工作区共存、双向模型流取消、关闭后冷恢复及活会话交接关闭；合计 10 次原生 Read/final、22 次模型 HTTP，物理资源和 writer 凭据已独立核对。该证据不代替默认入口及权限等未覆盖验收。
 
-上面两段 R1 证据的适用范围必须一起写清：`managed` 引擎的选择条件是配对 factory 存在（`packages/cli/src/config/config.ts:1909`），而唯一生产该 factory 的 `createManagedAgentChannelFactory`（`packages/cli/src/serve/managed-agent-channel.ts:70`）当前只被自己的单测引用，`packages/acp-bridge/src/bridge.ts` 的 `executionEngines` 也只在测试中注入。因此这些定向测试与真实进程验收都是在测试装配或分支内 staged host 下取得的，**证明的是机制与拒绝路径正确，不证明任何默认入口已经产生过 `managed` owner 记录**；复核这些数字时必须连同其装配方式一起复现。在 R2.3 完成普通 factory 接线之前，R1 的 enforcement 在默认路径上等于 no-op，不能据此把 R1 记为“默认已接通”。
+上面两段 R1 证据的适用范围必须一起写清：CLI 侧判断一个会话该归哪个引擎，靠的是配对 factory 是否存在——恢复守卫把 `hostPolicy?.managedToolSessionFactory ? 'managed' : 'legacy'` 作为期望引擎传给 `assertSessionExecutionEngine`（`packages/cli/src/config/config.ts:2114`；这是守卫的期望值推导，不是 Bridge 的引擎选择器，后者是 `executionEngines.select`），而唯一生产该 factory 的 `createManagedAgentChannelFactory`（`packages/cli/src/serve/managed-agent-channel.ts:70`）当前只被自己的单测引用，`packages/acp-bridge/src/bridge.ts` 的 `executionEngines` 也只在 `bridge-execution-engines.test.ts` 中注入。因此这些定向测试与真实进程验收都是在测试装配或分支内 staged host 下取得的，**证明的是机制与拒绝路径正确，不证明任何默认入口已经产生过 `managed` owner 记录**；复核这些数字时必须连同其装配方式一起复现。在 R2.3 完成普通 factory 接线之前，R1 的 enforcement 在默认路径上等于 no-op，不能据此把 R1 记为“默认已接通”。（2026-09-11 上游合并后已逐项复核这三个事实：`config.ts` 的那行由 1909 移到 2114，代码本身未变；另两处的引用面与行号均未变。）
 
 严格 settings 与项目 MCP 读取基础已实现，并接入实际 Managed host 的启动和 new/load/resume；旧版 settings 仅内存迁移，坏配置明确拒绝，悬空祖先目录不再误判缺失。构建、类型检查、定向单测和独立复审通过，真实验证证明十六次坏配置拒绝不改写配置/历史，修复配置后原会话可恢复并完成 Read。它保留原全局配置路径语义，尚不构成跨来源、跨 QWEN_HOME 的统一输入快照。
 
@@ -178,6 +178,10 @@ R2.S1 已进入施工，其余两片仍是设计。R2.S1 拆为 R2.S1a 记录格
 **仍失败且判定为环境/既有问题（未修）**：`storage.test.ts` 的 5 个 `ensureAuditFallbackDir` 用例（其 setup 自身报 `EEXIST symlink X -> X` 与 `Path is a directory`）、`write-file.test.ts` 1 个用例（断言通过、`finally` 里 `rmSync` 对目录符号链接抛 EISDIR）、`git-branches.test.ts` 的 15s 超时与 lock 提示、`agent/agent.test.ts` 1 个用例。这些都不在合并冲突面内，失败点在测试自身的 fs/git 前置或超时；**本轮未在上游基线上复跑对照**，因此只能记为「疑似环境/既有」，不能当成已排除合并影响。
 
 **边界**：这一步只是对齐，**没有**新增任何 Managed 默认接线——`managedSessionLogEnabled` 仍默认关闭，四处普通 factory 仍未开启它，因此 daemon 默认路径依旧是 legacy，R1 在默认配置下仍等于 no-op。本方案中带行号的 read-path 断言必须在新基线上重新核对后才能引用（上游改动了 transcript index 与 turn navigation），未重核的行号不得作为验收证据。
+
+**Managed 会话的 turn 导航已交付**（合并后复核 read-path 时发现的静默缺口）：`readTurnIndexPage` 的 turn 来自物理记录上的 `navigationKind`，而 Managed 日志里只有 wrapper 记录，没有任何记录带该标记——于是一个有历史的 Managed 会话被报成 `totalTurns: 0`，Web Shell 的 turn 列表会是空的，而且不报错。先用真实夹具复现（真实 `Config` + 真实临时目录，录两轮后读到 0 个 turn），再修：`readTurnIndexPage` 在索引带 Managed header 时改从投影取 turn，规则与索引构建器一致——带 `navigationKind` 的 user 记录开一个 turn，assistant 预览候选挂成该 turn 的 `finalAssistantRecordId`（`realtime_message` 挂到 realtime turn），`turn_result` 盖上 `promptId` 并关闭该 prompt turn；投影就是 replay，所以记录在投影中的位置即 `replayPosition`。`start`/`limit`/snapshot 校验/标签/详情全部沿用 legacy 那条路径，**只有 turn 与预览的来源不同**，因此 legacy 行为逐字不变。证据：该用例断言两个 turn 的标签、序号，以及「默认 limit=1 取到最新 → 用它的 snapshot 加 start=0 取到最早」的分页往返；`managed-session-log` 10/10，`session-transcript-reader` 与 `sessionService` 391/391 无回归，仓库 typecheck 与该两文件 eslint/prettier 通过。
+
+**该切片的已知代价**：每次 turn-index 请求都会重新投影整份日志（逐条读事件正文），因为物理索引对 wrapper 记录无法回答导航问题，而投影目前没有缓存（物理索引有 `getCachedIndex`）。默认关闭期间可以接受；一旦它出现在恢复/TTFT 计时里，再加投影缓存，不要靠削弱正确性来省这次读。覆盖面也与 legacy 相同：只有用户提示与 realtime 两类 turn，Managed 会话看到的 turn 集合与它作为 legacy 时一致。
 
 ## 后续阶段与完整完成条件
 

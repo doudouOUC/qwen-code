@@ -2619,6 +2619,57 @@ function managedReplayPage(
   };
 }
 
+/**
+ * Derives navigation turns from projected records.
+ *
+ * The physical log of a Managed session holds only wrapper records, which carry
+ * no navigation kind, so deriving turns from the index would report a session
+ * with history as having no turns at all. The rules mirror the index builder's:
+ * the projection is the replay, so a record's position in it is its replay
+ * position.
+ */
+function managedNavigationTurns(
+  records: readonly ChatRecord[],
+): TranscriptNavigationTurnHint[] {
+  const turns: TranscriptNavigationTurnHint[] = [];
+  let currentPromptTurn: TranscriptNavigationTurnHint | undefined;
+  let currentRealtimeTurn: TranscriptNavigationTurnHint | undefined;
+  for (const [position, record] of records.entries()) {
+    const navigationKind = navigationKindForRecord(record);
+    if (navigationKind) {
+      const turn: TranscriptNavigationTurnHint = {
+        turnId: record.uuid,
+        replayPosition: position,
+        kind: navigationKind,
+      };
+      turns.push(turn);
+      if (navigationKind === 'realtime') {
+        currentRealtimeTurn = turn;
+      } else {
+        currentPromptTurn = turn;
+        currentRealtimeTurn = undefined;
+      }
+      continue;
+    }
+    if (isAssistantPreviewCandidate(record)) {
+      const targetTurn =
+        record.subtype === 'realtime_message'
+          ? currentRealtimeTurn
+          : currentPromptTurn;
+      if (targetTurn) targetTurn.finalAssistantRecordId = record.uuid;
+    }
+    if (
+      record.subtype === 'turn_result' &&
+      isTurnResultRecordPayload(record.systemPayload) &&
+      currentPromptTurn
+    ) {
+      currentPromptTurn.promptId = record.systemPayload.promptId;
+      currentPromptTurn = undefined;
+    }
+  }
+  return turns;
+}
+
 export class SessionTranscriptReader {
   private readonly storage: Storage;
 
@@ -2718,14 +2769,20 @@ export class SessionTranscriptReader {
       startTime,
       lastUpdated,
     };
-    const totalTurns = index?.navigationTurns.length ?? 0;
+    const projected =
+      index !== undefined && indexHasManagedHeader(index)
+        ? await this.readManagedRecords(sessionId, index, {})
+        : undefined;
+    const navigationTurns = projected
+      ? managedNavigationTurns(projected)
+      : (index?.navigationTurns ?? []);
+    const totalTurns = navigationTurns.length;
     const start =
       options.start ?? Math.max(0, totalTurns - Math.min(limit, totalTurns));
     if (start > totalTurns) {
       throw new InvalidSessionTranscriptCursorError();
     }
-    const selectedTurns =
-      index?.navigationTurns.slice(start, start + limit) ?? [];
+    const selectedTurns = navigationTurns.slice(start, start + limit);
     const selectedUuids = selectedTurns.flatMap((turn) => [
       turn.turnId,
       ...(turn.finalAssistantRecordId ? [turn.finalAssistantRecordId] : []),
@@ -2740,23 +2797,29 @@ export class SessionTranscriptReader {
     );
     const labels = new Map<string, { label: string; timestamp?: string }>();
     const details = new Map<string, string>();
-    if (index) {
+    const collectPreview = (record: ChatRecord): void => {
+      const kind = selectedKinds.get(record.uuid);
+      if (kind) {
+        labels.set(record.uuid, {
+          label: projectNavigationLabel(record, kind),
+          ...(record.timestamp ? { timestamp: record.timestamp } : {}),
+        });
+      }
+      if (selectedAssistantUuids.has(record.uuid)) {
+        const detail = projectNavigationDetail(record);
+        if (detail) details.set(record.uuid, detail);
+      }
+    };
+    if (projected) {
+      const wanted = new Set(selectedUuids);
+      for (const record of projected) {
+        if (wanted.has(record.uuid)) collectPreview(record);
+      }
+    } else if (index) {
       await forEachAggregatedRecord(
         index,
         [...new Set(selectedUuids)],
-        (record) => {
-          const kind = selectedKinds.get(record.uuid);
-          if (kind) {
-            labels.set(record.uuid, {
-              label: projectNavigationLabel(record, kind),
-              ...(record.timestamp ? { timestamp: record.timestamp } : {}),
-            });
-          }
-          if (selectedAssistantUuids.has(record.uuid)) {
-            const detail = projectNavigationDetail(record);
-            if (detail) details.set(record.uuid, detail);
-          }
-        },
+        collectPreview,
       );
     }
     const turns = selectedTurns.map((turn, offset) => {
