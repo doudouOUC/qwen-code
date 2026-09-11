@@ -617,6 +617,25 @@ describe('managed session log activation', () => {
     });
   });
 
+  it('refuses to page a managed session instead of serving its wrappers', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      recorder.recordUserMessage('first turn');
+      recorder.recordUserMessage('second turn');
+      await fixture.config.closeSessionWriter();
+
+      // Without the guard this returned ten `system` records — the authority's
+      // wrappers — which a client would render as the conversation.
+      await expect(
+        new SessionTranscriptReader(fixture.config.getTargetDir()).readPage(
+          sessionId,
+          { limit: 10 },
+        ),
+      ).rejects.toThrow(/managed engine/);
+    });
+  });
+
   it('leaves a managed host on the legacy transcript when the log is off', async () => {
     await withWorkspace(async (activate) => {
       const fixture = await activate({ managedSessionLog: false });

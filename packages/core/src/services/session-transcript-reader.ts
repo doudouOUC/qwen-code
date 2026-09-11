@@ -76,6 +76,7 @@ import type { FileHistorySnapshot } from './fileHistoryService.js';
 import { SessionFileHistoryAccumulator } from './session-file-history-state.js';
 import {
   SessionExecutionEngineAccumulator,
+  SessionExecutionEngineError,
   type SessionExecutionEngine,
   type SessionExecutionEngineState,
 } from './session-execution-engine.js';
@@ -3862,6 +3863,16 @@ export class SessionTranscriptReader {
         snapshot?.lastUpdated ??
         new Date(stats.mtimeMs).toISOString(),
     });
+    // The index is built from the physical lines, which in a Managed log are
+    // the authority's wrapper records — paging it would hand a client those
+    // envelopes as if they were the conversation. Refuse until this reader can
+    // page the projection, the way the restore and turn readers already do.
+    if (indexHasManagedHeader(index)) {
+      throw new SessionExecutionEngineError(
+        sessionId,
+        'paged transcript reads are not implemented for the managed engine',
+      );
+    }
     const frozenLeafUuid = cursor?.leafUuid ?? snapshot?.leafUuid;
     if (frozenLeafUuid !== undefined && frozenLeafUuid !== index.leafUuid) {
       debugLogger.warn(
