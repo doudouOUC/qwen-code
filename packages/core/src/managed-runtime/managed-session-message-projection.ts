@@ -173,13 +173,21 @@ export async function readManagedSessionRecords(options: {
 }
 
 /**
+ * Domains whose body is a whole reader-facing record. The rest carry their own
+ * shape and are not something a reader replays.
+ */
+const RECORD_CARRYING_DOMAINS: ReadonlySet<string> = new Set([
+  'goal_state',
+  'file_history',
+  'session_source',
+]);
+
+/**
  * Where a whole reader-facing record lives, for the channels that carry one.
  *
- * The goal and file history domains are the two that store records; every other
- * domain body has its own shape and is not something a reader replays. A domain
- * body is the authority's envelope wrapping the content, so the record sits
- * under its own key there, unlike the event channels whose body is the record
- * itself.
+ * A domain body is the authority's envelope wrapping the content, so the record
+ * sits under its own key there, unlike the event channels whose body is the
+ * record itself.
  */
 function readerFacingBody(event: ManagedSessionEvent):
   | {
@@ -197,8 +205,7 @@ function readerFacingBody(event: ManagedSessionEvent):
     case 'checkpoint.committed':
       return { ref: event.payload['stateRef'], inDomainEnvelope: false };
     case 'domain.committed':
-      return event.payload['domain'] === 'goal_state' ||
-        event.payload['domain'] === 'file_history'
+      return RECORD_CARRYING_DOMAINS.has(event.payload['domain'] as string)
         ? { ref: event.payload['recordRef'], inDomainEnvelope: true }
         : undefined;
     default:

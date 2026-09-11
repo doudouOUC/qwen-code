@@ -76,6 +76,7 @@ export class ManagedSessionRecordSink {
       if (record.subtype === 'branch_checkpoint') return true;
       if (record.subtype === 'goal_state') return true;
       if (record.subtype === 'file_history_snapshot') return true;
+      if (record.subtype === 'session_source') return true;
       return (
         record.subtype !== undefined &&
         CARRIED_SYSTEM_SUBTYPES.has(record.subtype)
@@ -113,6 +114,10 @@ export class ManagedSessionRecordSink {
     }
     if (record.subtype === 'file_history_snapshot') {
       await this.commitFileHistory(record);
+      return;
+    }
+    if (record.subtype === 'session_source') {
+      await this.commitSessionSource(record);
       return;
     }
     if (record.subtype === 'turn_result') {
@@ -228,6 +233,32 @@ export class ManagedSessionRecordSink {
       },
       {
         domain: 'file_history',
+        content: { record: record as unknown as Record<string, unknown> },
+      },
+      { class: 'trusted_entry' },
+    );
+  }
+
+  /**
+   * The source a session was created from is session identity, not message
+   * content, so it is committed to its own domain. The recorder re-anchors the
+   * same record periodically so a truncated legacy transcript still carries the
+   * source near its tail; those repeats commit again here, and the reader keeps
+   * the latest, so the anchoring stays a legacy concern rather than a fault.
+   */
+  private async commitSessionSource(record: ChatRecord): Promise<void> {
+    if (record.systemPayload === undefined) {
+      throw new ManagedSessionUnmappedRecordError(record);
+    }
+    await this.authority.commitDomainRecord(
+      {
+        operation: 'commitSessionSource',
+        commandId: `recorder:${record.uuid}`,
+        sessionKey: this.authority.sessionHeader.sessionKey,
+        contentDigest: this.authority.sessionHeader.definitionRef.digest,
+      },
+      {
+        domain: 'session_source',
         content: { record: record as unknown as Record<string, unknown> },
       },
       { class: 'trusted_entry' },

@@ -525,6 +525,54 @@ describe('managed session log activation', () => {
     });
   });
 
+  it('carries the source a daemon session was created from', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      expect(await recorder.recordSessionSource('standalone', 'task-42')).toBe(
+        true,
+      );
+
+      // The bridge writes this on create and again on restore, so a refusal
+      // here would degrade the recorder before the first prompt.
+      recorder.recordUserMessage('after the source');
+      await recorder.flush();
+      await fixture.config.closeSessionWriter();
+
+      const records = await transcriptRecords(fixture.transcriptPath);
+      expect(
+        records.filter((record) => record['subtype'] === 'session_source'),
+      ).toEqual([]);
+      const committedDomains = records
+        .filter((record) => record['subtype'] === MANAGED_SESSION_EVENT_SUBTYPE)
+        .map((record) => record['managedSession'] as Record<string, unknown>)
+        .filter((event) => event['kind'] === 'domain.committed')
+        .map(
+          (event) =>
+            (event['payload'] as { domain?: unknown } | undefined)?.domain,
+        );
+      expect(
+        committedDomains.filter((domain) => domain === 'session_source'),
+      ).toHaveLength(1);
+
+      const projected = await readManagedSessionRecords({
+        transcriptPath: fixture.transcriptPath,
+        runtimeBaseDir: fixture.runtimeBaseDir,
+        sessionKey: localManagedSessionKey(
+          fixture.config.getProjectRoot(),
+          sessionId,
+        ),
+      });
+      const restored = projected.find(
+        (record) => record.subtype === 'session_source',
+      );
+      expect(restored?.systemPayload).toEqual({
+        sourceType: 'standalone',
+        sourceId: 'task-42',
+      });
+    });
+  });
+
   it('navigates the turns of a managed session', async () => {
     await withWorkspace(async (activate) => {
       const fixture = await activate({ managedSessionLog: true });

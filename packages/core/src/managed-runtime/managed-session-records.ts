@@ -90,6 +90,13 @@ export const MANAGED_SESSION_DOMAINS = [
   // the message projection restores the original record, and the existing file
   // history accumulator folds those records into the session's snapshots.
   'file_history',
+  // Also new to the v1 index. The source a session was created from is read
+  // back as a record — the session directory, the transcript index's side-task
+  // check and the bridge's listing all parse the original `systemPayload` — so
+  // it cannot ride in `session_metadata`, whose body is a metadata patch. The
+  // domain name is the only discriminator a reader has for a body shape, so a
+  // second shape under one name would make neither readable.
+  'session_source',
 ] as const;
 
 export type ManagedSessionDomain = (typeof MANAGED_SESSION_DOMAINS)[number];
@@ -100,7 +107,7 @@ export type ManagedSessionDomain = (typeof MANAGED_SESSION_DOMAINS)[number];
  * implemented or admitted, so submission is gated separately.
  */
 export const MANAGED_SESSION_ENABLED_DOMAINS: readonly ManagedSessionDomain[] =
-  ['goal_state', 'session_metadata', 'file_history'];
+  ['goal_state', 'session_metadata', 'file_history', 'session_source'];
 
 export function assertManagedSessionDomainEnabled(
   domain: ManagedSessionDomain,
