@@ -494,14 +494,20 @@ describe('managed session log activation', () => {
       expect(
         records.filter((record) => record['subtype'] === 'branch_checkpoint'),
       ).toEqual([]);
-      const checkpoints = records
+      const events = records
         .filter((record) => record['subtype'] === MANAGED_SESSION_EVENT_SUBTYPE)
-        .map((record) => record['managedSession'] as Record<string, unknown>)
-        .filter((event) => event['kind'] === 'checkpoint.committed');
-      expect(checkpoints).toHaveLength(1);
+        .map((record) => record['managedSession'] as Record<string, unknown>);
       expect(
-        (checkpoints[0]['payload'] as { checkpointId?: unknown })?.checkpointId,
-      ).toBe(point!.checkpointUuid);
+        events.filter((event) => event['kind'] === 'checkpoint.committed'),
+      ).toEqual([]);
+      const branchMessages = events.filter(
+        (event) =>
+          event['kind'] === 'message.committed' &&
+          (event['payload'] as { messageId?: unknown }).messageId ===
+            point!.checkpointUuid,
+      );
+      expect(branchMessages).toHaveLength(1);
+      expect(branchMessages[0]['payload']).toMatchObject({ role: 'system' });
 
       // The branch readers parse the original payload, so the record has to
       // come back as it was written.

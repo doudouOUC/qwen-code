@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { createHash } from 'node:crypto';
 import type { ChatRecord } from '../services/chatRecordingService.js';
+import { parseBranchCheckpointPayload } from '../services/branch-points.js';
 import type {
   LocalManagedSessionAuthority,
   ManagedSessionActor,
@@ -397,61 +399,22 @@ export class ManagedSessionRecordSink {
     );
   }
 
-  /**
-   * A branch checkpoint marks the point a completed turn can be branched from,
-   * so it is committed as `checkpoint.committed` chained to the previous
-   * checkpoint. The whole record becomes the state body: the branch readers
-   * parse the original payload, and the covered sequence is everything the log
-   * had committed when the turn settled.
-   */
   private async commitBranchCheckpoint(record: ChatRecord): Promise<void> {
-    if (record.systemPayload === undefined) {
+    if (parseBranchCheckpointPayload(record.systemPayload) === undefined) {
       throw new ManagedSessionUnmappedRecordError(record);
     }
-    const coveredSequence = this.authority.committedSequence;
-    const previous = this.authority.lastEventOfKind('checkpoint.committed');
-    const stateRef = await this.resources.publish(
-      'managed-branch-checkpoint',
-      Buffer.from(JSON.stringify(record), 'utf8'),
-    );
-    const actor = this.actor();
-    const held = actor.activation;
-    await this.authority.appendExecution(
+    // Preserve the old operation and byte digest for retries across cold reopen.
+    await this.projection.commit(
       {
         operation: 'commitBranchCheckpoint',
         commandId: `recorder:${record.uuid}`,
         sessionKey: this.authority.sessionHeader.sessionKey,
-        contentDigest: stateRef.digest,
+        contentDigest: createHash('sha256')
+          .update(JSON.stringify(record), 'utf8')
+          .digest('hex'),
       },
-      [
-        {
-          v: 1,
-          sequence: coveredSequence + 1,
-          eventId: `checkpoint:${record.uuid}`,
-          sessionKey: this.authority.sessionHeader.sessionKey,
-          kind: 'checkpoint.committed',
-          occurredAt: Date.parse(record.timestamp) || Date.now(),
-          ...(held === undefined
-            ? {}
-            : {
-                subject: {
-                  type: 'activation',
-                  scopeId: held.activationId,
-                  activationId: held.activationId,
-                  epoch: held.epoch,
-                },
-              }),
-          payload: {
-            checkpointId: record.uuid,
-            coveredSequence,
-            previousCheckpointId:
-              (previous?.payload['checkpointId'] as string | undefined) ?? null,
-            stateRef,
-            boundary: null,
-          },
-        },
-      ],
-      actor,
+      { record },
+      this.actor(),
     );
   }
 

@@ -7,7 +7,10 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { SessionWriterLease } from '../services/session-writer-lease.js';
-import type { LocalManagedSessionResourceStore } from './managed-session-resources.js';
+import {
+  readManagedBranchCheckpoint,
+  type LocalManagedSessionResourceStore,
+} from './managed-session-resources.js';
 import { managedToolDigest } from '../tools/managed-tool-protocol.js';
 import {
   MANAGED_SESSION_COMMIT_SUBTYPE,
@@ -195,6 +198,7 @@ export class LocalManagedSessionAuthority {
   private writeFailure: Error | undefined;
   private queue: Promise<unknown> = Promise.resolve();
   private readonly eventIds = new Set<string>();
+  private readonly checkpointSequences = new Map<string, number>();
   private checkpoint: ManagedSessionCheckpoint | undefined;
   private hasContinuation = false;
   private compactedThrough = 0;
@@ -308,12 +312,13 @@ export class LocalManagedSessionAuthority {
       scan.activation,
       options.resources,
     );
+    const branches = await authority.validateRecoveryFacts(scan.events);
     for (const event of scan.events) {
       authority.eventIds.add(event.eventId);
       if (event.kind === 'domain.committed') {
         authority.recordDomainEvent(event);
       }
-      authority.recordRecoveryFacts(event);
+      authority.recordRecoveryFacts(event, branches.has(event.eventId));
     }
     return authority;
   }
@@ -808,6 +813,8 @@ export class LocalManagedSessionAuthority {
       );
     }
 
+    const branches = await this.validateRecoveryFacts(events);
+
     // Events first, marker last: a crash before the marker leaves the
     // transaction invisible rather than half applied.
     try {
@@ -838,7 +845,7 @@ export class LocalManagedSessionAuthority {
       if (event.kind === 'domain.committed') {
         this.recordDomainEvent(event);
       }
-      this.recordRecoveryFacts(event);
+      this.recordRecoveryFacts(event, branches.has(event.eventId));
     }
     this.committed = marker.lastSequence;
     this.lastMarkerDigest = managedToolDigest(
@@ -1003,12 +1010,50 @@ export class LocalManagedSessionAuthority {
   }
 
   /**
-   * Tracks the two facts recovery turns on: the newest checkpoint, and whether
-   * any execution has happened that a checkpoint would have to cover.
+   * Classifies the checkpoints a transaction or a cold log carries. It runs
+   * before the first physical append, so a checkpoint whose state cannot be
+   * verified never reaches the log or the recovery facts.
    */
-  private recordRecoveryFacts(event: ManagedSessionEvent): void {
+  private async validateRecoveryFacts(
+    events: readonly ManagedSessionEvent[],
+  ): Promise<Set<string>> {
+    const branches = new Set<string>();
+    const pendingCheckpoints = new Map<string, number>();
+    for (const event of events) {
+      const branch = await readManagedBranchCheckpoint(
+        event,
+        this.resources,
+        (id) => pendingCheckpoints.get(id) ?? this.checkpointSequences.get(id),
+        this.committed,
+      );
+      if (branch !== undefined) branches.add(event.eventId);
+      if (event.kind === 'checkpoint.committed') {
+        pendingCheckpoints.set(
+          event.payload['checkpointId'] as string,
+          event.sequence,
+        );
+      }
+    }
+    return branches;
+  }
+
+  private recordRecoveryFacts(
+    event: ManagedSessionEvent,
+    branch: boolean,
+  ): void {
+    if (event.kind === 'checkpoint.committed') {
+      this.checkpointSequences.set(
+        event.payload['checkpointId'] as string,
+        event.sequence,
+      );
+    }
+    if (branch) {
+      this.hasContinuation = true;
+      return;
+    }
     if (event.kind === 'context.compacted') {
       this.compactedThrough = event.payload['toSequence'] as number;
+      this.hasContinuation = true;
       return;
     }
     if (event.kind === 'checkpoint.committed') {
@@ -1025,7 +1070,15 @@ export class LocalManagedSessionAuthority {
       };
       return;
     }
-    if (event.kind === 'model.attempt' || event.kind === 'tool.intent') {
+    if (
+      event.kind === 'model.attempt' ||
+      event.kind === 'tool.intent' ||
+      event.kind === 'tool.receipt' ||
+      event.kind === 'turn.settled' ||
+      (event.kind === 'message.committed' &&
+        (event.payload['role'] === 'assistant' ||
+          event.payload['role'] === 'tool_result'))
+    ) {
       this.hasContinuation = true;
     }
   }
@@ -1304,6 +1357,14 @@ export async function readManagedSessionLog(
       );
     }
     for (const event of pending) {
+      if (
+        event.kind === 'checkpoint.committed' &&
+        (event.payload['coveredSequence'] as number) > committed
+      ) {
+        throw new ManagedSessionRecordError(
+          'checkpoint covers events not committed before its transaction.',
+        );
+      }
       events.push(event);
       if (event.kind === 'activation.changed') {
         activation = activationStateFrom(event);

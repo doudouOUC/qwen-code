@@ -184,7 +184,53 @@ describe('managed session record sink', () => {
     await harness.close();
   });
 
-  it('chains a branch checkpoint to the previous one past a page of events', async () => {
+  it('keeps the Harness checkpoint when a branch point is recorded', async () => {
+    const harness = await createHarness();
+    try {
+      const state = Buffer.from(
+        JSON.stringify({ continuation: { phase: 'turn_settled' } }),
+      );
+      const { checkpoint } = await harness.authority.commitCheckpoint(
+        {
+          operation: 'commitCheckpoint',
+          commandId: 'checkpoint-1',
+          sessionKey,
+          contentDigest: DIGEST,
+        },
+        { state, boundary: 'turn_settled' },
+        { class: 'harness', activation: { activationId: 'act-1', epoch: 1 } },
+      );
+      await harness.sink.write(
+        record({
+          uuid: 'branch-1',
+          type: 'system',
+          subtype: 'branch_checkpoint',
+          parentUuid: 'assistant-1',
+          systemPayload: {
+            v: 1,
+            startExclusiveRecordUuid: null,
+            assistantRecordUuid: 'assistant-1',
+          },
+        }),
+      );
+      expect(harness.authority.latestCheckpoint).toEqual(checkpoint);
+      expect(await harness.authority.readCheckpointState()).toEqual(state);
+      await expect(
+        harness.sink.write(
+          record({
+            uuid: 'branch-2',
+            type: 'system',
+            subtype: 'branch_checkpoint',
+            systemPayload: { v: 2 } as never,
+          }),
+        ),
+      ).rejects.toThrow(ManagedSessionUnmappedRecordError);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('carries branch points and compacts the full message range past a page of events', async () => {
     const harness = await createHarness();
     const checkpoint = (uuid: string) =>
       record({
@@ -202,21 +248,24 @@ describe('managed session record sink', () => {
         await harness.sink.write(
           record({
             uuid: `rec-${prefix}-${index}`,
+            type: index % 2 === 0 ? 'user' : 'assistant',
             message: { role: 'user', parts: [{ text: `${prefix} ${index}` }] },
           }),
         );
       }
     };
-    // The first checkpoint has to land beyond `defaultReadEvents`, or a paged
-    // scan from the start would still reach it and the chain would look sound.
     await filler('early', 110);
     await harness.sink.write(checkpoint('rec-checkpoint-1'));
     await filler('late', 2);
     await harness.sink.write(checkpoint('rec-checkpoint-2'));
 
-    const latest = harness.authority.lastEventOfKind('checkpoint.committed');
-    expect(latest?.payload['checkpointId']).toBe('rec-checkpoint-2');
-    expect(latest?.payload['previousCheckpointId']).toBe('rec-checkpoint-1');
+    expect(harness.authority.latestCheckpoint).toBeUndefined();
+    expect(harness.authority.restoreBasis()).toBe('blocked');
+    expect(
+      (await harness.sink.project()).filter(
+        (item) => item.subtype === 'branch_checkpoint',
+      ),
+    ).toEqual([checkpoint('rec-checkpoint-1'), checkpoint('rec-checkpoint-2')]);
 
     // A compaction describes the range it replaces, so it has to name every
     // message in it — a page would have listed only the first hundred.
@@ -231,9 +280,18 @@ describe('managed session record sink', () => {
       } as Partial<ChatRecord>),
     );
     const compaction = harness.authority.lastEventOfKind('context.compacted');
-    expect((compaction?.payload['replacedMessageIds'] as string[]).length).toBe(
-      112,
-    );
+    expect(compaction?.payload['replacedMessageIds']).toEqual([
+      ...Array.from({ length: 110 }, (_, index) => `rec-early-${index}`),
+      'rec-checkpoint-1',
+      'rec-late-0',
+      'rec-late-1',
+      'rec-checkpoint-2',
+    ]);
+    expect(
+      (await harness.sink.project()).filter(
+        (item) => item.subtype === 'branch_checkpoint',
+      ),
+    ).toEqual([checkpoint('rec-checkpoint-1'), checkpoint('rec-checkpoint-2')]);
     await harness.close();
   });
 

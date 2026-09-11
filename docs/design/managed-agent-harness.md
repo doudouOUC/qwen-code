@@ -68,6 +68,8 @@ stateDiagram-v2
 
 ## 4. HarnessCheckpoint v1
 
+`branch_checkpoint` 只描述可分支的已完成 turn，不是 HarnessCheckpoint。新记录走 `message.committed` 的 system 内容；历史 Managed 日志中 `managed-branch-checkpoint` 资源的兼容校验见[存储 §3](managed-agent-session-storage.md#3-事件-union-与生产消费链)。它不能替换最近的执行状态，也不能让已运行会话回到 initial。`managed-checkpoint` 的资源分类、长度和摘要校验只是持久化基础；完整九组 schema、作用域、消费位置及尾部对账仍必须通过，不能把当前 opaque Buffer 原语的 `restoreBasis=checkpoint` 当作可运行授权。
+
 checkpoint 复用 SessionRestoreProjection 的已提交数据/引用，另外保存 continuation 必需状态，不克隆整个运行对象。它覆盖的 sequence 不得超过 authority 已提交位置；所有 durable_wait 引用必须已受控保存。无字段依据或不能重建时拒绝该安全点，不用默认空队列/零预算补齐。
 
 Factory 必须校验 RestoreBundle 的 `restoreBasis/restoreProofRef/checkpointRef`，唯一分型与字段规则见[存储 §2.2](managed-agent-session-storage.md#22-恢复基础与空检查点)。initial 或合法 history_rewind/history_copy/format_upgrade 起点允许 null；Harness 在获得有效 activation 后初始化完整状态，先提交 before_model checkpoint（boundary=null），再运行原 Agent。null 不承接未决工具/审批，也不允许为丢失 checkpoint、坏资源或未知作用域清空历史与预算。初始化不新增 HarnessBoundary 分型；之后的合作式 detach 仍须已有完整 boundary receipt。

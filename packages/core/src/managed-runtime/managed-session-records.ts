@@ -5,6 +5,8 @@
  */
 
 import { managedToolDigest } from '../tools/managed-tool-protocol.js';
+import { parseBranchCheckpointPayload } from '../services/branch-points.js';
+import type { ChatRecord } from '../services/chatRecordingService.js';
 import type { ManagedSessionJsonValue } from './managed-session-inbox.js';
 
 export const MANAGED_SESSION_FORMAT_VERSION = 1;
@@ -379,6 +381,33 @@ export function assertManagedSessionDurableRef(
     ),
     digest: assertManagedSessionDigest(record['digest'], `${label}.digest`),
   };
+}
+
+export function assertManagedBranchRecord(
+  value: unknown,
+  sessionKey: ManagedSessionKey,
+  recordId: string,
+): ChatRecord {
+  const record = object(value, 'branch record');
+  if (
+    record['type'] !== 'system' ||
+    record['subtype'] !== 'branch_checkpoint' ||
+    record['uuid'] !== recordId ||
+    record['sessionId'] !== sessionKey.sessionId ||
+    typeof record['timestamp'] !== 'string' ||
+    !Number.isFinite(Date.parse(record['timestamp'])) ||
+    typeof record['cwd'] !== 'string' ||
+    typeof record['version'] !== 'string' ||
+    (record['parentUuid'] !== null &&
+      (typeof record['parentUuid'] !== 'string' ||
+        record['parentUuid'].length === 0)) ||
+    parseBranchCheckpointPayload(
+      record['systemPayload'] as unknown as ChatRecord['systemPayload'],
+    ) === undefined
+  ) {
+    fail('branch record does not match its committed identity or v1 payload.');
+  }
+  return record as unknown as ChatRecord;
 }
 
 function assertSubject(

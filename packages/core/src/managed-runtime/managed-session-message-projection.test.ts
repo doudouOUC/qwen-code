@@ -10,11 +10,22 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Storage } from '../config/storage.js';
 import type { ChatRecord } from '../services/chatRecordingService.js';
-import { LocalManagedSessionAuthority } from './managed-session-authority.js';
-import { ManagedSessionMessageProjection } from './managed-session-message-projection.js';
+import {
+  LocalManagedSessionAuthority,
+  readManagedSessionLog,
+} from './managed-session-authority.js';
+import {
+  ManagedSessionMessageProjection,
+  readManagedSessionRecords,
+} from './managed-session-message-projection.js';
 import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
+import { ManagedSessionRecordSink } from './managed-session-record-sink.js';
 import { managedSessionResourceRoot } from '../utils/sessionStorageUtils.js';
-import type { ManagedSessionDurableRef } from './managed-session-records.js';
+import {
+  managedSessionEventsDigest,
+  parseManagedSessionEvent,
+  type ManagedSessionDurableRef,
+} from './managed-session-records.js';
 
 const DIGEST = 'e'.repeat(64);
 const sessionId = '550e8400-e29b-41d4-a716-446655440000';
@@ -169,7 +180,516 @@ const records: ChatRecord[] = [
   },
 ] as ChatRecord[];
 
+function historicalCheckpoint(
+  harness: Harness,
+  stateRef: ManagedSessionDurableRef,
+  id = 'branch-1',
+  previous: string | null = null,
+) {
+  return parseManagedSessionEvent({
+    v: 1,
+    sequence: harness.authority.committedSequence + 1,
+    eventId: `checkpoint:${id}`,
+    sessionKey,
+    kind: 'checkpoint.committed',
+    occurredAt: 1,
+    subject: { type: 'activation', scopeId: 'act-1', ...HOLDS.activation },
+    payload: {
+      checkpointId: id,
+      coveredSequence: harness.authority.committedSequence,
+      previousCheckpointId: previous,
+      stateRef,
+      boundary: null,
+    },
+  });
+}
+
+const branchRecord: ChatRecord = {
+  ...records[2],
+  uuid: 'branch-1',
+  subtype: 'branch_checkpoint',
+  systemPayload: {
+    v: 1,
+    startExclusiveRecordUuid: null,
+    assistantRecordUuid: records[1].uuid,
+  },
+};
+
 describe('managed session message projection', () => {
+  it.each([
+    [
+      'JSON',
+      Buffer.from(JSON.stringify({ continuation: { phase: 'before_model' } })),
+    ],
+    ['opaque bytes', Buffer.from([0, 255, 1, 2])],
+  ])(
+    'does not project a %s Harness checkpoint as a ChatRecord',
+    async (_label, state) => {
+      const harness = await createHarness();
+      try {
+        await harness.projection.commit(
+          command('commitMessage', 'cmd-msg-0'),
+          { record: records[0] },
+          HOLDS,
+        );
+        await harness.authority.commitCheckpoint(
+          command('commitCheckpoint', 'cmd-checkpoint'),
+          { state, boundary: null },
+          HOLDS,
+        );
+        await expect(
+          readManagedSessionRecords({
+            transcriptPath: harness.transcriptPath,
+            runtimeBaseDir: harness.runtimeBaseDir,
+            sessionKey,
+          }),
+        ).resolves.toEqual([records[0]]);
+        expect(await harness.authority.readCheckpointState()).toEqual(state);
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it.each(['none', 'before', 'after', 'both'] as const)(
+    'reads historical branches, retries and resumes the state chain (state position: %s)',
+    async (position) => {
+      const withState = position !== 'none';
+      const harness = await createHarness();
+      const branch = branchRecord;
+      const state = Buffer.from('Harness state');
+      let checkpointId: string | undefined;
+      try {
+        for (const record of records.slice(0, 2)) {
+          await harness.projection.commit(
+            command('commitMessage', record.uuid),
+            { record },
+            HOLDS,
+          );
+        }
+        if (position === 'before' || position === 'both') {
+          const committed = await harness.authority.commitCheckpoint(
+            command('commitCheckpoint', 'state-1'),
+            { state, boundary: null },
+            HOLDS,
+          );
+          checkpointId = committed.checkpoint.checkpointId;
+        }
+        const stateRef = await harness.store.publish(
+          'managed-branch-checkpoint',
+          Buffer.from(JSON.stringify(branch)),
+        );
+        await harness.authority.appendExecution(
+          {
+            ...command('commitBranchCheckpoint', `recorder:${branch.uuid}`),
+            contentDigest: stateRef.digest,
+          },
+          [
+            historicalCheckpoint(
+              harness,
+              stateRef,
+              branch.uuid,
+              checkpointId ?? null,
+            ),
+          ],
+          HOLDS,
+        );
+        if (position === 'after' || position === 'both') {
+          const stateAfter = await harness.store.publish(
+            'managed-checkpoint',
+            state,
+          );
+          checkpointId = 'state-after';
+          await harness.authority.appendExecution(
+            command('commitCheckpoint', checkpointId),
+            [
+              historicalCheckpoint(
+                harness,
+                stateAfter,
+                checkpointId,
+                branch.uuid,
+              ),
+            ],
+            HOLDS,
+          );
+        }
+        expect(harness.authority.latestCheckpoint?.checkpointId).toBe(
+          checkpointId,
+        );
+        expect(await harness.projection.project()).toEqual([
+          ...records.slice(0, 2),
+          branch,
+        ]);
+      } finally {
+        await harness.close();
+      }
+      const before = await fs.readFile(harness.transcriptPath);
+      await expect(
+        readManagedSessionRecords({
+          transcriptPath: harness.transcriptPath,
+          runtimeBaseDir: harness.runtimeBaseDir,
+          sessionKey,
+        }),
+      ).resolves.toEqual([...records.slice(0, 2), branch]);
+      const lease = await LocalManagedSessionAuthority.acquireWriter({
+        runtimeBaseDir: harness.runtimeBaseDir,
+        sessionId,
+        transcriptPath: harness.transcriptPath,
+      });
+      const reopened = await LocalManagedSessionAuthority.open({
+        lease,
+        sessionKey,
+        cwd: '/workspace',
+        version: 'test',
+        resources: harness.store,
+      });
+      try {
+        expect(reopened.latestCheckpoint?.checkpointId).toBe(checkpointId);
+        expect(reopened.restoreBasis()).toBe(
+          withState ? 'checkpoint' : 'blocked',
+        );
+        expect(await reopened.readCheckpointState()).toEqual(
+          withState ? state : undefined,
+        );
+        expect(await fs.readFile(harness.transcriptPath)).toEqual(before);
+        const sink = new ManagedSessionRecordSink(
+          reopened,
+          harness.store,
+          () => HOLDS,
+        );
+        await sink.write(branch);
+        expect(await fs.readFile(harness.transcriptPath)).toEqual(before);
+        await expect(
+          sink.write({ ...branch, parentUuid: 'changed' }),
+        ).rejects.toThrow(/different content/);
+        const next = await reopened.commitCheckpoint(
+          command('commitCheckpoint', 'next-state'),
+          { state: Buffer.from('next'), boundary: null },
+          HOLDS,
+        );
+        expect(next.checkpoint.previousCheckpointId).toBe(checkpointId ?? null);
+        const newBranch = { ...branch, uuid: 'branch-new' };
+        await sink.write(newBranch);
+        const afterBranch = await fs.readFile(harness.transcriptPath);
+        await sink.write(newBranch);
+        expect(await fs.readFile(harness.transcriptPath)).toEqual(afterBranch);
+        expect(reopened.latestCheckpoint).toEqual(next.checkpoint);
+        const last = await reopened.commitCheckpoint(
+          command('commitCheckpoint', 'last-state'),
+          { state: Buffer.from('last'), boundary: null },
+          HOLDS,
+        );
+        expect(last.checkpoint.previousCheckpointId).toBe(
+          next.checkpoint.checkpointId,
+        );
+        expect(
+          await readManagedSessionRecords({
+            transcriptPath: harness.transcriptPath,
+            runtimeBaseDir: harness.runtimeBaseDir,
+            sessionKey,
+          }),
+        ).toEqual([...records.slice(0, 2), branch, newBranch]);
+      } finally {
+        await reopened.close();
+      }
+    },
+  );
+
+  it.each([
+    ['wrong record ID', JSON.stringify({ ...branchRecord, uuid: 'other' })],
+    ['wrong session', JSON.stringify({ ...branchRecord, sessionId: 'other' })],
+    ['wrong type', JSON.stringify({ ...branchRecord, type: 'assistant' })],
+    [
+      'wrong subtype',
+      JSON.stringify({ ...branchRecord, subtype: 'slash_command' }),
+    ],
+    [
+      'missing parent',
+      JSON.stringify({ ...branchRecord, parentUuid: undefined }),
+    ],
+    [
+      'invalid payload',
+      JSON.stringify({ ...branchRecord, systemPayload: { v: 2 } }),
+    ],
+    [
+      'duplicate JSON key',
+      JSON.stringify(branchRecord).replace('"v":1', '"v":2,"v":1'),
+    ],
+    ['invalid JSON', 'not a record'],
+  ])(
+    'rejects %s before appending and permits a corrected retry',
+    async (_name, body) => {
+      const harness = await createHarness();
+      try {
+        const ref = await harness.store.publish(
+          'managed-branch-checkpoint',
+          Buffer.from(body),
+        );
+        const event = historicalCheckpoint(harness, ref);
+        const before = await fs.readFile(harness.transcriptPath);
+        const cmd = command('commitBranchCheckpoint', 'retryable');
+        await expect(
+          harness.authority.appendExecution(cmd, [event], HOLDS),
+        ).rejects.toThrow();
+        expect(await fs.readFile(harness.transcriptPath)).toEqual(before);
+        expect(harness.authority.latestCheckpoint).toBeUndefined();
+        expect(harness.authority.restoreBasis()).toBe('initial');
+        const valid = await harness.store.publish(
+          'managed-branch-checkpoint',
+          Buffer.from(JSON.stringify(branchRecord)),
+        );
+        await harness.authority.appendExecution(
+          cmd,
+          [historicalCheckpoint(harness, valid)],
+          HOLDS,
+        );
+        expect(harness.authority.restoreBasis()).toBe('blocked');
+        expect(await harness.projection.project()).toEqual([branchRecord]);
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it.each([
+    'kind',
+    'version',
+    'coverage',
+    'dangling predecessor',
+    'self predecessor',
+    'boundary',
+  ] as const)(
+    'rejects an invalid checkpoint %s before committing',
+    async (invalid) => {
+      const harness = await createHarness();
+      try {
+        let ref = await harness.store.publish(
+          'managed-branch-checkpoint',
+          Buffer.from(JSON.stringify(branchRecord)),
+        );
+        if (invalid === 'kind') ref = { ...ref, kind: 'managed-other' };
+        if (invalid === 'version') ref = { ...ref, schemaVersion: 2 };
+        const event = historicalCheckpoint(harness, ref);
+        const payload = {
+          ...event.payload,
+          ...(invalid === 'coverage'
+            ? { coveredSequence: event.sequence }
+            : {}),
+          ...(invalid === 'dangling predecessor'
+            ? { previousCheckpointId: 'missing' }
+            : {}),
+          ...(invalid === 'self predecessor'
+            ? { previousCheckpointId: 'branch-1' }
+            : {}),
+          ...(invalid === 'boundary' ? { boundary: 'turn_settled' } : {}),
+        };
+        const before = await fs.readFile(harness.transcriptPath);
+        await expect(
+          harness.authority.appendExecution(
+            command('commitBranchCheckpoint', 'invalid'),
+            [{ ...event, payload }],
+            HOLDS,
+          ),
+        ).rejects.toThrow();
+        expect(await fs.readFile(harness.transcriptPath)).toEqual(before);
+        expect(harness.authority.latestCheckpoint).toBeUndefined();
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it.each(['digest', 'length', 'missing'])(
+    'rejects a historical branch resource with %s damage on cold reads and reopen',
+    async (damage) => {
+      const harness = await createHarness();
+      const bytes = Buffer.from(JSON.stringify(branchRecord));
+      const ref = await harness.store.publish(
+        'managed-branch-checkpoint',
+        bytes,
+      );
+      await harness.authority.appendExecution(
+        command('commitCheckpoint', 'committed'),
+        [historicalCheckpoint(harness, ref)],
+        HOLDS,
+      );
+      await harness.close();
+      const resourcePath = path.join(
+        harness.store.sessionRoot,
+        ref.kind,
+        ref.resourceId,
+      );
+      if (damage === 'missing') {
+        await fs.unlink(resourcePath);
+      } else {
+        await fs.writeFile(
+          resourcePath,
+          Buffer.alloc(damage === 'length' ? 0 : bytes.length),
+        );
+      }
+      const error =
+        damage === 'digest'
+          ? /digest/
+          : damage === 'length'
+            ? /bytes where/
+            : /not present/;
+      const before = await fs.readFile(harness.transcriptPath);
+      await expect(
+        readManagedSessionRecords({
+          transcriptPath: harness.transcriptPath,
+          runtimeBaseDir: harness.runtimeBaseDir,
+          sessionKey,
+        }),
+      ).rejects.toThrow(error);
+      const lease = await LocalManagedSessionAuthority.acquireWriter({
+        runtimeBaseDir: harness.runtimeBaseDir,
+        sessionId,
+        transcriptPath: harness.transcriptPath,
+      });
+      try {
+        await expect(
+          LocalManagedSessionAuthority.open({
+            lease,
+            sessionKey,
+            cwd: '/workspace',
+            version: 'test',
+            resources: harness.store,
+          }),
+        ).rejects.toThrow(error);
+        expect(await fs.readFile(harness.transcriptPath)).toEqual(before);
+      } finally {
+        await lease.release();
+      }
+    },
+  );
+
+  it('rejects coverage of the same transaction on both hot and cold paths', async () => {
+    const harness = await createHarness();
+    const stateRef = await harness.store.publish(
+      'managed-checkpoint',
+      Buffer.from('state'),
+    );
+    const contentRef = await harness.store.publish(
+      'managed-message',
+      Buffer.from(JSON.stringify(records[0])),
+    );
+    const checkpoint = historicalCheckpoint(harness, stateRef, 'state-1');
+    const events = [
+      parseManagedSessionEvent({
+        ...checkpoint,
+        eventId: 'message-1',
+        kind: 'message.committed',
+        payload: {
+          messageId: records[0].uuid,
+          role: 'user',
+          contentRef,
+          parentMessageId: null,
+        },
+      }),
+      parseManagedSessionEvent({
+        ...checkpoint,
+        sequence: checkpoint.sequence + 1,
+        payload: {
+          ...checkpoint.payload,
+          coveredSequence: checkpoint.sequence,
+        },
+      }),
+    ];
+    try {
+      await expect(
+        harness.authority.appendExecution(
+          command('commitCheckpoint', 'bad-coverage'),
+          events,
+          HOLDS,
+        ),
+      ).rejects.toThrow(/coverage/);
+    } finally {
+      await harness.close();
+    }
+    const scan = await readManagedSessionLog(
+      harness.transcriptPath,
+      sessionKey,
+    );
+    const marker = {
+      transactionId: 'historical-batch',
+      commandId: 'historical-batch',
+      operation: 'commitCheckpoint',
+      contentDigest: DIGEST,
+      firstSequence: events[0].sequence,
+      lastSequence: events[1].sequence,
+      eventCount: events.length,
+      eventsDigest: managedSessionEventsDigest(events),
+      previousCommitDigest: scan.lastMarkerDigest,
+    };
+    await fs.appendFile(
+      harness.transcriptPath,
+      [
+        ...events.map((event) =>
+          JSON.stringify({
+            subtype: 'managed_session_event_v1',
+            managedSession: event,
+          }),
+        ),
+        JSON.stringify({
+          subtype: 'managed_session_commit_v1',
+          managedSession: marker,
+        }),
+      ].join('\n') + '\n',
+    );
+    await expect(
+      readManagedSessionRecords({
+        transcriptPath: harness.transcriptPath,
+        runtimeBaseDir: harness.runtimeBaseDir,
+        sessionKey,
+      }),
+    ).rejects.toThrow(/not committed before its transaction/);
+  });
+
+  it.each([
+    { label: 'input', record: records[0], basis: 'initial' },
+    { label: 'assistant', record: records[1], basis: 'blocked' },
+    { label: 'system input', record: records[2], basis: 'initial' },
+    {
+      label: 'tool result',
+      record: { ...records[1], type: 'tool_result' } as ChatRecord,
+      basis: 'blocked',
+    },
+  ])(
+    'classifies $label without a checkpoint consistently on cold reopen',
+    async ({ record, basis }) => {
+      const harness = await createHarness();
+      try {
+        await harness.projection.commit(
+          command('commitMessage', 'only-record'),
+          { record },
+          HOLDS,
+        );
+        expect(harness.authority.restoreBasis()).toBe(basis);
+        expect(harness.authority.latestCheckpoint).toBeUndefined();
+      } finally {
+        await harness.close();
+      }
+      const lease = await LocalManagedSessionAuthority.acquireWriter({
+        runtimeBaseDir: harness.runtimeBaseDir,
+        sessionId,
+        transcriptPath: harness.transcriptPath,
+      });
+      const reopened = await LocalManagedSessionAuthority.open({
+        lease,
+        sessionKey,
+        cwd: '/workspace',
+        version: 'test',
+        resources: harness.store,
+      });
+      try {
+        expect(reopened.restoreBasis()).toBe(basis);
+        expect(reopened.latestCheckpoint).toBeUndefined();
+      } finally {
+        await reopened.close();
+      }
+    },
+  );
+
   it('round trips records through the authoritative log without losing detail', async () => {
     const harness = await createHarness();
     for (const [index, record] of records.entries()) {

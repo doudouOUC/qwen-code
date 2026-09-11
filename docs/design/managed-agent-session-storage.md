@@ -118,6 +118,10 @@ Action 请求的来源与资格固定如下。`requestAction` 只允许注册领
 
 **旧 subtype 的归位。** 现有 transcript 还有若干不属于执行事实的 ChatRecord subtype，它们不新增顶层 kind，按下列方式落位，避免“既不在 union 里、又不许双写”的空档：会话标题与重命名归 `domain.committed` 的 `session_metadata`；`slash_command`、`at_command` 等用户输入形态与 UI 遥测、attribution 快照保留在 `message.committed` 的 `contentRef` 内容 union 中，reader 投影时还原原 subtype，不作为恢复必需事实；模型来源与父子记账已由 header、`config.bound`、`message.committed.parentMessageId` 和 checkpoint 覆盖，不另开记录。实时语音消息在 v1 没有对应归位，因此启用实时会话的入口继续固定 legacy，等[普通客户端专项](managed-agent-full-design.md)完成该切片后再纳入本表；在此之前不允许把它塞进 `message.committed` 充数。
 
+**分支点不是执行 checkpoint。** 新 `branch_checkpoint` 保留完整原 ChatRecord（uuid、parentUuid、v1 systemPayload），由原 Harness/recorder 通过 `message.committed` 的 system 内容提交，branch/transcript reader 原样投影；不新增 kind/domain，不双写，维持 formatVersion=1 与 minimumReader=`managed-session/1`，既有 message reader 已支持此内容形态。`commitBranchCheckpoint` 的 operation、`recorder:<uuid>` 与原 JSON 字节 SHA-256 保持不变，使升级后的重试返回旧事务，不另加一条分支记录。compaction 的 replacedMessageIds 列出范围内所有 message 事件（包括分支 system 内容），原事件及展示分支点不删除。
+
+历史已提交的 `checkpoint.committed` 若引用 schemaVersion=1 的 `managed-branch-checkpoint`，在热提交、冷开和投影时核验引用格式、资源长度/摘要、严格 JSON、record 的 sessionId/uuid/type/subtype、parentUuid 形态与 v1 payload；其 boundary 必须为 null，coveredSequence 为此前提交尾部。保留原事件、marker、资源及前驱，不改写日志。它只恢复分支展示并表明已有执行，不能更新 latestCheckpoint；没有执行状态时 blocked，不退回 initial。前驱只能引用已出现且在覆盖范围内的 checkpoint ID，拒绝重复 ID、悬空和向前引用；历史 state 可以引用已验证的 branch ID，后续新 state 则只连接上一个 state。所有 checkpoint 的 coverage 都不得超过本事务开始前的 committedSequence。`managed-checkpoint` 资源不按 ChatRecord 或 JSON 解码，分类阶段也不读取其字节；损坏或缺失的执行 state 仍在实际读取处失败，本片不改变该行为，正式的 blocked 映射随恢复切片交付。未知种类/版本明确失败。这里不宣称修复旧二进制，也不将分类隔离等同于 Harness 九组状态及尾部对账验收。
+
 ### 3.1 domain 注册索引
 
 下列 30 个名称构成全量目标的 v1 集合，event version=1、recordRef.kind=`managed-<domain>`、schemaVersion=1。正文 schema、生产者和消费/原子要求归对应专项；实现须从此索引检查完整集合，不得重新发明同义名。阶段、用途与 capability 决定当前可用子集：解析器认识一个名称不表示该功能已实现或获准执行。延期能力继续原准入规则，不提前扩大默认范围。新 domain 或正文的不兼容改动必须遵守上面的 reader/version 扩展规则。

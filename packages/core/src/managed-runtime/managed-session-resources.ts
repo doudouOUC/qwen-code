@@ -8,9 +8,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { open, mkdir, rename, readFile, unlink } from 'node:fs/promises';
 import * as path from 'node:path';
 import { managedSessionResourceRoot } from '../utils/sessionStorageUtils.js';
+import type { ChatRecord } from '../services/chatRecordingService.js';
 import {
+  assertManagedBranchRecord,
+  assertManagedSessionDurableRef,
   ManagedSessionRecordError,
+  parseManagedSessionRecordJson,
   type ManagedSessionDurableRef,
+  type ManagedSessionEvent,
   type ManagedSessionKey,
 } from './managed-session-records.js';
 
@@ -132,6 +137,71 @@ export class LocalManagedSessionResourceStore {
     }
     return bytes;
   }
+}
+
+/**
+ * Classifies a committed checkpoint before recovery trusts it.
+ *
+ * A historical Managed log recorded branch points as `checkpoint.committed`
+ * referencing a whole ChatRecord, so the resource kind is the only thing
+ * separating a display record from Harness state. Returning that record is
+ * what lets a reader keep showing those branch points without letting one
+ * stand in for a resumable state; Harness state is never decoded as a record.
+ */
+export async function readManagedBranchCheckpoint(
+  event: ManagedSessionEvent,
+  resources: LocalManagedSessionResourceStore | undefined,
+  checkpointSequence: (id: string) => number | undefined,
+  committedSequence: number,
+): Promise<ChatRecord | undefined> {
+  if (event.kind !== 'checkpoint.committed') return undefined;
+  if (resources === undefined) {
+    throw new ManagedSessionRecordError(
+      'a resource store is required to classify checkpoints.',
+    );
+  }
+  const ref = assertManagedSessionDurableRef(
+    event.payload['stateRef'],
+    'checkpoint state',
+  );
+  const branch = ref.kind === 'managed-branch-checkpoint';
+  if (
+    ref.schemaVersion !== 1 ||
+    (!branch && ref.kind !== 'managed-checkpoint')
+  ) {
+    throw new ManagedSessionRecordError('unknown checkpoint state format.');
+  }
+  const id = event.payload['checkpointId'] as string;
+  const covered = event.payload['coveredSequence'] as number;
+  const previous = event.payload['previousCheckpointId'] as string | null;
+  const previousSequence =
+    previous === null ? undefined : checkpointSequence(previous);
+  if (
+    checkpointSequence(id) !== undefined ||
+    covered >= event.sequence ||
+    covered > committedSequence ||
+    (previous !== null &&
+      (previousSequence === undefined || previousSequence > covered))
+  ) {
+    throw new ManagedSessionRecordError(
+      'invalid checkpoint coverage or predecessor.',
+    );
+  }
+  if (
+    branch &&
+    (event.payload['boundary'] !== null || covered !== event.sequence - 1)
+  ) {
+    throw new ManagedSessionRecordError(
+      'invalid historical branch checkpoint boundary.',
+    );
+  }
+  if (!branch) return undefined;
+  const bytes = await resources.read(ref);
+  return assertManagedBranchRecord(
+    parseManagedSessionRecordJson(bytes.toString('utf8'), ref.byteLength),
+    event.sessionKey,
+    id,
+  );
 }
 
 function assertPathSegment(value: string, label: string): string {

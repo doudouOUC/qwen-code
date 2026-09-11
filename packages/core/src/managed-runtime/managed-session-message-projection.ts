@@ -19,7 +19,10 @@ import {
   type ManagedSessionCommand,
   type ManagedSessionCommitReceipt,
 } from './managed-session-authority.js';
-import { LocalManagedSessionResourceStore } from './managed-session-resources.js';
+import {
+  LocalManagedSessionResourceStore,
+  readManagedBranchCheckpoint,
+} from './managed-session-resources.js';
 
 /**
  * Carries the existing transcript history inside the authoritative log.
@@ -99,6 +102,7 @@ export class ManagedSessionMessageProjection {
    */
   async project(): Promise<ChatRecord[]> {
     const records: ChatRecord[] = [];
+    const checkpoints = new Map<string, number>();
     let after = 0;
     for (;;) {
       const page = this.authority.readEvents({
@@ -108,10 +112,25 @@ export class ManagedSessionMessageProjection {
       if (page.length === 0) break;
       for (const event of page) {
         after = event.sequence;
-        if (event.kind !== 'message.committed') continue;
-        records.push(
-          await readRecordBody(this.resources, event.payload['contentRef']),
+        const branch = await readManagedBranchCheckpoint(
+          event,
+          this.resources,
+          (id) => checkpoints.get(id),
+          this.authority.committedSequence,
         );
+        if (event.kind === 'checkpoint.committed') {
+          checkpoints.set(
+            event.payload['checkpointId'] as string,
+            event.sequence,
+          );
+        }
+        if (branch !== undefined) {
+          records.push(branch);
+        } else if (event.kind === 'message.committed') {
+          records.push(
+            await readRecordBody(this.resources, event.payload['contentRef']),
+          );
+        }
       }
     }
     return records;
@@ -159,7 +178,21 @@ export async function readManagedSessionRecords(options: {
     sessionKey: options.sessionKey,
   });
   const records: ChatRecord[] = [];
+  const checkpoints = new Map<string, number>();
   for (const event of scan.events) {
+    const branch = await readManagedBranchCheckpoint(
+      event,
+      resources,
+      (id) => checkpoints.get(id),
+      scan.committed,
+    );
+    if (event.kind === 'checkpoint.committed') {
+      checkpoints.set(event.payload['checkpointId'] as string, event.sequence);
+    }
+    if (branch !== undefined) {
+      records.push(branch);
+      continue;
+    }
     const carried = readerFacingBody(event);
     if (carried === undefined) continue;
     const body = await readRecordBody(resources, carried.ref);
@@ -202,8 +235,6 @@ function readerFacingBody(event: ManagedSessionEvent):
       return { ref: event.payload['resultRef'], inDomainEnvelope: false };
     case 'context.compacted':
       return { ref: event.payload['summaryRef'], inDomainEnvelope: false };
-    case 'checkpoint.committed':
-      return { ref: event.payload['stateRef'], inDomainEnvelope: false };
     case 'domain.committed':
       return RECORD_CARRYING_DOMAINS.has(event.payload['domain'])
         ? { ref: event.payload['recordRef'], inDomainEnvelope: true }
