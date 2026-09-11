@@ -196,6 +196,7 @@ export class LocalManagedSessionAuthority {
   private readonly eventIds = new Set<string>();
   private checkpoint: ManagedSessionCheckpoint | undefined;
   private hasContinuation = false;
+  private compactedThrough = 0;
   private readonly domainRecords = new Map<
     string,
     { revision: number; recordRef: ManagedSessionDurableRef }
@@ -203,6 +204,14 @@ export class LocalManagedSessionAuthority {
 
   get committedSequence(): number {
     return this.committed;
+  }
+
+  /**
+   * The highest sequence a compaction already claims to have replaced, so the
+   * next one states a range that does not overlap an earlier claim.
+   */
+  get compactedThroughSequence(): number {
+    return this.compactedThrough;
   }
 
   get sessionHeader(): ManagedSessionHeader {
@@ -965,6 +974,10 @@ export class LocalManagedSessionAuthority {
    * any execution has happened that a checkpoint would have to cover.
    */
   private recordRecoveryFacts(event: ManagedSessionEvent): void {
+    if (event.kind === 'context.compacted') {
+      this.compactedThrough = event.payload['toSequence'] as number;
+      return;
+    }
     if (event.kind === 'checkpoint.committed') {
       this.checkpoint = {
         checkpointId: event.payload['checkpointId'] as string,

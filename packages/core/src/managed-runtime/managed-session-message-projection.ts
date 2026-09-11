@@ -166,7 +166,9 @@ export async function readManagedSessionRecords(options: {
         ? event.payload['contentRef']
         : event.kind === 'turn.settled'
           ? event.payload['resultRef']
-          : undefined;
+          : event.kind === 'context.compacted'
+            ? event.payload['summaryRef']
+            : undefined;
     if (ref === undefined) continue;
     records.push(await readRecordBody(resources, ref));
   }

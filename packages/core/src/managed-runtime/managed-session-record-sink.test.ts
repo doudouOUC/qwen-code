@@ -173,16 +173,59 @@ describe('managed session record sink', () => {
 
   it('refuses shapes that have their own home and are not mapped yet', async () => {
     const harness = await createHarness();
-    const unmapped = [
-      'goal_state',
-      'chat_compression',
-      'file_history_snapshot',
-    ] as const;
+    const unmapped = ['goal_state', 'file_history_snapshot'] as const;
     for (const subtype of unmapped) {
       expect(harness.sink.canCarry(record({ type: 'system', subtype }))).toBe(
         false,
       );
     }
+    await harness.close();
+  });
+
+  it('commits a compaction as the range of history it replaces', async () => {
+    const harness = await createHarness();
+    const message = record({
+      uuid: 'rec-user-1',
+      message: { role: 'user', parts: [{ text: 'summarise the docs' }] },
+    });
+    await harness.sink.write(message);
+
+    const compression = record({
+      uuid: 'rec-compact-1',
+      type: 'system',
+      subtype: 'chat_compression',
+      systemPayload: {
+        info: { originalTokenCount: 100, newTokenCount: 10 },
+        compressedHistory: [{ role: 'user', parts: [{ text: 'summary' }] }],
+      },
+    } as Partial<ChatRecord>);
+    await harness.sink.write(compression);
+
+    const compacted = harness.authority
+      .readEvents()
+      .filter((event) => event.kind === 'context.compacted');
+    expect(compacted).toHaveLength(1);
+    expect(compacted[0].payload['replacedMessageIds']).toEqual(['rec-user-1']);
+    expect(compacted[0].payload['fromSequence']).toBe(1);
+
+    // The snapshot reads back whole, and a compaction is not message content,
+    // so it stays out of the message projection.
+    const body = await harness.store.read(
+      compacted[0].payload['summaryRef'] as unknown as ManagedSessionDurableRef,
+    );
+    expect(JSON.parse(body.toString('utf8'))).toEqual(compression);
+    expect(await harness.sink.project()).toEqual([message]);
+
+    await expect(
+      harness.sink.write(
+        record({
+          uuid: 'rec-compact-2',
+          type: 'system',
+          subtype: 'chat_compression',
+          systemPayload: { info: {} } as never,
+        }),
+      ),
+    ).rejects.toThrow(ManagedSessionUnmappedRecordError);
     await harness.close();
   });
 

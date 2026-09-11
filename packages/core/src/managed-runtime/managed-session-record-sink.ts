@@ -48,7 +48,6 @@ export class ManagedSessionUnmappedRecordError extends Error {
  */
 export class ManagedSessionRecordSink {
   private readonly projection: ManagedSessionMessageProjection;
-  private sequence = 0;
 
   constructor(
     private readonly authority: LocalManagedSessionAuthority,
@@ -63,6 +62,7 @@ export class ManagedSessionRecordSink {
     if (record.type === 'system') {
       if (record.subtype === 'custom_title') return true;
       if (record.subtype === 'turn_result') return true;
+      if (record.subtype === 'chat_compression') return true;
       return (
         record.subtype !== undefined &&
         CARRIED_SYSTEM_SUBTYPES.has(record.subtype)
@@ -95,7 +95,10 @@ export class ManagedSessionRecordSink {
       await this.commitTurnSettled(record);
       return;
     }
-    this.sequence += 1;
+    if (record.subtype === 'chat_compression') {
+      await this.commitContextCompacted(record);
+      return;
+    }
     await this.projection.commit(
       {
         operation: 'commitMessage',
@@ -203,6 +206,75 @@ export class ManagedSessionRecordSink {
             resultRef,
             usageRef: null,
             pendingOwnersRef: null,
+          },
+        },
+      ],
+      actor,
+    );
+  }
+
+  /**
+   * A compaction replaces a range of history rather than adding to it, so it is
+   * committed as `context.compacted` naming that range and the messages inside
+   * it. The whole record becomes the summary body: a reader rebuilds the model
+   * history from the snapshot it carries, so a record without one is refused.
+   */
+  private async commitContextCompacted(record: ChatRecord): Promise<void> {
+    const payload = record.systemPayload as
+      | { compressedHistory?: unknown }
+      | undefined;
+    if (!payload?.compressedHistory) {
+      throw new ManagedSessionUnmappedRecordError(record);
+    }
+    const fromSequence = this.authority.compactedThroughSequence + 1;
+    const toSequence = this.authority.committedSequence;
+    const replacedMessageIds = this.authority
+      .readEvents()
+      .filter(
+        (event) =>
+          event.kind === 'message.committed' &&
+          event.sequence >= fromSequence &&
+          event.sequence <= toSequence,
+      )
+      .map((event) => event.payload['messageId'] as string);
+    const summaryRef = await this.resources.publish(
+      'managed-compaction-summary',
+      Buffer.from(JSON.stringify(record), 'utf8'),
+    );
+    const actor = this.actor();
+    const held = actor.activation;
+    await this.authority.appendExecution(
+      {
+        operation: 'compactContext',
+        commandId: `recorder:${record.uuid}`,
+        sessionKey: this.authority.sessionHeader.sessionKey,
+        contentDigest: summaryRef.digest,
+      },
+      [
+        {
+          v: 1,
+          sequence: toSequence + 1,
+          eventId: `compaction:${record.uuid}`,
+          sessionKey: this.authority.sessionHeader.sessionKey,
+          kind: 'context.compacted',
+          occurredAt: Date.parse(record.timestamp) || Date.now(),
+          ...(held === undefined
+            ? {}
+            : {
+                subject: {
+                  type: 'activation',
+                  scopeId: held.activationId,
+                  activationId: held.activationId,
+                  epoch: held.epoch,
+                },
+              }),
+          payload: {
+            compactionId: record.uuid,
+            fromSequence,
+            toSequence,
+            summaryRef,
+            replacedMessageIds,
+            tokenCountsRef: null,
           },
         },
       ],

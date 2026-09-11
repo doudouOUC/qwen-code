@@ -9,6 +9,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Config, type ConfigParameters } from './config.js';
+import { CompressionStatus } from '../core/turn.js';
 import { Storage } from './storage.js';
 import { getSessionWriterLockPath } from '../services/session-writer-lease.js';
 import {
@@ -219,6 +220,37 @@ describe('managed session log activation', () => {
         ),
       ) as Record<string, unknown>;
       expect(lock['state']).toBe('sealed');
+    });
+  });
+
+  it('restores a compacted managed session from its summary', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      recorder.recordUserMessage('first turn');
+      recorder.recordChatCompression({
+        info: {
+          originalTokenCount: 100,
+          newTokenCount: 10,
+          compressionStatus: CompressionStatus.COMPRESSED,
+        },
+        compressedHistory: [{ role: 'user', parts: [{ text: 'summary' }] }],
+      });
+      // A shape the sink cannot map fails the flush, so reaching the assertions
+      // is itself evidence the compaction was carried.
+      await recorder.flush();
+      await fixture.config.closeSessionWriter();
+
+      const projection = await fixture.config
+        .getSessionService()
+        .readRestoreProjection(sessionId, {
+          replay: { kind: 'all', hideInheritedHistory: false },
+        });
+
+      // Rebuilt from the compaction snapshot, not from the turn it replaced.
+      expect(projection?.runtime.apiHistory).toEqual([
+        { role: 'user', parts: [{ text: 'summary' }] },
+      ]);
     });
   });
 

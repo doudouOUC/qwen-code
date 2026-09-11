@@ -2706,7 +2706,10 @@ export class SessionTranscriptReader {
     let lastTokenCountsRecord: ChatRecord | undefined;
     for (const record of records) {
       turnState.addHint(getSessionTurnRecordHint(record, sessionId));
-      if (record.type !== 'system') apiHistory.add(record);
+      // Every record: the accumulator ignores system records that are not a
+      // compaction snapshot, and resets its history when it sees one, so
+      // filtering by type here would rebuild history from before a compaction.
+      apiHistory.add(record);
       if (isResumeTokenCountsCandidate(record)) lastTokenCountsRecord = record;
       if (record.subtype === 'ui_telemetry') {
         const uiEvent = (
