@@ -299,6 +299,7 @@ describe('ManagedToolRuntime', () => {
         getProjectTempDir: () => '/managed-child/tmp',
         getProjectDir: () => '/managed-child',
         getUserSkillsDirs: () => [],
+        getWorkflowRunsDir: () => '/managed-child/workflow-runs',
       },
     });
     const prepareTurn = vi.fn(async () => {});

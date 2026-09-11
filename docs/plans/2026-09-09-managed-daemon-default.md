@@ -171,6 +171,12 @@ R2.S1 已进入施工，其余两片仍是设计。R2.S1 拆为 R2.S1a 记录格
 
 **证据**：`npm install`（上游新增 `remend` 依赖）、仓库 `npm run build` 与 `npm run typecheck` 均 0 error，改动文件 prettier/eslint 干净；`bridge.test.ts` 932/932，`llm.test.tsx` + `acpAgent.test.ts` 843/843，`run-qwen-serve.test.ts` + `environment.test.ts` + `tool-call-emitter.test.ts` 545/545，core 的 `sessionService`/`session-transcript-reader`/`managed-session-log`/`envVarResolver` 427/427。上游把 envVarResolver 移入 core 时删掉了 CLI 侧套件，本分支「显式环境不回落 ambient」的用例已补进 core 套件（28/28）。
 
+**跑完整 core 包才暴露的三类缺口**（定向套件全绿并不代表合并无损，25737 项里有 116 项失败）：其一，`applyAutoModeDecision` 少传 `actionFingerprint`、`evaluateAutoMode` 少传 `trustedUserAnswers`、allow 快路径的 `recordAllow` 少传指纹——都是上游同一批 auto-mode 改动里被**部分**吸收的 hunk，后果是「同一动作被拦后重试」不再路由到一次人工确认而是再次报错；已按上游补齐，`coreToolScheduler` 448/448。其二，上游新写的 provider/pipeline 套件用极简 Config stub，缺本分支的 `getRuntimeEnvironment`；由于该访问器**故意不回落 ambient `process.env`**（否则前一段的显式环境语义就没了），修的是 stub 而不是生产调用，20 处补齐后这批 1469/1469。其三，本分支自己的三处断言已随上游改名/改签名而过期：`LlmContentGenerator` 现在多收一个 CLI Config 参数、取消原因改为上游 #10180 的措辞、PDF 页数改为带 signal 的 options；另有本分支早于合并就已过期的 `reproduce-401` 措辞断言（本分支把诊断从 `process.env[...]` 改成 `Environment variable ...` 时漏改）。
+
+**这次审计方法学也要记录**：我先用「把上游补丁反向 dry-run 到合并结果」来查漏，113 个双方都改过的文件只报出上游删掉的两个 CLI envVarResolver 文件，看着像零漏；但该方法只能发现**前像完整保留**的 hunk，对「上下文匹配、少吸收一两行」的部分应用是盲的——上面第一类缺口正是这样漏过去的。**结论：合并完整性只能由测试判定，补丁反向 dry-run 只是补充。**
+
+**仍失败且判定为环境/既有问题（未修）**：`storage.test.ts` 的 5 个 `ensureAuditFallbackDir` 用例（其 setup 自身报 `EEXIST symlink X -> X` 与 `Path is a directory`）、`write-file.test.ts` 1 个用例（断言通过、`finally` 里 `rmSync` 对目录符号链接抛 EISDIR）、`git-branches.test.ts` 的 15s 超时与 lock 提示、`agent/agent.test.ts` 1 个用例。这些都不在合并冲突面内，失败点在测试自身的 fs/git 前置或超时；**本轮未在上游基线上复跑对照**，因此只能记为「疑似环境/既有」，不能当成已排除合并影响。
+
 **边界**：这一步只是对齐，**没有**新增任何 Managed 默认接线——`managedSessionLogEnabled` 仍默认关闭，四处普通 factory 仍未开启它，因此 daemon 默认路径依旧是 legacy，R1 在默认配置下仍等于 no-op。本方案中带行号的 read-path 断言必须在新基线上重新核对后才能引用（上游改动了 transcript index 与 turn navigation），未重核的行号不得作为验收证据。
 
 ## 后续阶段与完整完成条件

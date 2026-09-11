@@ -1441,7 +1441,6 @@ describe('ContentGenerationPipeline', () => {
       } as ContentGeneratorConfig;
       if ('capability' in testCase) {
         mockCliConfig = {
-          getRuntimeEnvironment: () => process.env,
           ...mockCliConfig,
           getResolvedModelConfig: vi.fn(() => ({
             capabilities: { reasoning: testCase.capability },
@@ -2139,7 +2138,6 @@ describe('ContentGenerationPipeline', () => {
               mode === 'disabled' ? false : effort ? { effort } : undefined,
           };
           mockCliConfig = {
-            getRuntimeEnvironment: () => process.env,
             ...mockCliConfig,
             getResolvedModelConfig: vi.fn().mockReturnValue(installed),
             getContentGeneratorConfig: () => mockContentGeneratorConfig,
