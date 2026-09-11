@@ -71,6 +71,7 @@ export class SessionExecutionEngineAccumulator {
   private engine: SessionExecutionEngine | undefined;
   private reason: string | undefined;
   private hasRecords = false;
+  private complete = true;
 
   constructor(private readonly sessionId: string) {}
 
@@ -78,6 +79,7 @@ export class SessionExecutionEngineAccumulator {
     if (!line.trim()) return [];
     const parsed = parseLineTolerantWithIntegrity<unknown>(line, filePath);
     if (!parsed.complete) this.reason ??= 'incomplete transcript';
+    this.complete &&= parsed.complete;
     for (const value of parsed.records) {
       this.hasRecords = true;
       const { record, diagnostics } = validateTranscriptRecord(value);
@@ -110,6 +112,17 @@ export class SessionExecutionEngineAccumulator {
       this.engine = payload.engine;
     }
     return parsed.records;
+  }
+
+  /**
+   * Whether every line handed to {@link parseLine} parsed whole.
+   *
+   * Exposed because a caller that reads lines through this accumulator has no
+   * other way to see it: the parse happens here, and an index that assumed the
+   * source was complete would present a truncated transcript as a whole one.
+   */
+  get sourceComplete(): boolean {
+    return this.complete;
   }
 
   finish(snapshot: SessionExecutionSnapshot): SessionExecutionEngineState {

@@ -37,7 +37,7 @@ import {
   type ThoughtSummary,
 } from '../utils/thoughtUtils.js';
 import type { LoopType } from '../telemetry/types.js';
-import type { ActiveGoal } from '../goals/activeGoalStore.js';
+import type { ActiveGoal } from '../goals/goal-legacy-projection.js';
 import type {
   GoalSnapshotV2,
   GoalStateCause,
@@ -75,6 +75,7 @@ export enum LlmEventType {
   Citation = 'citation',
   Retry = 'retry',
   HookSystemMessage = 'hook_system_message',
+  GoalSettlementFailed = 'goal_settlement_failed',
   UserPromptSubmitBlocked = 'user_prompt_submit_blocked',
   StopHookLoop = 'stop_hook_loop',
   GoalState = 'goal_state',
@@ -243,6 +244,14 @@ export function createDuplicateProviderToolCallResponse(
 ): ToolCallResponseInfo {
   const providerCallId = request.providerCallId ?? request.callId;
   const message = duplicateProviderToolCallMessage(providerCallId);
+  return createNotStartedToolErrorResponse(request, message);
+}
+
+export function createNotStartedToolErrorResponse(
+  request: ToolCallRequestInfo,
+  message: string,
+  errorType: ToolErrorType = ToolErrorType.EXECUTION_FAILED,
+): ToolCallResponseInfo {
   return {
     callId: request.callId,
     responseParts: [
@@ -256,7 +265,7 @@ export function createDuplicateProviderToolCallResponse(
     ],
     resultDisplay: message,
     error: new Error(message),
-    errorType: ToolErrorType.EXECUTION_FAILED,
+    errorType,
     executionStatus: 'not_started',
   };
 }
@@ -411,11 +420,14 @@ export function isCompressionFailureStatus(
 /**
  * Why an auto-compaction fired. Drives the user-facing notice so a
  * screenshot-overflow trigger isn't mislabeled as "approached the token
- * limit". Undefined on NOOP / failure paths and for callers that don't set it.
+ * limit" and a 413-driven compaction isn't mislabeled as a token overflow
+ * (#10380). Undefined on NOOP / failure paths and for callers that don't
+ * set it.
  */
 export type CompactionTriggerReason =
   | 'token_limit'
   | 'image_overflow'
+  | 'payload_overflow'
   | 'manual';
 
 export interface ChatCompressionInfo {
@@ -477,6 +489,11 @@ export type ServerLlmHookSystemMessageEvent = {
   value: string;
 };
 
+export type ServerLlmGoalSettlementFailedEvent = {
+  type: LlmEventType.GoalSettlementFailed;
+  value: string;
+};
+
 export type ServerLlmUserPromptSubmitBlockedEvent = {
   type: LlmEventType.UserPromptSubmitBlocked;
   value: {
@@ -514,6 +531,7 @@ export type ServerLlmStreamEvent =
   | ServerLlmContentEvent
   | ServerLlmErrorEvent
   | ServerLlmFinishedEvent
+  | ServerLlmGoalSettlementFailedEvent
   | ServerLlmHookSystemMessageEvent
   | ServerLlmUserPromptSubmitBlockedEvent
   | ServerLlmStopHookLoopEvent

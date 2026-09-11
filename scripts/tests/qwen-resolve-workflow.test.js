@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,11 +19,45 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '../..',
 );
+
+// Capability probe, not a platform check: the FIFO wedge tests need
+// mkfifo(1). vitest.config excludes win32 only, so the merge_group/schedule
+// gated test_macos lane runs this suite too, and on a host without mkfifo
+// spawnSync('mkfifo', ...) returns ENOENT without throwing, no FIFO is
+// ever created, and the wedge assertions would pass for the wrong reason
+// (R11-7). Probe PRESENCE, not GNU-ness: BSD mkfifo rejects `--help`, so
+// an exit-code probe skipped the coverage on every macOS host although
+// macOS ships /usr/bin/mkfifo. With no operand both implementations print
+// usage and exit non-zero; only ENOENT means "absent".
+const hasMkfifo = (() => {
+  const probe = spawnSync('mkfifo', [], { stdio: 'ignore' });
+  return probe.error?.code !== 'ENOENT';
+})();
+
+// The review lane exports the production QWEN_CI_REAL_* captures into the
+// reviewed agent's environment, and every replay harness below spreads
+// process.env: inherited, a capture resolves a replayed
+// `"${QWEN_CI_REAL_X:-x}"` read to the REAL utility instead of the
+// bin-planted stub — the FIFO wedge tests then pass without a FIFO ever
+// being swapped in, and a bound-removing regression ships green on exactly
+// the lane the suite is documented to run on (R28-1). Neutralize EVERY
+// inherited capture up front (empty reads as unset to the :- fallbacks,
+// restoring PATH-stub resolution); the per-harness pins after the spread
+// still override. A sweep, not a name list: the next capture production
+// adds must not reopen the door.
+function neutralizedRealPins() {
+  return Object.fromEntries(
+    Object.keys(process.env)
+      .filter((k) => k.startsWith('QWEN_CI_REAL_'))
+      .map((k) => [k, '']),
+  );
+}
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -49,11 +84,65 @@ function step(section, name) {
   return match?.[0] ?? '';
 }
 
+// The behavioural tests below execute shell sliced out of the workflow's
+// `run: |-` blocks; the index guards and the 10-space dedent live in one
+// place so a drifted helper cannot silently extract a wrong range.
+function extractBlock(source, startMarker, endMarker, options = {}) {
+  const { includeStart = true, includeEnd = true } = options;
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(
+    endMarker,
+    start === -1 ? 0 : start + startMarker.length,
+  );
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const sliceStart = includeStart ? start : start + startMarker.length;
+  return source
+    .slice(sliceStart, includeEnd ? end + endMarker.length : end)
+    .replace(/^ {10}/gm, '');
+}
+
 function reviewGhWrapper(runStep) {
-  const start = runStep.indexOf('cat > "$proxy_bin/gh" <<\'QWEN_GH_WRAPPER\'');
-  const bodyStart = runStep.indexOf('\n', start) + 1;
-  const end = runStep.indexOf('\n          QWEN_GH_WRAPPER', bodyStart);
-  return runStep.slice(bodyStart, end).replace(/^ {10}/gm, '');
+  return extractBlock(
+    runStep,
+    'cat > "$proxy_bin/gh" <<\'QWEN_GH_WRAPPER\'\n',
+    '\n          QWEN_GH_WRAPPER',
+    { includeStart: false, includeEnd: false },
+  );
+}
+
+// A timeout(1) stub that ENFORCES the bound: the wrapper's salvage marker
+// read is a `timeout 5 head -c 128` open, and a lane without GNU coreutils
+// (macOS) ships no timeout(1). A bare pass-through is not sufficient: a
+// rename-swapped FIFO then blocks the open forever (R8-10).
+function boundedTimeoutStub() {
+  const js =
+    'const [dur, ...cmd] = process.argv.slice(1);' +
+    'const ms = Math.max(0, Number.parseFloat(dur) || 0) * 1000;' +
+    'const child = require("child_process").spawn(cmd[0], cmd.slice(1), { stdio: "inherit" });' +
+    'let killed = false;' +
+    'const timer = setTimeout(() => { killed = true; try { child.kill("SIGKILL"); } catch (e) {} }, ms);' +
+    'child.on("exit", (code, signal) => { clearTimeout(timer); process.exit(killed ? 124 : code === null ? (signal ? 137 : 1) : code); });';
+  return `#!/bin/bash\nexec "${process.execPath}" -e '${js}' "$@"\n`;
+}
+
+// A reader stub (installed as head AND cat) that rename-swaps a FIFO onto
+// its target at open time — the window [ -f ] cannot refuse — then blocks
+// like a real open (no writer). Only a timeout bound resolves the read;
+// shimming both readers keeps the wedge red for a regression back to a
+// bare `cat`.
+function swapAtOpenStub() {
+  return (
+    [
+      '#!/bin/bash',
+      'for last in "$@"; do :; done',
+      'if [ -n "$last" ] && [ -f "$last" ]; then',
+      '  rm -f "$last"',
+      '  mkfifo "$last"',
+      'fi',
+      'exec cat "$last"',
+    ].join('\n') + '\n'
+  );
 }
 
 function runReviewGhWrapper(
@@ -62,12 +151,29 @@ function runReviewGhWrapper(
   prState,
   currentHead,
   expectedHead = 'head-a',
+  // salvageContent: when set, a salvage marker file with that content is
+  // created and exported as QWEN_CI_REVIEW_SALVAGE_OK_FILE — the supersede
+  // watcher's past-threshold pin (#10110). salvageFifo plants a static
+  // FIFO at the marker; swapSalvageOnRead rename-swaps one in at the
+  // read's open — the window [ -f ] cannot refuse (R8-10).
+  { salvageContent, salvageFifo = false, swapSalvageOnRead = false } = {},
 ) {
   const tempDir = mkdtempSync(path.join(tmpdir(), 'qwen-review-gh-'));
   try {
     const wrapperPath = path.join(tempDir, 'gh');
     const realGhPath = path.join(tempDir, 'real-gh');
     const ghLogPath = path.join(tempDir, 'gh.log');
+    let salvagePath = '';
+    if (salvageFifo) {
+      salvagePath = path.join(tempDir, 'salvage-ok');
+      spawnSync('mkfifo', [salvagePath]);
+      // A plant that silently failed would let the wedge case pass for
+      // the wrong reason (the read of a missing file returns at once).
+      expect(statSync(salvagePath).isFIFO()).toBe(true);
+    } else if (salvageContent !== undefined) {
+      salvagePath = path.join(tempDir, 'salvage-ok');
+      writeFileSync(salvagePath, salvageContent);
+    }
     writeFileSync(wrapperPath, reviewGhWrapper(runStep));
     writeFileSync(
       realGhPath,
@@ -84,11 +190,32 @@ function runReviewGhWrapper(
     writeFileSync(ghLogPath, '');
     chmodSync(wrapperPath, 0o755);
     chmodSync(realGhPath, 0o755);
+    // The marker read is a bounded `timeout 5 head -c 128` open: give the
+    // wrapper a bound-enforcing timeout(1) on every lane (macOS ships
+    // none) — and the swap head stub when the wedge arm is requested.
+    const binDir = path.join(tempDir, 'bin');
+    mkdirSync(binDir);
+    writeFileSync(path.join(binDir, 'timeout'), boundedTimeoutStub());
+    chmodSync(path.join(binDir, 'timeout'), 0o755);
+    if (swapSalvageOnRead) {
+      for (const name of ['head', 'cat']) {
+        writeFileSync(path.join(binDir, name), swapAtOpenStub());
+        chmodSync(path.join(binDir, name), 0o755);
+      }
+    }
 
     const result = spawnSync(wrapperPath, args, {
       encoding: 'utf8',
+      // A regression that unbounds the marker read must turn the suite
+      // RED on the harness bound, not hang it: spawnSync kills the child
+      // at 30s and the status assertions fail on the missing exit.
+      timeout: 30_000,
       env: {
         ...process.env,
+        // Inherited review-lane captures would route the guard's bounded
+        // marker read past the bin timeout/head stubs (R28-1).
+        ...neutralizedRealPins(),
+        PATH: `${binDir}:${process.env.PATH}`,
         FAKE_GH_LOG: ghLogPath,
         FAKE_HEAD_SHA: currentHead,
         FAKE_PR_STATE: prState,
@@ -96,6 +223,7 @@ function runReviewGhWrapper(
         QWEN_CI_REVIEW_EXPECTED_HEAD_SHA: expectedHead,
         QWEN_CI_REVIEW_PR_NUMBER: '123',
         QWEN_CI_REVIEW_REPO: 'owner/repo',
+        ...(salvagePath ? { QWEN_CI_REVIEW_SALVAGE_OK_FILE: salvagePath } : {}),
       },
     });
 
@@ -189,16 +317,29 @@ describe('qwen resolve workflow', () => {
     );
   });
 
-  it('keeps synchronize cancellation expression simple for workflow-level concurrency', () => {
+  it('cancels in progress on closed only — synchronize supersede is decided in-run (#10110)', () => {
     const concurrencyStart = workflow.indexOf('\nconcurrency:');
     const concurrency = workflow.slice(
       concurrencyStart,
       workflow.indexOf('\njobs:', concurrencyStart),
     );
 
+    // Verbatim: re-adding `synchronize` here silently reinstates the
+    // declarative cancel that discarded a 4h06m review minutes from posting
+    // (PR #9729, run 32726618419). A push now queues PENDING in the PR group
+    // while the in-flight run's supersede watcher decides KEEP (salvage past
+    // the threshold, post against the reviewed head) vs CEDE (end early);
+    // `closed` still cancels — a closed PR's review is pointless and its
+    // posting is blocked by the OPEN guard anyway.
     expect(concurrency).toContain(
-      "cancel-in-progress: \"${{ github.event_name == 'pull_request_target' && (github.event.action == 'synchronize' || github.event.action == 'closed') }}\"",
+      "cancel-in-progress: \"${{ github.event_name == 'pull_request_target' && github.event.action == 'closed' }}\"",
     );
+    // The other half of the model: every CEDE branch relies on a push
+    // QUEUING a replacement lifecycle run, which only happens while
+    // `synchronize` stays a pull_request_target trigger.
+    const types = parse(workflow).on?.pull_request_target?.types ?? [];
+    expect(types).toContain('synchronize');
+    expect(types).toContain('closed');
   });
 
   it('listens for /resolve comments', () => {
@@ -638,6 +779,96 @@ describe('qwen resolve workflow', () => {
     );
     expect(staleSummary.ghLog).toBe('');
   });
+
+  it('lets a salvage-armed run post against its reviewed head after a move (#10110)', () => {
+    const runStep = step(reviewJob, 'Run review');
+    // The marker content must equal the head this run reviewed
+    // (EXPECTED_HEAD_SHA): the supersede watcher pins it there, so a stale
+    // marker left by another run on the reused runner can never match.
+    const salvaged = runReviewGhWrapper(
+      runStep,
+      ['api', 'repos/owner/repo/pulls/123/reviews', '--input', 'review.json'],
+      'OPEN',
+      'head-b',
+      'head-a',
+      { salvageContent: 'head-a' },
+    );
+    expect(salvaged.status).toBe(0);
+    expect(salvaged.stderr).toContain('PR write allowed (salvage)');
+    expect(salvaged.ghLog).toContain(
+      'api repos/owner/repo/pulls/123/reviews --input review.json',
+    );
+
+    // Wrong pin — a marker for some other head blocks exactly as before.
+    const wrongPin = runReviewGhWrapper(
+      runStep,
+      ['api', 'repos/owner/repo/pulls/123/reviews', '--input', 'review.json'],
+      'OPEN',
+      'head-b',
+      'head-a',
+      { salvageContent: 'head-z' },
+    );
+    expect(wrongPin.status).toBe(90);
+    expect(wrongPin.stderr).toContain(
+      'Blocked PR write: PR #123 moved from head-a to head-b',
+    );
+    expect(wrongPin.ghLog).toBe('');
+
+    // Salvage never overrides the OPEN check: a closed PR stays blocked.
+    const closedSalvage = runReviewGhWrapper(
+      runStep,
+      ['api', 'repos/owner/repo/pulls/123/reviews', '--input', 'review.json'],
+      'CLOSED',
+      'head-b',
+      'head-a',
+      { salvageContent: 'head-a' },
+    );
+    expect(closedSalvage.status).toBe(90);
+    expect(closedSalvage.stderr).toContain(
+      'Blocked PR write: PR #123 is CLOSED',
+    );
+    expect(closedSalvage.ghLog).toBe('');
+  });
+
+  it.skipIf(!hasMkfifo)(
+    'bounds the salvage marker read on the posting path (#10110)',
+    () => {
+      const runStep = step(reviewJob, 'Run review');
+      // R8-10: the escape's marker read is one timeout-bounded, size-capped
+      // open. A FIFO rename-swapped in at open time — or planted statically —
+      // must fail CLOSED to the block inside the bound: an unbounded open
+      // wedges the posting path forever, the attempt budget bleeds out, and
+      // the salvage-armed cede then discards a finished review with no
+      // failure signal at all.
+      const wedged = runReviewGhWrapper(
+        runStep,
+        ['api', 'repos/owner/repo/pulls/123/reviews', '--input', 'review.json'],
+        'OPEN',
+        'head-b',
+        'head-a',
+        { salvageContent: 'head-a', swapSalvageOnRead: true },
+      );
+      expect(wedged.status).toBe(90);
+      expect(wedged.stderr).toContain(
+        'Blocked PR write: PR #123 moved from head-a to head-b',
+      );
+      expect(wedged.ghLog).toBe('');
+
+      const fifo = runReviewGhWrapper(
+        runStep,
+        ['api', 'repos/owner/repo/pulls/123/reviews', '--input', 'review.json'],
+        'OPEN',
+        'head-b',
+        'head-a',
+        { salvageFifo: true },
+      );
+      expect(fifo.status).toBe(90);
+      expect(fifo.stderr).toContain(
+        'Blocked PR write: PR #123 moved from head-a to head-b',
+      );
+      expect(fifo.ghLog).toBe('');
+    },
+  );
 
   it('allows wrapped gh review writes when the PR is still current', () => {
     const runStep = step(reviewJob, 'Run review');
@@ -1475,5 +1706,858 @@ describe('qwen resolve workflow', () => {
     expect(publishJob).toContain("push_fail_reason='permission'");
     expect(publishJob).toContain("push_fail_reason='moved'");
     expect(publishJob).toContain('Allow edits by maintainers');
+  });
+});
+
+// A /resolve request is lost after the agent succeeded whenever the push is
+// declined, and before the agent even runs whenever a preflight refuses it.
+// The suite below pins the recovery paths added for the largest of those
+// losses (2026-06-25..08-27, 839 requests): the head moving during the run
+// (17 resolutions lost), fork PRs the bot cannot push to (10 agent runs
+// wasted), transient permission-API errors (silent denials), and the draft
+// gate (182 skip comments on explicit requests).
+describe('qwen resolve workflow: recovering requests that used to be lost', () => {
+  const workflow = readFileSync(
+    path.join(repoRoot, '.github/workflows/qwen-code-pr-review.yml'),
+    'utf8',
+  );
+  const resolveJob = job(workflow, 'resolve-pr');
+  const publishJob = job(workflow, 'publish-resolution');
+  const authorizeJob = job(workflow, 'authorize');
+  const prepareStep = step(resolveJob, 'Prepare pull request branch');
+  const reportStep = step(publishJob, 'Report result');
+  const authorizeStep = step(authorizeJob, 'Check principal write permission');
+
+  // The replay functions, dedented out of the `run: |-` block so a real git
+  // fixture can exercise them exactly as the runner will.
+  function replayFunctions() {
+    return extractBlock(
+      reportStep,
+      'replay_give_up() {',
+      '\n          if [ "$OUTCOME" = "fixed" ]',
+      { includeEnd: false },
+    );
+  }
+
+  const gitEnv = {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'fixture',
+    GIT_AUTHOR_EMAIL: 'fixture@example.com',
+    GIT_COMMITTER_NAME: 'fixture',
+    GIT_COMMITTER_EMAIL: 'fixture@example.com',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+  };
+  function git(cwd, ...args) {
+    const result = spawnSync('git', args, {
+      cwd,
+      env: gitEnv,
+      encoding: 'utf8',
+    });
+    if (result.status !== 0) {
+      throw new Error(
+        `git ${args.join(' ')} failed in ${cwd}:\n${result.stdout}\n${result.stderr}`,
+      );
+    }
+    return result.stdout.trim();
+  }
+
+  // Builds: a bare origin with `main` and refs/pull/1/head; a runner checkout
+  // on branch qwen-resolve/pr-1 holding the agent's resolution of a.txt (the
+  // conflicted file) merged on top of the ORIGINAL head; and a contributor
+  // clone that can move the head. Returns the paths and the original head SHA.
+  function makeFixture(resolveWith = 'edit', options = {}) {
+    const { conflicted = 'a.txt', sibling = null } = options;
+    const root = mkdtempSync(path.join(tmpdir(), 'qwen-resolve-replay-'));
+    const origin = path.join(root, 'origin.git');
+    const contributor = path.join(root, 'contributor');
+    const runner = path.join(root, 'runner');
+    git(root, 'init', '-q', '--bare', origin);
+    git(root, 'init', '-q', '-b', 'main', contributor);
+    writeFileSync(path.join(contributor, conflicted), 'shared line\n');
+    writeFileSync(path.join(contributor, 'b.txt'), 'b original\n');
+    if (sibling) {
+      writeFileSync(path.join(contributor, sibling), 'sibling original\n');
+    }
+    git(contributor, 'add', '.');
+    git(contributor, 'commit', '-q', '-m', 'chore: seed');
+    git(contributor, 'checkout', '-q', '-b', 'feature');
+    writeFileSync(path.join(contributor, conflicted), 'feature side\n');
+    git(contributor, 'commit', '-q', '-am', 'feat: feature side');
+    const originalHead = git(contributor, 'rev-parse', 'HEAD');
+    git(contributor, 'checkout', '-q', 'main');
+    writeFileSync(path.join(contributor, conflicted), 'main side\n');
+    writeFileSync(path.join(contributor, 'c.txt'), 'c from main\n');
+    git(contributor, 'add', '.');
+    git(contributor, 'commit', '-q', '-m', 'feat: main side');
+    git(contributor, 'remote', 'add', 'origin', origin);
+    git(
+      contributor,
+      'push',
+      '-q',
+      'origin',
+      'main',
+      'feature:refs/pull/1/head',
+    );
+
+    git(root, 'clone', '-q', origin, runner);
+    git(
+      runner,
+      'fetch',
+      '-q',
+      'origin',
+      '+refs/pull/1/head:refs/remotes/origin/qwen-resolve/pr-1/head',
+      '+refs/heads/main:refs/remotes/origin/main',
+    );
+    git(
+      runner,
+      'checkout',
+      '-q',
+      '-B',
+      'qwen-resolve/pr-1',
+      'refs/remotes/origin/qwen-resolve/pr-1/head',
+    );
+    // The agent's merge: a.txt conflicts, resolved to a line neither side had.
+    spawnSync('git', ['merge', '--no-commit', 'origin/main'], {
+      cwd: runner,
+      env: gitEnv,
+    });
+    if (resolveWith === 'delete') {
+      // Deleting the conflicted file IS the agent's resolution of it.
+      // Literal pathspecs: a glob-named file must not take its wildcard
+      // siblings with it.
+      spawnSync('git', ['rm', '-q', '--', conflicted], {
+        cwd: runner,
+        env: { ...gitEnv, GIT_LITERAL_PATHSPECS: '1' },
+      });
+    } else {
+      writeFileSync(path.join(runner, conflicted), 'resolved by agent\n');
+      spawnSync('git', ['add', '--', conflicted], {
+        cwd: runner,
+        env: { ...gitEnv, GIT_LITERAL_PATHSPECS: '1' },
+      });
+    }
+    git(runner, 'commit', '-q', '-m', 'fix: resolve merge conflicts with main');
+    const resolvedCommit = git(runner, 'rev-parse', 'HEAD');
+    return { root, origin, contributor, runner, originalHead, resolvedCommit };
+  }
+
+  function moveHead(fixture, file, content) {
+    git(fixture.contributor, 'checkout', '-q', 'feature');
+    writeFileSync(path.join(fixture.contributor, file), content);
+    git(fixture.contributor, 'add', file);
+    git(
+      fixture.contributor,
+      'commit',
+      '-q',
+      '-m',
+      `chore: move head (${file})`,
+    );
+    git(
+      fixture.contributor,
+      'push',
+      '-q',
+      'origin',
+      'feature:refs/pull/1/head',
+    );
+    return git(fixture.contributor, 'rev-parse', 'HEAD');
+  }
+
+  function runReplay(fixture) {
+    // The production step has already scrubbed the workspace before the
+    // replay runs (#10428): no .git/config — so no `origin` remote and no
+    // user.name/email — and no global config. Reproduce that state so the
+    // replay must carry its own identity and fetch by URL.
+    const replayEnv = { ...gitEnv };
+    for (const key of [
+      'GIT_AUTHOR_NAME',
+      'GIT_AUTHOR_EMAIL',
+      'GIT_COMMITTER_NAME',
+      'GIT_COMMITTER_EMAIL',
+    ]) {
+      delete replayEnv[key];
+    }
+    const script = [
+      'set -euo pipefail',
+      'rm -f .git/config',
+      replayFunctions(),
+      'replayed_on=""',
+      'if replay_on_moved_head; then rc=0; else rc=$?; fi',
+      'echo "rc=$rc"',
+      'echo "HEAD_SHA=$HEAD_SHA"',
+      'echo "replayed_on=$replayed_on"',
+      'echo "head=$(git rev-parse HEAD)"',
+      'echo "branch=$(git rev-parse --abbrev-ref HEAD)"',
+      'echo "status=$(git status --porcelain | tr "\\n" ";")"',
+    ].join('\n');
+    const result = spawnSync('bash', ['-c', script], {
+      cwd: fixture.runner,
+      env: {
+        ...replayEnv,
+        PR_NUMBER: '1',
+        HEAD_SHA: fixture.originalHead,
+        BASE_REF: 'main',
+        REPO: 'QwenLM/qwen-code',
+        // The replay fetches by URL (the scrub removes the `origin` remote
+        // with .git/config); point it at the fixture's bare repository.
+        RESOLVE_ORIGIN_URL: fixture.origin,
+      },
+      encoding: 'utf8',
+    });
+    const out = Object.fromEntries(
+      result.stdout
+        .split('\n')
+        .filter((line) =>
+          /^(rc|HEAD_SHA|replayed_on|head|branch|status)=/.test(line),
+        )
+        .map((line) => line.split(/=(.*)/s).slice(0, 2)),
+    );
+    return { ...out, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  it('replays the resolution when the head moved in files the conflict did not touch', () => {
+    const fixture = makeFixture();
+    try {
+      const newHead = moveHead(
+        fixture,
+        'b.txt',
+        'b changed after the agent started\n',
+      );
+      const out = runReplay(fixture);
+      expect(out.rc, out.stdout + out.stderr).toBe('0');
+      // The lease for the second push is taken on the NEW head.
+      expect(out.HEAD_SHA).toBe(newHead);
+      expect(out.replayed_on).toBe(newHead);
+      expect(out.status).toBe('');
+      // The replayed commit sits on the new head, merges the base, keeps the
+      // agent's resolution and the contributor's new change, and reuses the
+      // agent's commit message (CI rejects git's default merge message).
+      const parents = git(
+        fixture.runner,
+        'log',
+        '-1',
+        '--format=%P',
+        out.head,
+      ).split(' ');
+      expect(parents).toContain(newHead);
+      expect(parents).toContain(
+        git(fixture.runner, 'rev-parse', 'origin/main'),
+      );
+      expect(readFileSync(path.join(fixture.runner, 'a.txt'), 'utf8')).toBe(
+        'resolved by agent\n',
+      );
+      expect(readFileSync(path.join(fixture.runner, 'b.txt'), 'utf8')).toBe(
+        'b changed after the agent started\n',
+      );
+      expect(readFileSync(path.join(fixture.runner, 'c.txt'), 'utf8')).toBe(
+        'c from main\n',
+      );
+      expect(git(fixture.runner, 'log', '-1', '--format=%s', out.head)).toBe(
+        'fix: resolve merge conflicts with main',
+      );
+      // The scrub removed user.name/email with .git/config; the replay must
+      // bring the bot identity itself (the author is reused from the agent's
+      // commit by -C).
+      expect(
+        git(fixture.runner, 'log', '-1', '--format=%cn <%ce>', out.head),
+      ).toBe('qwen-code-dev-bot <qwen-code-dev-bot@users.noreply.github.com>');
+      // Only base-changed files differ from the new head: the scope guard holds.
+      expect(
+        git(fixture.runner, 'diff', '--name-only', newHead, out.head)
+          .split('\n')
+          .sort(),
+      ).toEqual(['a.txt', 'c.txt']);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('gives up, and restores the original resolution, when the new head touched a conflicted file', () => {
+    const fixture = makeFixture();
+    try {
+      moveHead(fixture, 'a.txt', 'feature side, edited again\n');
+      const out = runReplay(fixture);
+      expect(out.rc, out.stdout + out.stderr).toBe('1');
+      expect(out.stdout).toContain(
+        'Replay gave up: a.txt still conflicts and the new head changed it',
+      );
+      // Nothing was taken from the agent's merge for a file the contributor
+      // rewrote, the lease SHA is untouched, and the checkout is back on the
+      // original resolution with a clean tree — the artifact and the "moved"
+      // comment describe exactly what exists.
+      expect(out.HEAD_SHA).toBe(fixture.originalHead);
+      expect(out.replayed_on).toBe('');
+      expect(out.branch).toBe('qwen-resolve/pr-1');
+      expect(out.head).toBe(fixture.resolvedCommit);
+      expect(out.status).toBe('');
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('gives up when the head did not move at all (the push failed for another reason)', () => {
+    const fixture = makeFixture();
+    try {
+      const out = runReplay(fixture);
+      expect(out.rc, out.stdout + out.stderr).toBe('1');
+      expect(out.stdout).toContain('the push was declined for another reason');
+      expect(out.head).toBe(fixture.resolvedCommit);
+      expect(out.branch).toBe('qwen-resolve/pr-1');
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('wires the replay into the push path with a lease on the new head, and never re-runs the agent', () => {
+    expect(reportStep).toContain(
+      '[ "$push_fail_reason" = "moved" ] && replay_on_moved_head && push_resolution',
+    );
+    // The lease still names ${HEAD_SHA}; the replay moves that variable to the
+    // new head instead of pushing with a bare --force.
+    expect(reportStep).toContain(
+      '--force-with-lease="refs/heads/${HEAD_REF}:${HEAD_SHA}"',
+    );
+    expect(reportStep).toContain('HEAD_SHA="$new_sha"');
+    expect(reportStep).not.toContain('--force ');
+    // The replay re-applies the structural checks of 'Resolution check'.
+    const replay = replayFunctions();
+    expect(replay).toContain("grep -InE -e '^(<<<<<<<|>>>>>>>) '");
+    expect(replay).toContain(
+      'git merge-tree --write-tree "origin/${BASE_REF}" HEAD',
+    );
+    expect(replay).toContain('comm -23 <(printf');
+    expect(replay).not.toContain('qwen-code-action');
+    // The credentialed steps remove the workspace .git/config — and with it
+    // the `origin` remote — before they run, so the replay must fetch by URL.
+    expect(replay).toContain(
+      'git fetch "${RESOLVE_ORIGIN_URL:-https://github.com/${REPO}.git}"',
+    );
+    expect(replay).not.toContain('git fetch origin');
+    // And the comment says a replay happened, and where the pushed tree is:
+    // the first artifact holds the ORIGINAL resolution (uploaded before the
+    // replay ran), so a replay records what it pushed for a second upload.
+    expect(reportStep).toContain('the resolution was replayed on top of it');
+    expect(reportStep).toContain(
+      'git diff "origin/${BASE_REF}...HEAD" > "${WORKDIR}/pushed/pushed.diff"',
+    );
+    expect(reportStep).toContain('qwen-resolve-pr-${PR_NUMBER}-pushed');
+    const pushedUpload = step(publishJob, 'Upload pushed tree');
+    expect(pushedUpload).toContain(
+      "name: 'qwen-resolve-pr-${{ needs.resolve-pr.outputs.pr_number }}-pushed'",
+    );
+    expect(pushedUpload).toContain("path: '${{ env.WORKDIR }}/pushed/'");
+    // always() (not the resolve-pr prepare gate, which has no meaning here);
+    // quote style is the workflow author's choice, so match either.
+    expect(pushedUpload).toMatch(/if:\s*['"]\$\{\{ always\(\) \}\}['"]/);
+    expect(pushedUpload).not.toContain('steps.prepare.outputs.decision');
+    expect(publishJob.indexOf("- name: 'Upload pushed tree'")).toBeGreaterThan(
+      publishJob.indexOf("- name: 'Report result'"),
+    );
+  });
+
+  it('defines every uppercase variable the resolve-pr and publish run blocks expand', () => {
+    // The steps run under `set -u`; a ${NAME} the env block does not define
+    // aborts the step at first use. The replay was shipped once with BASE_REF
+    // missing from 'Report result' — the fixture test injected it, so nothing
+    // noticed. Cover every run block of the job, not just that one.
+    const builtins = new Set([
+      'GITHUB_OUTPUT',
+      'GITHUB_REPOSITORY',
+      'GITHUB_STEP_SUMMARY',
+      'GITHUB_ENV',
+      'GITHUB_PATH',
+      'RUNNER_TEMP',
+      'HOME',
+      'PATH',
+      'RANDOM',
+      'PIPESTATUS',
+      'BASH_REMATCH',
+    ]);
+    for (const jobText of [resolveJob, publishJob]) {
+      const jobEnv = new Set(
+        [...jobText.matchAll(/^ {6}([A-Z][A-Z0-9_]*): /gm)].map((m) => m[1]),
+      );
+      const stepBlocks = jobText.split(/\n {6}- name: /).slice(1);
+      for (const block of stepBlocks) {
+        if (!/\n {8}run: \|-?\n/.test(block)) {
+          continue;
+        }
+        const name = block.slice(0, block.indexOf('\n'));
+        const stepEnv = new Set(
+          [...block.matchAll(/^ {10}([A-Z][A-Z0-9_]*): /gm)].map((m) => m[1]),
+        );
+        const run = block.slice(block.search(/\n {8}run: \|-?\n/));
+        const assigned = new Set(
+          [...run.matchAll(/(?:^|[\s;{(])([A-Z][A-Z0-9_]*)=/gm)].map(
+            (m) => m[1],
+          ),
+        );
+        const referenced = new Set(
+          [...run.matchAll(/\$\{?([A-Z][A-Z0-9_]+)\b/g)]
+            .map((m) => m[1])
+            .filter((v) => !v.startsWith('GITHUB_')),
+        );
+        const missing = [...referenced].filter(
+          (v) =>
+            !jobEnv.has(v) &&
+            !stepEnv.has(v) &&
+            !assigned.has(v) &&
+            !builtins.has(v),
+        );
+        expect(
+          missing,
+          `step ${name} expands undefined: ${missing.join(', ')}`,
+        ).toEqual([]);
+      }
+    }
+    // And the one that shipped missing is now there (the replay lives in the
+    // publish job, whose refs come from the agent job's outputs).
+    expect(step(publishJob, 'Report result')).toContain(
+      "BASE_REF: '${{ needs.resolve-pr.outputs.base_ref }}'",
+    );
+  });
+
+  it('refuses fork PRs the bot cannot push to before spending an agent run', () => {
+    expect(prepareStep).toContain('maintainerCanModify');
+    expect(prepareStep).toContain(
+      '[ "$head_repo" != "$REPO" ] && [ "$maintainer_can_modify" != "true" ]',
+    );
+    expect(prepareStep).toContain('**Allow edits by maintainers** off');
+    // Same-repo PRs report maintainerCanModify=false too; the fork check must
+    // be conjoined with the head-repo comparison or every in-repo PR is refused.
+    expect(prepareStep).not.toMatch(
+      /\n\s+if \[ "\$maintainer_can_modify" != "true" \]; then/,
+    );
+  });
+
+  it('no longer refuses draft PRs', () => {
+    // /resolve is an explicit request by a writer; a draft with conflicts is
+    // where resolving is cheapest. The automatic review lane keeps its gate.
+    expect(prepareStep).not.toContain('is draft.');
+    expect(prepareStep).not.toContain('isDraft');
+    expect(job(workflow, 'delay-automatic-review')).toContain('is draft.');
+  });
+
+  it('retries a transient permission-API error before denying, and still fails closed', () => {
+    expect(authorizeJob).toContain(
+      'failed transiently (attempt ${attempt} of 3)',
+    );
+    expect(authorizeJob).toContain('No server is currently available');
+    // The strings above stay put if the loop itself regresses: the bound,
+    // the backoff, and the retry branch are pinned by the behavioural tests
+    // below, and their YAML anchors here.
+    expect(authorizeJob).toContain('[ "$attempt" -lt 3 ]');
+    expect(authorizeJob).toContain('sleep $((attempt * 5))');
+    // After the retries the original fail-closed denial is unchanged.
+    expect(authorizeJob).toContain(
+      '::error::Permission API call failed for ${principal}: ${api_error}',
+    );
+    expect(authorizeJob).toContain(
+      'echo "should_review=false" >> "$GITHUB_OUTPUT"',
+    );
+  });
+
+  // --- classify_push_failure: order pin + behaviour against real push logs ---
+
+  it('tests the lease-decline signature before the permission patterns', () => {
+    // git echoes the destination branch into the push log; the permission
+    // patterns are substrings of plausible branch names, the moved patterns
+    // are server phrases a branch name cannot contain. Order is the guard.
+    const scope = reportStep.indexOf("push_fail_reason='workflow_scope'");
+    const moved = reportStep.indexOf("push_fail_reason='moved'");
+    const permission = reportStep.indexOf("push_fail_reason='permission'");
+    expect(scope).toBeGreaterThan(-1);
+    expect(scope).toBeLessThan(moved);
+    expect(moved).toBeLessThan(permission);
+  });
+
+  function classifyFunction() {
+    return extractBlock(
+      reportStep,
+      'classify_push_failure() {',
+      '\n          }',
+    );
+  }
+
+  function classifyScript(lines, scriptLines, extraEnv = {}) {
+    const dir = mkdtempSync(path.join(tmpdir(), 'qwen-classify-'));
+    try {
+      const pushLog = path.join(dir, 'push.log');
+      writeFileSync(pushLog, `${lines.join('\n')}\n`);
+      return spawnSync(
+        'bash',
+        [
+          '-c',
+          ['set -euo pipefail', classifyFunction(), ...scriptLines].join('\n'),
+        ],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, push_log: pushLog, ...extraEnv },
+        },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  function classifyLog(lines) {
+    const result = classifyScript(lines, [
+      'classify_push_failure',
+      'printf "reason=%s\\n" "$push_fail_reason"',
+    ]);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    return result.stdout.match(/^reason=(.*)$/m)?.[1];
+  }
+
+  const staleInfoLog = (branch) => [
+    'To github.com:contributor/repo.git',
+    ` ! [remote rejected] HEAD -> ${branch} (stale info)`,
+    "error: failed to push some refs to 'github.com/contributor/repo.git'",
+  ];
+
+  it('classifies a moved head by its lease decline even when the branch name echoes a permission substring', () => {
+    expect(classifyLog(staleInfoLog('feature'))).toBe('moved');
+    expect(classifyLog(staleInfoLog('fix/permission-prompt'))).toBe('moved');
+    expect(classifyLog(staleInfoLog('fix-403-error'))).toBe('moved');
+    // A branch that merely CONTAINS a moved-reason phrase — even parenthesised,
+    // which refnames legally allow — is not a lease decline: git prints the
+    // real reason last on the line, and the moved arm anchors to end-of-line.
+    // These also pin the parenthesised patterns against a bare-word
+    // regression, which every one of these branch names would trip.
+    expect(
+      classifyLog([
+        ' ! [remote rejected] HEAD -> x(non-fast-forward)y (protected branch hook declined)',
+      ]),
+    ).toBe('permission');
+    expect(
+      classifyLog([
+        ' ! [remote rejected] HEAD -> fix/non-fast-forward (cannot be updated)',
+      ]),
+    ).toBe('permission');
+    expect(
+      classifyLog([
+        ' ! [remote rejected] HEAD -> fix/non-fast-forward-retry (pre-receive hook declined)',
+        "fatal: unable to access 'https://github.com/contributor/repo.git/': The requested URL returned error: 403",
+      ]),
+    ).toBe('permission');
+    // Genuine access problems still classify as permission, the workflow-scope
+    // arm keeps its priority over both, and unknown failures stay 'other'.
+    expect(
+      classifyLog([
+        "fatal: unable to access 'https://github.com/contributor/repo.git/': The requested URL returned error: 403",
+      ]),
+    ).toBe('permission');
+    expect(
+      classifyLog([
+        'remote: refusing to allow an OAuth App to create or update workflow `.github/workflows/ci.yml` without `workflow` scope',
+      ]),
+    ).toBe('workflow_scope');
+    expect(classifyLog(['error: something else entirely'])).toBe('other');
+  });
+
+  it('re-classifies from the current push log when the replay push fails for a new reason', () => {
+    // After a failed replay push, classify_push_failure runs a second time;
+    // the reported reason must come from the second push's log, not the stale
+    // 'moved' from the first.
+    const result = classifyScript(
+      staleInfoLog('feature'),
+      [
+        'classify_push_failure',
+        'printf "first=%s\\n" "$push_fail_reason"',
+        'printf "%s\\n" "$SECOND_LOG" > "$push_log"',
+        'classify_push_failure',
+        'printf "second=%s\\n" "$push_fail_reason"',
+      ],
+      {
+        SECOND_LOG:
+          "fatal: unable to access 'https://github.com/contributor/repo.git/': The requested URL returned error: 403",
+      },
+    );
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(result.stdout).toContain('first=moved');
+    expect(result.stdout).toContain('second=permission');
+  });
+
+  it('says in the replay comment what the run artifact does and does not describe', () => {
+    // The artifact's pr.diff is computed before the replay runs; the pushed
+    // tree is the replay. The comment must say so, and must not claim files
+    // were taken from the agent's merge when the replay merged clean.
+    const armStart = reportStep.indexOf('elif [ -n "$replayed_on" ]; then');
+    expect(armStart).toBeGreaterThan(-1);
+    const arm = reportStep.slice(
+      armStart,
+      reportStep.indexOf('\n                else', armStart),
+    );
+    expect(arm).toContain('the resolution was replayed on top of it');
+    expect(arm).toContain(
+      'where a file still conflicted and the new commits had not touched it',
+    );
+    expect(arm).toContain(
+      'describes the original resolution it was replayed from',
+    );
+  });
+
+  // --- replay fixtures: the empty-merge give-up and deletion resolutions ---
+
+  // The contributor merges the base into their PR branch while the agent
+  // runs; the replay's re-merge of the base then changes nothing, so the
+  // lane must give up cleanly instead of committing an unchanged tree.
+  function mergeMainIntoHead(fixture) {
+    git(fixture.contributor, 'checkout', '-q', 'feature');
+    const merge = spawnSync('git', ['merge', '--no-edit', 'main'], {
+      cwd: fixture.contributor,
+      env: gitEnv,
+      encoding: 'utf8',
+    });
+    // a.txt still conflicts between feature and main; the contributor keeps
+    // their side and completes the merge themselves.
+    expect(merge.status).not.toBe(0);
+    writeFileSync(
+      path.join(fixture.contributor, 'a.txt'),
+      'feature side, merged by the contributor\n',
+    );
+    git(fixture.contributor, 'add', 'a.txt');
+    git(fixture.contributor, 'commit', '-q', '--no-edit');
+    git(
+      fixture.contributor,
+      'push',
+      '-q',
+      'origin',
+      'feature:refs/pull/1/head',
+    );
+    return git(fixture.contributor, 'rev-parse', 'HEAD');
+  }
+
+  it('gives up cleanly when the new head already merged the base itself', () => {
+    const fixture = makeFixture();
+    try {
+      const newHead = mergeMainIntoHead(fixture);
+      expect(newHead).not.toBe(fixture.originalHead);
+      const out = runReplay(fixture);
+      expect(out.rc, out.stdout + out.stderr).toBe('1');
+      expect(out.stdout).toContain('changes nothing');
+      expect(out.HEAD_SHA).toBe(fixture.originalHead);
+      expect(out.replayed_on).toBe('');
+      expect(out.branch).toBe('qwen-resolve/pr-1');
+      expect(out.head).toBe(fixture.resolvedCommit);
+      expect(out.status).toBe('');
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('replays a resolution that deleted the conflicted file', () => {
+    const fixture = makeFixture('delete');
+    try {
+      const newHead = moveHead(
+        fixture,
+        'b.txt',
+        'b changed after the agent started\n',
+      );
+      const out = runReplay(fixture);
+      expect(out.rc, out.stdout + out.stderr).toBe('0');
+      expect(out.HEAD_SHA).toBe(newHead);
+      expect(out.replayed_on).toBe(newHead);
+      // The agent's version of a.txt IS its deletion: the pushed tree must
+      // not have the file back, and the scope guard still holds.
+      expect(existsSync(path.join(fixture.runner, 'a.txt'))).toBe(false);
+      expect(
+        git(fixture.runner, 'ls-tree', '--name-only', out.head),
+      ).not.toContain('a.txt');
+      expect(
+        git(fixture.runner, 'diff', '--name-only', newHead, out.head)
+          .split('\n')
+          .sort(),
+      ).toEqual(['a.txt', 'c.txt']);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  // Conflicted filenames legally carry glob characters; the replay's per-file
+  // diff/checkout/rm pathspecs must stay literal (GIT_LITERAL_PATHSPECS) or a
+  // file named `a[1].txt` widens every one of them to its sibling `a1.txt`.
+  it('replays when the head moved only in a glob sibling of the conflicted file', () => {
+    const fixture = makeFixture('edit', {
+      conflicted: 'a[1].txt',
+      sibling: 'a1.txt',
+    });
+    try {
+      const newHead = moveHead(
+        fixture,
+        'a1.txt',
+        'sibling edited by the new head\n',
+      );
+      const out = runReplay(fixture);
+      expect(out.rc, out.stdout + out.stderr).toBe('0');
+      expect(out.HEAD_SHA).toBe(newHead);
+      expect(out.replayed_on).toBe(newHead);
+      // Both files intact: the agent's resolution of the conflicted file and
+      // the new head's edit of its wildcard sibling.
+      expect(readFileSync(path.join(fixture.runner, 'a[1].txt'), 'utf8')).toBe(
+        'resolved by agent\n',
+      );
+      expect(readFileSync(path.join(fixture.runner, 'a1.txt'), 'utf8')).toBe(
+        'sibling edited by the new head\n',
+      );
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a glob sibling alive when a deletion resolution is replayed', () => {
+    const fixture = makeFixture('delete', {
+      conflicted: 'a[1].txt',
+      sibling: 'a1.txt',
+    });
+    try {
+      const newHead = moveHead(
+        fixture,
+        'a1.txt',
+        'sibling edited by the new head\n',
+      );
+      const out = runReplay(fixture);
+      expect(out.rc, out.stdout + out.stderr).toBe('0');
+      expect(out.HEAD_SHA).toBe(newHead);
+      expect(out.replayed_on).toBe(newHead);
+      // The agent deleted a[1].txt; `git rm` must not have staged its
+      // wildcard sibling along with it.
+      expect(existsSync(path.join(fixture.runner, 'a[1].txt'))).toBe(false);
+      expect(readFileSync(path.join(fixture.runner, 'a1.txt'), 'utf8')).toBe(
+        'sibling edited by the new head\n',
+      );
+      expect(
+        git(fixture.runner, 'ls-tree', '--name-only', out.head).split('\n'),
+      ).toContain('a1.txt');
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  // --- authorize retry loop: behaviour against a scripted gh ---
+
+  function authorizeRetryBlock() {
+    return extractBlock(
+      authorizeStep,
+      'api_error_file="$(mktemp)"',
+      '\n          esac',
+    );
+  }
+
+  function runAuthorizeRetry(plan) {
+    const tempDir = mkdtempSync(path.join(tmpdir(), 'qwen-authorize-retry-'));
+    try {
+      const binDir = path.join(tempDir, 'bin');
+      mkdirSync(binDir);
+      const planFile = path.join(tempDir, 'plan.txt');
+      const callLog = path.join(tempDir, 'calls.log');
+      const sleepLog = path.join(tempDir, 'sleeps.log');
+      const outputFile = path.join(tempDir, 'output');
+      const summaryFile = path.join(tempDir, 'summary');
+      writeFileSync(planFile, `${plan.join('\n')}\n`);
+      writeFileSync(callLog, '');
+      writeFileSync(sleepLog, '');
+      writeFileSync(outputFile, '');
+      writeFileSync(summaryFile, '');
+      writeFileSync(
+        path.join(binDir, 'gh'),
+        [
+          '#!/usr/bin/env bash',
+          'set -euo pipefail',
+          'printf "%s\\n" "$*" >> "$AUTHORIZE_CALL_LOG"',
+          'n="$(cat "$AUTHORIZE_CALL_COUNT" 2>/dev/null || echo 0)"',
+          'n=$((n + 1))',
+          'printf "%s\\n" "$n" > "$AUTHORIZE_CALL_COUNT"',
+          'line="$(sed -n "${n}p" "$AUTHORIZE_PLAN_FILE")"',
+          'case "$line" in',
+          '  ok:*) printf "%s\\n" "${line#ok:}" ;;',
+          '  fail:*) printf "%s\\n" "${line#fail:}" >&2; exit 1 ;;',
+          'esac',
+        ].join('\n'),
+      );
+      chmodSync(path.join(binDir, 'gh'), 0o755);
+      const result = spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set -euo pipefail',
+            'sleep() { printf "%s\\n" "$1" >> "$AUTHORIZE_SLEEP_LOG"; }',
+            'principal=commenter',
+            'GITHUB_REPOSITORY=owner/repo',
+            authorizeRetryBlock(),
+          ].join('\n'),
+        ],
+        {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+            AUTHORIZE_PLAN_FILE: planFile,
+            AUTHORIZE_CALL_COUNT: path.join(tempDir, 'count'),
+            AUTHORIZE_CALL_LOG: callLog,
+            AUTHORIZE_SLEEP_LOG: sleepLog,
+            GITHUB_OUTPUT: outputFile,
+            GITHUB_STEP_SUMMARY: summaryFile,
+          },
+        },
+      );
+      return {
+        ...result,
+        output: readFileSync(outputFile, 'utf8'),
+        summary: readFileSync(summaryFile, 'utf8'),
+        calls: readFileSync(callLog, 'utf8').split('\n').filter(Boolean),
+        sleeps: readFileSync(sleepLog, 'utf8').split('\n').filter(Boolean),
+      };
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  const TRANSIENT_503 = 'fail:HTTP 503: No server is currently available';
+
+  it('retries a transient permission-API error twice, then allows the writer', () => {
+    const out = runAuthorizeRetry([TRANSIENT_503, TRANSIENT_503, 'ok:write']);
+    expect(out.status, out.stdout + out.stderr).toBe(0);
+    expect(out.output).toContain('should_review=true');
+    expect(out.calls).toHaveLength(3);
+    for (const call of out.calls) {
+      expect(call).toBe(
+        'api repos/owner/repo/collaborators/commenter/permission --jq .permission',
+      );
+    }
+    expect(out.sleeps).toEqual(['5', '10']);
+    expect(out.stdout).toContain('failed transiently (attempt 1 of 3)');
+    expect(out.stdout).toContain('failed transiently (attempt 2 of 3)');
+  });
+
+  it('denies after three transient failures — fail closed', () => {
+    const out = runAuthorizeRetry([
+      TRANSIENT_503,
+      TRANSIENT_503,
+      TRANSIENT_503,
+    ]);
+    expect(out.status, out.stdout + out.stderr).toBe(0);
+    expect(out.output).toContain('should_review=false');
+    expect(out.output).not.toContain('should_review=true');
+    expect(out.calls).toHaveLength(3);
+    expect(out.stdout).toContain(
+      '::error::Permission API call failed for commenter',
+    );
+    expect(out.summary).toContain(
+      'Failed to check permission for commenter (API error:',
+    );
+  });
+
+  it('denies a non-transient permission-API error on the first attempt', () => {
+    const out = runAuthorizeRetry(['fail:HTTP 404: Not Found']);
+    expect(out.status, out.stdout + out.stderr).toBe(0);
+    expect(out.output).toContain('should_review=false');
+    expect(out.output).not.toContain('should_review=true');
+    expect(out.calls).toHaveLength(1);
+    expect(out.sleeps).toEqual([]);
+    expect(out.summary).toContain(
+      'Failed to check permission for commenter (API error:',
+    );
   });
 });

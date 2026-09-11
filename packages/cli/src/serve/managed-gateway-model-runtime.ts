@@ -736,6 +736,7 @@ export class ResidentManagedGatewayModelRunner
         screenReader: undefined,
         inputFormat: 'text',
         outputFormat: 'text',
+        outputStyle: undefined,
         includePartialMessages: false,
         chatRecording: false,
         continue: undefined,

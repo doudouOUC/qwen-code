@@ -108,6 +108,21 @@ export type BridgeSessionLifecycle = (
 ) => void;
 
 /**
+ * Allocates monotonically increasing Channel epochs for one canonical
+ * workspace. Daemon hosts reuse the same source across runtime replacement;
+ * standalone Bridge users may omit it and receive a Bridge-local source.
+ */
+export interface BridgeRuntimeEpochSource {
+  current(): number;
+  allocate(): number;
+}
+
+export type BridgeMcpAuthenticationAdmission = (
+  workspaceCwd: string,
+  serverName: string,
+) => (() => void) | undefined;
+
+/**
  * Trusted child-to-daemon request made immediately before a tool executor.
  * `sessionId` and `promptId` are revalidated by BridgeClient against its
  * runtime-owned active entry before this reaches the host handler.
@@ -239,6 +254,14 @@ export interface BridgeOptions {
    */
   sessionAttachmentsRoot?: string;
   /**
+   * Fallback root for reading session attachments stored before
+   * `sessionAttachmentsRoot` was reconfigured (e.g. the previous default
+   * directory). Writes always go to `sessionAttachmentsRoot`; reads and
+   * removes that miss there consult this root so existing attachments
+   * survive a root switch.
+   */
+  sessionAttachmentsFallbackRoot?: string;
+  /**
    * `single` shares one session per workspace across HTTP
    * clients (live-collaboration default); `thread` gives each `spawnOrAttach`
    * call its own session for strict isolation.
@@ -262,6 +285,10 @@ export interface BridgeOptions {
       context: BridgeExecutionSelection,
     ): SessionExecutionEngine | Promise<SessionExecutionEngine>;
   };
+  /** Workspace-scoped epoch source shared across Bridge replacement. */
+  runtimeEpochSource?: BridgeRuntimeEpochSource;
+  /** Daemon-global admission for the process-wide MCP OAuth callback port. */
+  acquireMcpAuthentication?: BridgeMcpAuthenticationAdmission;
   /** How long to wait for the child's `initialize` reply before giving up. */
   initializeTimeoutMs?: number;
   /**
@@ -579,11 +606,9 @@ export interface BridgeOptions {
    */
   onDiagnosticLine?: DiagnosticLineSink;
   /**
-   * Milliseconds to keep the ACP child alive after the last session
-   * closes. When a new session arrives during the idle window, the
-   * warm channel is reused without a cold start. `0` (default) kills
-   * the channel immediately (current behavior). The timer is `.unref()`'d
-   * so it does not prevent daemon exit.
+   * Keeps the ACP child alive after the last session and workspace operation
+   * drain. `0` or unset kills it immediately. Timers are `.unref()`'d so they
+   * do not prevent daemon exit.
    */
   channelIdleTimeoutMs?: number;
   /**
@@ -600,6 +625,35 @@ export interface BridgeOptions {
    * Default: 1_800_000 (30 minutes). `0` or `Infinity` disables.
    */
   sessionIdleTimeoutMs?: number;
+  /**
+   * Grace period after a prompt settles before an otherwise-idle session
+   * may be auto-closed, in milliseconds.
+   *
+   * Poll-based SSE clients (e.g. the DataAgent CLI, which reconnects every
+   * ~12 s) are disconnected between polls. When a prompt settles while no
+   * subscriber is attached, the immediate `prompt_settled` auto-close fires
+   * before the client can reconnect — destroying the session and forcing a
+   * resume that creates a new EventBus epoch. The client then reconnects
+   * with its old `Last-Event-ID`, detects the epoch mismatch, and emits a
+   * `state_resync_required` error (`reason=epoch_reset`).
+   *
+   * Setting this to a value greater than the client's maximum poll interval
+   * (e.g. `60_000` for a 12 s poll cycle) defers the close until the
+   * reconnecting subscriber can cancel the timer via `subscribeEvents`.
+   *
+   * `0` (the default) preserves the original behavior: close fires
+   * immediately when the session is idle at prompt-settle time. Library
+   * consumers embedding the bridge directly are unaffected unless they opt
+   * in by setting this value. For `qwen serve`, pass
+   * `--session-prompt-settled-close-grace-ms 60000` (or similar) to enable
+   * protection for poll-based clients.
+   *
+   * The grace hold lives in `entryIsAutoCloseCandidate`, which gates every
+   * automatic close path — including `last_client_detached` and
+   * `idle_timeout` — so during the window none of those triggers close the
+   * session either. Only explicit close, kill, and shutdown bypass the hold.
+   */
+  sessionPromptSettledCloseGraceMs?: number;
   /**
    * Reverse tool channel (issue #5626, Phase 2). Looks up the
    * `sendSdkMcpMessage`-shaped sender for a client-hosted MCP server by its
@@ -677,6 +731,8 @@ export interface CreateSubSessionInfo {
   completion: 'sent' | 'first-turn';
   /** Optional model service id for the sub-session (falls back to default). */
   model?: string;
+  /** Optional named group for a scheduled-task run session. */
+  groupId?: string;
   /** Optional display name for the sub-session in the session list. */
   name?: string;
   /** Optional immutable creator attribution for the fresh session. */

@@ -396,6 +396,51 @@ describe('ToolRegistry', () => {
       expect(names).toEqual(['alpha', 'middle', 'zeta']);
     });
 
+    it('only declares Goal proposals during an ACP turn with a responder', () => {
+      const acpConfig = new Config({
+        ...baseConfigParams,
+        experimentalZedIntegration: true,
+      });
+      acpConfig.setGoalProposalHostSupported(true);
+      const registry = new ToolRegistry(acpConfig);
+      registry.registerTool(new MockTool({ name: 'other_tool' }));
+      registry.registerTool(new MockTool({ name: 'propose_goal' }));
+      expect(
+        registry.getFunctionDeclarations().map((tool) => tool.name),
+      ).toEqual(['other_tool']);
+      expect(
+        registry
+          .getFunctionDeclarationsFiltered(['other_tool', 'propose_goal'])
+          .map((tool) => tool.name),
+      ).toEqual(['other_tool']);
+      acpConfig.setGoalProposalTurnKey('user-turn');
+      expect(
+        registry.getFunctionDeclarations().map((tool) => tool.name),
+      ).toEqual(['other_tool', 'propose_goal']);
+      expect(
+        registry
+          .getFunctionDeclarationsFiltered(['other_tool', 'propose_goal'])
+          .map((tool) => tool.name),
+      ).toEqual(['other_tool', 'propose_goal']);
+      acpConfig.setGoalProposalTurnKey(undefined);
+      expect(
+        registry.getFunctionDeclarations().map((tool) => tool.name),
+      ).toEqual(['other_tool']);
+    });
+
+    it('keeps Goal proposals declared in an interactive terminal', () => {
+      const interactiveConfig = new Config({
+        ...baseConfigParams,
+        interactive: true,
+      });
+      const registry = new ToolRegistry(interactiveConfig);
+      registry.registerTool(new MockTool({ name: 'propose_goal' }));
+
+      expect(
+        registry.getFunctionDeclarations().map((tool) => tool.name),
+      ).toEqual(['propose_goal']);
+    });
+
     it('excludes shouldDefer tools from getFunctionDeclarations by default', () => {
       toolRegistry.registerTool(new MockTool({ name: 'visible' }));
       toolRegistry.registerTool(
@@ -797,6 +842,28 @@ describe('ToolRegistry', () => {
       expect(summary).toEqual([{ name: 'beta', description: 'b' }]);
     });
 
+    it('excludes unavailable Goal proposals from the deferred summary', () => {
+      const acpConfig = new Config({
+        ...baseConfigParams,
+        experimentalZedIntegration: true,
+      });
+      acpConfig.setGoalProposalHostSupported(true);
+      const registry = new ToolRegistry(acpConfig);
+      registry.registerTool(
+        new MockTool({
+          name: 'propose_goal',
+          description: 'propose a Goal',
+          shouldDefer: true,
+        }),
+      );
+
+      expect(registry.getDeferredToolSummary()).toEqual([]);
+      acpConfig.setGoalProposalTurnKey('user-turn');
+      expect(registry.getDeferredToolSummary()).toEqual([
+        { name: 'propose_goal', description: 'propose a Goal' },
+      ]);
+    });
+
     it('visibleTools has no effect on non-deferred tools', () => {
       const visibleConfig = new Config({
         ...baseConfigParams,
@@ -928,6 +995,28 @@ describe('ToolRegistry', () => {
       expect(toolRegistry.isDeferredAndHidden('hidden_by_allowlist')).toBe(
         true,
       );
+    });
+
+    it('keeps the tool visible when listed in visibleTools', async () => {
+      const registry = new ToolRegistry(
+        new Config({
+          ...baseConfigParams,
+          visibleTools: ['hidden_by_allowlist'],
+        }),
+      );
+      registry.registerPermissionDeferredFactory(
+        'hidden_by_allowlist',
+        async () => new MockTool({ name: 'hidden_by_allowlist' }),
+      );
+      await registry.warmAll();
+
+      expect(registry.getFunctionDeclarations().map((d) => d.name)).toContain(
+        'hidden_by_allowlist',
+      );
+      expect(registry.isDeferredAndHidden('hidden_by_allowlist')).toBe(false);
+      expect(
+        registry.getDeferredToolSummary().map((t) => t.name),
+      ).not.toContain('hidden_by_allowlist');
     });
 
     it('reveals the schema once ToolSearch loads the tool', async () => {

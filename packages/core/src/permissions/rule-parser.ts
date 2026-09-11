@@ -168,6 +168,9 @@ export const TOOL_NAME_ALIASES: Readonly<Record<string, string>> = {
   update_goal: 'update_goal',
   UpdateGoal: 'update_goal',
   UpdateGoalTool: 'update_goal',
+  propose_goal: 'propose_goal',
+  ProposeGoal: 'propose_goal',
+  ProposeGoalTool: 'propose_goal',
 
   // Save Memory tool
   save_memory: 'save_memory',
@@ -246,6 +249,8 @@ export const TOOL_NAME_ALIASES: Readonly<Record<string, string>> = {
   artifact: 'artifact',
   Artifact: 'artifact',
   record_artifact: 'record_artifact',
+  record_source: 'record_source',
+  RecordSource: 'record_source',
   RecordArtifact: 'record_artifact',
 
   // Report Findings tool

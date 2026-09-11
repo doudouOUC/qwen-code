@@ -23,6 +23,7 @@ import type {
   DaemonPendingPromptsResult,
   DaemonRemovePendingPromptResult,
   DaemonSessionContextStatus,
+  DaemonSessionSavedWorkflowDetail,
   DaemonSessionContextUsageStatus,
   DaemonSessionRecapResult,
   DaemonRewindResult,
@@ -36,6 +37,10 @@ import type {
   DaemonSessionWorkflowTasksStatus,
   DaemonSessionStatsStatus,
   DaemonSessionArtifactsEnvelope,
+  SessionSourceInput,
+  SessionSourcesResult,
+  SessionSourceUpsertResult,
+  SessionSourceRemoveResult,
   DaemonSkillToggleMutation,
   DaemonShellCommandResult,
   DaemonTranscriptBlock,
@@ -51,6 +56,7 @@ import type {
   PermissionResponse,
   PromptContentBlock,
   PromptResult,
+  ReasoningSelection,
   SessionMetadataResult,
   SetModelResult,
 } from '@qwen-code/sdk/daemon';
@@ -112,7 +118,9 @@ export interface DaemonConnectionState {
   currentModel?: string;
   reasoning?: DaemonReasoningControls;
   currentMode?: string;
+  planExecutionMode?: string;
   displayName?: string;
+  titleSource?: 'manual' | 'auto';
   /** Latest main-conversation model usage event. */
   tokenUsage?: DaemonTokenUsage;
   /** Authoritative Goal v2 state for the current session. */
@@ -137,8 +145,12 @@ export interface DaemonConnectionState {
 
 export interface DaemonReasoningControls {
   enabled: boolean;
-  effort: string;
-  efforts: string[];
+  effort: ReasoningSelection;
+  efforts: Array<Exclude<ReasoningSelection, 'none' | 'default'>>;
+  /** The model default when the daemon advertises one. */
+  defaultEffort?: Exclude<ReasoningSelection, 'none' | 'default'>;
+  enableValue?: 'default';
+  canEnable?: false;
   /** Defaults to true. False means effort is mutable but thinking is required. */
   canDisable?: boolean;
 }
@@ -164,6 +176,13 @@ export interface DaemonSessionProviderProps {
   sessionId?: string;
   /** Stable client identity to reuse for session-scoped daemon requests. */
   clientId?: string;
+  /**
+   * Creator attribution forwarded on workspace session load/resume. The
+   * daemon applies it only when the restored session has no persisted source,
+   * so a host (e.g. the VS Code companion) reclaims its pre-attribution
+   * sessions on first open without ever overwriting existing attribution.
+   */
+  sessionSourceType?: string;
   /** Extra create-session options, excluding workspaceCwd which is owned by the provider. */
   createSessionRequest?: Omit<CreateSessionRequest, 'workspaceCwd'>;
   /** Maximum queued SSE events requested from the daemon per subscription. */
@@ -254,6 +273,7 @@ export type DaemonNoticeOperation =
   | 'cancel_task'
   | 'control_workflow'
   | 'run_saved_workflow'
+  | 'read_saved_workflow'
   | 'load_goal'
   | 'control_goal'
   | 'clear_goal'
@@ -279,6 +299,7 @@ export interface DaemonSessionNotice {
   message: string;
   debugMessage?: string;
   recoverable?: boolean;
+  sourceRetry?: () => Promise<void>;
   createdAt: number;
 }
 
@@ -318,10 +339,13 @@ export interface DaemonCommandInfo {
   argumentHint?: string;
   autoSubmit?: boolean;
   source?: string;
+  altNames?: string[];
   raw: DaemonAvailableCommand;
 }
 
 export interface SendPromptOptions {
+  /** Original text declared at the user submission boundary, before host preparation. */
+  submittedPrompt?: string;
   optimisticUserMessage?: boolean;
   images?: DaemonPromptImage[];
   files?: DaemonPromptFile[];
@@ -400,7 +424,30 @@ export interface SubmitPromptResult {
   removedAfterAbort?: true;
 }
 
+export interface DaemonActivePromptState {
+  active: boolean | undefined;
+  workspaceCwd: string | undefined;
+  sessionId: string | undefined;
+}
+
 export interface DaemonSessionActions {
+  /**
+   * Publish the daemon's authoritative "this session has a prompt in flight"
+   * state for the identified session, or `undefined` when it cannot be known
+   * (a daemon without `workspace_session_live_state`, or a workspace nothing
+   * polls live state for).
+   *
+   * The event stream alone cannot tell a long silent tool call apart from a
+   * finished turn, so without this the pane settles a still-running turn to
+   * `idle` after a few seconds of silence and the loading indicator drops
+   * mid-turn (#9487). While this reports `true`, silence-based settling is
+   * suppressed. A fresh `false` settles a restored prompt, and losing a known
+   * `true` settles an observed turn when its terminal event never arrives.
+   */
+  setDaemonActivePrompt(
+    active: boolean | undefined,
+    owner?: Pick<DaemonActivePromptState, 'workspaceCwd' | 'sessionId'>,
+  ): void;
   sendPrompt(text: string, options?: SendPromptOptions): Promise<PromptResult>;
   /**
    * Non-blocking prompt submission. POSTs to the daemon and returns
@@ -414,10 +461,13 @@ export interface DaemonSessionActions {
   ): Promise<SubmitPromptResult>;
   cancel(): Promise<void>;
   setModel(modelId: string): Promise<SetModelResult>;
-  setReasoningEffort(value: string): Promise<void>;
+  setReasoningEffort(
+    value: ReasoningSelection,
+    opts?: { persist?: boolean },
+  ): Promise<void>;
   setApprovalMode(
     mode: DaemonApprovalMode,
-    opts?: { persist?: boolean },
+    opts?: { persist?: boolean; planMode?: boolean },
   ): Promise<DaemonApprovalModeResult>;
   respondToPermission(
     requestId: string,
@@ -468,12 +518,14 @@ export interface DaemonSessionActions {
    * `options.approvalMode` seeds the session's approval mode in the create
    * request itself, so the daemon applies it atomically at spawn instead of
    * requiring a follow-up `setApprovalMode` call.
+   * `options.modelServiceId` is a standalone-only atomic create override.
    *
    * `options.sourceType` records immutable creator attribution.
    */
   createSession(options?: {
     workspaceCwd?: string;
     sessionContext?: DaemonProductSessionContext;
+    modelServiceId?: string;
     approvalMode?: DaemonApprovalMode;
     sourceType?: string;
     worktree?: { slug?: string };
@@ -488,6 +540,9 @@ export interface DaemonSessionActions {
   getContext(): Promise<DaemonSessionContextStatus>;
   getContextUsage(opts?: {
     detail?: boolean;
+    /** Rethrow transient failures raw instead of recording a notice; for
+     * surfaces that re-collect automatically and report failures inline. */
+    silent?: boolean;
   }): Promise<DaemonSessionContextUsageStatus>;
   renameSession(displayName: string): Promise<SessionMetadataResult>;
   recapSession(): Promise<DaemonSessionRecapResult>;
@@ -509,6 +564,8 @@ export interface DaemonSessionActions {
     opts?: { signal?: AbortSignal; sessionId?: string },
   ): Promise<DaemonSessionAttachmentReference>;
   readAttachment(attachmentId: string): Promise<DaemonSessionAttachmentData>;
+  /** List every attachment currently stored for the session, upload order. */
+  listAttachments(): Promise<DaemonSessionAttachmentReference[]>;
   removeAttachment(
     attachmentId: string,
     opts?: { sessionId?: string },
@@ -573,6 +630,13 @@ export interface DaemonSessionActions {
     status?: DaemonSessionWorkflowTaskStatus['status'];
     taskId?: string;
   }>;
+  /**
+   * Read one saved workflow definition (script + parsed meta). Resolves to
+   * null when the name is unknown or Workflow controls are unavailable.
+   */
+  readSavedWorkflow(
+    name: string,
+  ): Promise<DaemonSessionSavedWorkflowDetail | null>;
   getGoal(): Promise<GoalStateResponse>;
   controlGoal(request: GoalControlRequest): Promise<GoalStateResponse>;
   /**
@@ -585,6 +649,9 @@ export interface DaemonSessionActions {
   clearGoal(): Promise<{ cleared: boolean; condition?: string }>;
   getStats(): Promise<DaemonSessionStatsStatus>;
   loadArtifacts(): Promise<DaemonSessionArtifactsEnvelope>;
+  listSources(): Promise<SessionSourcesResult>;
+  upsertSource(source: SessionSourceInput): Promise<SessionSourceUpsertResult>;
+  removeSource(sourceId: string): Promise<SessionSourceRemoveResult>;
   branchSession(
     name?: string,
     atRecordId?: string,
@@ -592,6 +659,7 @@ export interface DaemonSessionActions {
     sessionId: string;
     displayName: string;
     switchStarted: boolean;
+    sourceWarnings?: string[];
   }>;
   forkSession(directive: string): Promise<DaemonForkSessionResult>;
 }
@@ -614,6 +682,7 @@ export interface DaemonWorkspaceEventSignals {
   mcpVersion: number;
   extensionsVersion: number;
   artifactsVersion: number;
+  sourcesVersion?: number;
   lastExtensionChange?: {
     status?:
       | 'installed'

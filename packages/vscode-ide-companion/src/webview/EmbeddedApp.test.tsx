@@ -222,6 +222,97 @@ describe('EmbeddedApp host wiring', () => {
     });
   });
 
+  it('relativizes the active file across a symlinked workspace', async () => {
+    await renderApp();
+
+    // The daemon matches workspaces by canonical path while every
+    // `activeEditorChanged` sender posts VS Code's raw `uri.fsPath`, so the
+    // bootstrap carries both spellings of a symlinked folder.
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            type: 'webShellBootstrap',
+            data: {
+              baseUrl: 'http://localhost:4141',
+              clientId: 'client-1',
+              workspaceCwd: '/private/workspace',
+              editorWorkspaceCwd: '/workspace',
+              hostKind: 'view',
+            },
+          },
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            type: 'activeEditorChanged',
+            data: {
+              fileName: 'editor.ts',
+              filePath: '/workspace/nested/editor.ts',
+            },
+          },
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    const prepareSubmit = callback<
+      (submission: {
+        prompt: string;
+        sessionId?: string;
+        inputAnnotations: unknown[];
+      }) => Promise<{ prompt: string; inputAnnotations: unknown[] } | undefined>
+    >(mocks.embeddedProps.current as CapturedProps, 'prepareSubmit');
+
+    // A bare `@editor.ts` is what the prefix strip degrades to when the two
+    // sides sit in different path spaces; the agent then resolves it against
+    // the workspace root and finds nothing, or the wrong sibling.
+    await expect(
+      prepareSubmit({ prompt: 'Explain this', inputAnnotations: [] }),
+    ).resolves.toEqual({
+      prompt: '@nested/editor.ts Explain this',
+      inputAnnotations: [
+        expect.objectContaining({
+          type: 'reference',
+          reference: expect.objectContaining({
+            value: '/workspace/nested/editor.ts',
+            serialized: '@nested/editor.ts',
+          }),
+        }),
+      ],
+    });
+
+    // The file picker produces a true workspace-relative annotation value, so
+    // the dedup has to see the same string or it attaches the file twice.
+    const pickerAnnotation = {
+      type: 'reference',
+      start: 0,
+      end: '@nested/editor.ts'.length,
+      text: '@nested/editor.ts',
+      reference: {
+        id: 'picker:nested/editor.ts',
+        kind: 'file',
+        label: 'editor.ts',
+        value: 'nested/editor.ts',
+        serialized: '@nested/editor.ts',
+      },
+    };
+    await expect(
+      prepareSubmit({
+        prompt: 'Explain this',
+        inputAnnotations: [pickerAnnotation],
+      }),
+    ).resolves.toEqual({
+      prompt: 'Explain this',
+      inputAnnotations: [pickerAnnotation],
+    });
+  });
+
   it('keeps an authenticated session visible when auth is cancelled', async () => {
     await renderApp();
     const { container } = mounted[mounted.length - 1];
@@ -261,7 +352,7 @@ describe('EmbeddedApp host wiring', () => {
     expect(container.textContent).toContain('Get Started');
   });
 
-  it('keeps an explicit active-file exclusion across same-file editor changes', async () => {
+  it('keeps an explicit active-file exclusion across editor changes', async () => {
     await renderApp();
 
     const dispatchEditorChanged = (fileName: string, filePath: string) =>
@@ -319,7 +410,7 @@ describe('EmbeddedApp host wiring', () => {
         prepareSubmitAfterSameFile({ prompt: 'hi', inputAnnotations: [] }),
       ).resolves.toBeUndefined();
 
-      // Switching to a different file re-arms inclusion.
+      // Switching to a different file must preserve the explicit exclusion.
       await dispatchEditorChanged('other.ts', '/workspace/other.ts');
       const prepareSubmitAfterSwitch = callback<
         (submission: {
@@ -331,7 +422,7 @@ describe('EmbeddedApp host wiring', () => {
       >(mocks.embeddedProps.current as CapturedProps, 'prepareSubmit');
       await expect(
         prepareSubmitAfterSwitch({ prompt: 'hi', inputAnnotations: [] }),
-      ).resolves.toMatchObject({ prompt: '@other.ts hi' });
+      ).resolves.toBeUndefined();
     } finally {
       act(() => toolbarRoot.unmount());
       toolbarContainer.remove();
@@ -479,8 +570,118 @@ describe('EmbeddedApp host wiring', () => {
         oldText: 'header\nconst value = 1;\nfooter',
         newText: 'header\nconst value = 2;\nfooter',
         source: 'web-shell',
+        requestId: 'req-write',
       },
     });
+    expect(postMessagesOfType('webShellPermissionState').at(-1)).toEqual({
+      type: 'webShellPermissionState',
+      data: { pending: true, requestId: 'req-write' },
+    });
+  });
+
+  it('keeps host permission ownership in sync while pending stays true', async () => {
+    const props = await renderApp();
+    const onTranscriptChange = callback<(blocks: unknown[]) => void>(
+      props,
+      'onTranscriptChange',
+    );
+    const permissionBlock = (id: string, path: string) => ({
+      id,
+      kind: 'permission',
+      requestId: id,
+      title: path,
+      options: [],
+      preview: { kind: 'key_value', rows: [] },
+      toolCall: {
+        content: [{ type: 'diff', path, oldText: 'old', newText: 'new' }],
+      },
+    });
+
+    await act(async () => {
+      onTranscriptChange([
+        permissionBlock('req-a', '/workspace/a.ts'),
+        permissionBlock('req-b', '/workspace/b.ts'),
+      ]);
+      await Promise.resolve();
+    });
+
+    expect(postMessagesOfType('webShellPermissionState').at(-1)).toEqual({
+      type: 'webShellPermissionState',
+      data: { pending: true, requestId: 'req-a' },
+    });
+
+    await act(async () => {
+      onTranscriptChange([
+        { ...permissionBlock('req-a', '/workspace/a.ts'), resolved: true },
+        permissionBlock('req-b', '/workspace/b.ts'),
+      ]);
+      await Promise.resolve();
+    });
+
+    // Pending stays true, but ownership moves to the remaining request so a
+    // stale accept cannot vote on the wrong approval.
+    expect(postMessagesOfType('webShellPermissionState').at(-1)).toEqual({
+      type: 'webShellPermissionState',
+      data: { pending: true, requestId: 'req-b' },
+    });
+  });
+
+  it('posts pending: false when pending permission diffs are torn down', async () => {
+    const props = await renderApp();
+    const onTranscriptChange = callback<(blocks: unknown[]) => void>(
+      props,
+      'onTranscriptChange',
+    );
+
+    await act(async () => {
+      onTranscriptChange([
+        {
+          id: 'perm-a',
+          kind: 'permission',
+          requestId: 'req-a',
+          title: 'update a.ts',
+          options: [],
+          preview: { kind: 'key_value', rows: [] },
+          toolCall: {
+            content: [
+              {
+                type: 'diff',
+                path: '/workspace/a.ts',
+                oldText: 'old',
+                newText: 'new',
+              },
+            ],
+          },
+        },
+      ]);
+      await Promise.resolve();
+    });
+
+    expect(postMessagesOfType('webShellPermissionState').at(-1)).toEqual({
+      type: 'webShellPermissionState',
+      data: { pending: true, requestId: 'req-a' },
+    });
+
+    // Closing the host tab/view unmounts the app. The teardown must tell
+    // the extension the pending set is gone; otherwise the vote gate stays
+    // open for an approval the user can no longer see.
+    const { container, root } = mounted.splice(mounted.length - 1, 1)[0];
+    await act(async () => {
+      root.unmount();
+      await Promise.resolve();
+    });
+    container.remove();
+
+    expect(postMessagesOfType('webShellPermissionState').at(-1)).toEqual({
+      type: 'webShellPermissionState',
+      data: { pending: false },
+    });
+    expect(postMessagesOfType('closeDiff')).toEqual([
+      {
+        type: 'closeDiff',
+        data: { path: '/workspace/a.ts', requestId: 'req-a' },
+      },
+    ]);
   });
 
   it('routes auth and session-change host actions to the extension', async () => {
@@ -591,20 +792,309 @@ describe('EmbeddedApp host wiring', () => {
         await Promise.resolve();
       });
 
-      expect(container.textContent).toContain('Loading conversation…');
+      expect(
+        container.querySelector(
+          '[role="status"][aria-label="Loading conversation…"]',
+        ),
+      ).not.toBeNull();
 
-      // A retriable connection failure that never settles must not lock the
-      // panel behind the overlay forever.
+      // A retriable connection failure that never settles must not leave the
+      // header loading state active forever.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(15_000);
       });
 
-      expect(container.textContent).not.toContain('Loading conversation…');
+      expect(
+        container.querySelector(
+          '[role="status"][aria-label="Loading conversation…"]',
+        ),
+      ).toBeNull();
       expect(container.textContent).toContain(
         'The conversation switch timed out. Try again.',
       );
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('merges allowlisted pre-cutover sessions into the history list', async () => {
+    // v0.21-era conversations were recorded without source attribution, so
+    // the vscode-scoped catalog query cannot return them. The host ships the
+    // legacy ids it still has in globalState; the panel then claims exactly
+    // those sessions back from the daemon's default catalog — without
+    // surfacing unattributed CLI sessions or browser-stamped ones.
+    sdkMocks.listWorkspaceSessionsPage.mockImplementation(
+      (options?: { sourceType?: string }) => {
+        if (options?.sourceType === 'vscode') {
+          return Promise.resolve({
+            sessions: [
+              {
+                sessionId: 'vscode-1',
+                workspaceCwd: '/workspace',
+                displayName: 'Current chat',
+                sourceType: 'vscode',
+                updatedAt: '2026-09-09T12:00:00.000Z',
+              },
+            ],
+            nextCursor: undefined,
+          });
+        }
+        if (options?.sourceType === 'default') {
+          return Promise.resolve({
+            sessions: [
+              {
+                sessionId: 'legacy-1',
+                workspaceCwd: '/workspace',
+                displayName: 'Pre-upgrade chat',
+                updatedAt: '2026-08-01T12:00:00.000Z',
+              },
+              {
+                sessionId: 'cli-1',
+                workspaceCwd: '/workspace',
+                displayName: 'Terminal chat',
+                updatedAt: '2026-08-02T12:00:00.000Z',
+              },
+              {
+                sessionId: 'web-1',
+                workspaceCwd: '/workspace',
+                displayName: 'Browser chat',
+                sourceType: 'default',
+                updatedAt: '2026-08-03T12:00:00.000Z',
+              },
+            ],
+            nextCursor: undefined,
+          });
+        }
+        return Promise.resolve({ sessions: [], nextCursor: undefined });
+      },
+    );
+
+    await renderApp();
+    const { container } = mounted[mounted.length - 1];
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            type: 'webShellBootstrap',
+            data: {
+              baseUrl: 'http://localhost:4141',
+              clientId: 'client-1',
+              workspaceCwd: '/workspace',
+              sessionId: 'session-1',
+              hostKind: 'panel',
+              legacyConversationIds: ['legacy-1', 'never-recorded'],
+            },
+          },
+        }),
+      );
+      // The remount effect refetches the vscode page, then pages the default
+      // catalog for allowlisted ids — both are sequential awaits.
+      for (let i = 0; i < 6; i++) await Promise.resolve();
+    });
+
+    const historyButton = container.querySelector(
+      'button[aria-haspopup="dialog"]',
+    ) as HTMLButtonElement;
+    expect(historyButton).not.toBeNull();
+    await act(async () => {
+      historyButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await Promise.resolve();
+    });
+    // Opening the dropdown triggers the first-page load, which now includes
+    // the legacy-catalog scan; wait for its rows instead of fixed flushes.
+    await vi.waitFor(() => {
+      expect(
+        document.querySelector('[data-session-id="legacy-1"]'),
+      ).not.toBeNull();
+    });
+
+    expect(
+      document.querySelector('[data-session-id="vscode-1"]'),
+    ).not.toBeNull();
+    // Neither the unattributed CLI session nor the browser-stamped one is
+    // allowlisted, so the panel must not claim them.
+    expect(document.querySelector('[data-session-id="cli-1"]')).toBeNull();
+    expect(document.querySelector('[data-session-id="web-1"]')).toBeNull();
+
+    const defaultCatalogCalls = sdkMocks.listWorkspaceSessionsPage.mock.calls
+      .map(([options]) => options)
+      .filter(
+        (options) =>
+          (options as { sourceType?: string })?.sourceType === 'default',
+      );
+    expect(defaultCatalogCalls.length).toBeGreaterThan(0);
+    expect(defaultCatalogCalls[0]).toMatchObject({
+      archiveState: 'active',
+    });
+
+    // The scan converges after its first successful run: ids that never
+    // match (other workspaces, deleted transcripts, since-stamped sessions)
+    // must not re-page the default catalog on every dropdown open.
+    await act(async () => {
+      historyButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      historyButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => {
+      const vscodeCalls = sdkMocks.listWorkspaceSessionsPage.mock.calls.filter(
+        ([options]) =>
+          (options as { sourceType?: string })?.sourceType === 'vscode',
+      );
+      expect(vscodeCalls.length).toBeGreaterThanOrEqual(2);
+    });
+    expect(
+      sdkMocks.listWorkspaceSessionsPage.mock.calls.filter(
+        ([options]) =>
+          (options as { sourceType?: string })?.sourceType === 'default',
+      ),
+    ).toHaveLength(1);
+    expect(
+      document.querySelector('[data-session-id="legacy-1"]'),
+    ).not.toBeNull();
+  });
+});
+
+describe('web shell permission decision messages', () => {
+  function installShellApi(
+    api: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const props = mocks.embeddedProps.current;
+    expect(props).not.toBeNull();
+    const shellRef = (props as CapturedProps)['shellRef'] as {
+      current: unknown;
+    };
+    expect(shellRef).toBeTruthy();
+    shellRef.current = api;
+    return api;
+  }
+
+  async function setPendingPermission(
+    props: CapturedProps,
+    requestId = 'req-1',
+  ) {
+    const onTranscriptChange = callback<(blocks: unknown[]) => void>(
+      props,
+      'onTranscriptChange',
+    );
+    await act(async () => {
+      onTranscriptChange([
+        {
+          id: 'permission-1',
+          kind: 'permission',
+          requestId,
+          title: 'Edit fixture.txt',
+          resolved: false,
+          options: [],
+          preview: { kind: 'key_value', rows: [] },
+          toolCall: {
+            content: [
+              {
+                type: 'diff',
+                path: '/workspace/fixture.txt',
+                oldText: 'before',
+                newText: 'after',
+              },
+            ],
+          },
+        },
+      ]);
+      await Promise.resolve();
+    });
+  }
+
+  async function dispatchDecision(
+    decision: string,
+    source: Window | null,
+    requestId = 'req-1',
+  ) {
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            type: 'webShellPermissionDecision',
+            data: { decision, requestId },
+          },
+          source,
+        }),
+      );
+      await Promise.resolve();
+    });
+  }
+
+  it('forwards host-relayed decisions to the web shell', async () => {
+    const props = await renderApp();
+    const respondToPendingPermission = vi.fn().mockResolvedValue(true);
+    installShellApi({ respondToPendingPermission });
+    await setPendingPermission(props);
+
+    // Extension-host messages arrive via the webview preload frame, i.e.
+    // with this frame's parent as their source.
+    await dispatchDecision('allow', window.parent);
+
+    expect(respondToPendingPermission).toHaveBeenCalledWith('req-1', 'allow');
+  });
+
+  it('ignores decisions posted by a nested iframe window', async () => {
+    const props = await renderApp();
+    const respondToPendingPermission = vi.fn().mockResolvedValue(true);
+    installShellApi({ respondToPendingPermission });
+    await setPendingPermission(props);
+
+    // MCP apps and artifact previews run in scriptable sandboxed iframes
+    // inside this webview; they can postMessage to this window and must
+    // not be able to vote on the pending approval, even when they know the
+    // active request id. Their source is their own child window, not the
+    // preload parent frame.
+    const iframe = document.createElement('iframe');
+    document.body.appendChild(iframe);
+    try {
+      const childWindow = iframe.contentWindow;
+      expect(childWindow).not.toBeNull();
+      await dispatchDecision('allow', childWindow as Window);
+      await dispatchDecision('reject', childWindow as Window);
+    } finally {
+      iframe.remove();
+    }
+
+    expect(respondToPendingPermission).not.toHaveBeenCalled();
+  });
+
+  it('ignores decisions delivered without a source window', async () => {
+    const props = await renderApp();
+    const respondToPendingPermission = vi.fn().mockResolvedValue(true);
+    installShellApi({ respondToPendingPermission });
+    await setPendingPermission(props);
+
+    // Fail closed on synthetic deliveries: real host messages always carry
+    // the preload frame as their source.
+    await dispatchDecision('allow', null);
+
+    expect(respondToPendingPermission).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a notice when the shell resolves the vote to false', async () => {
+    const props = await renderApp();
+    const respondToPendingPermission = vi.fn().mockResolvedValue(false);
+    installShellApi({ respondToPendingPermission });
+    await setPendingPermission(props);
+    const { container } = mounted[mounted.length - 1];
+
+    await dispatchDecision('allow', window.parent);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(respondToPendingPermission).toHaveBeenCalledWith('req-1', 'allow');
+    // A resolved `false` must not die silently: it covers both the benign
+    // race (the approval was resolved elsewhere one tick earlier) and hung
+    // votes (e.g. while catching up after a session switch). Notify the
+    // user without the hard-error state reset of `handleShellError`.
+    expect(container.textContent).toContain(
+      'The approval decision could not be applied.',
+    );
   });
 });

@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type { SessionSourcesSnapshot } from './session-sources.js';
+
 import { type Config } from '../config/config.js';
 import {
   SessionExecutionEngineError,
@@ -289,6 +291,8 @@ export interface ManagedSessionRecordWriter {
 }
 
 export interface ChatRecord {
+  /** Daemon admission identity, distinct from CLI file-history prompt IDs. */
+  daemonPromptId?: string;
   /** Unique identifier for this logical message */
   uuid: string;
   /** UUID of the parent message; null for root (first message in session) */
@@ -322,10 +326,12 @@ export interface ChatRecord {
     | 'agent_bootstrap'
     | 'agent_launch_prompt'
     | 'agent_retry'
+    | 'agent_session_ready'
     | 'file_history_snapshot'
     | 'user_text_elements'
     | 'session_artifact_event'
     | 'session_artifact_snapshot'
+    | 'session_sources_snapshot'
     | 'branch_checkpoint'
     | 'goal_state'
     | 'goal_runtime'
@@ -390,10 +396,12 @@ export interface ChatRecord {
     | RewindRecordPayload
     | AgentBootstrapRecordPayload
     | AgentRetryRecordPayload
+    | AgentSessionReadyRecordPayload
     | FileHistorySnapshotRecordPayload
     | UserTextElementsRecordPayload
     | SessionArtifactEventRecordPayload
     | SessionArtifactSnapshotRecordPayload
+    | SessionSourcesSnapshot
     | BranchCheckpointRecordPayloadV1
     | GoalStateRecordPayloadV2
     | TurnResultRecordPayload;
@@ -450,8 +458,9 @@ export interface NotificationRecordPayload {
 
 export interface UserPromptRecordPayload {
   /**
-   * TUI submittedPrompt projection when available; otherwise the expanded
-   * pre-hook prompt.
+   * Core/headless: submitted projection, otherwise expanded pre-hook text.
+   * ACP: display projection or raw request text before expansion. ACP omits
+   * this payload when neither a projection nor attachment references exist.
    */
   displayText: string;
   /** Sanitized hook context duplicated from the tagged model-bound part. */
@@ -486,6 +495,11 @@ export interface AgentBootstrapRecordPayload {
    * this field and resume resolves tool names through the current registry.
    */
   tools?: Array<string | FunctionDeclaration>;
+}
+
+export interface AgentSessionReadyRecordPayload {
+  callId: string;
+  subagentSessionReady: boolean;
 }
 
 export interface AgentRetryRecordPayload {
@@ -1958,12 +1972,14 @@ export class ChatRecordingService {
     message: PartListUnion,
     goalContext?: GoalTurnPermit,
     promptPayload?: UserPromptRecordPayload,
+    daemonPromptId?: string,
   ): void {
     try {
       this.trackUserDisplayTextForTitle(promptPayload?.displayText);
       this.turnParentUuids.push(this.lastRecordUuid);
       const record: ChatRecord = {
         ...this.createBaseRecord('user'),
+        ...(daemonPromptId ? { daemonPromptId } : {}),
         ...(goalContext ? { goalContext: copyGoalContext(goalContext) } : {}),
         message: createUserContent(message),
         ...(promptPayload ? { systemPayload: promptPayload } : {}),
@@ -2163,6 +2179,34 @@ export class ChatRecordingService {
     const { tokens } = this.goalTurnSpend;
     this.goalTurnSpend = undefined;
     return tokens;
+  }
+
+  /**
+   * Evidence-bearing tool results recorded in the Goal turn that is currently
+   * open. Single entry for the same reason the spend is.
+   */
+  private goalTurnToolResults?: { turnId: string; count: number };
+
+  private accumulateGoalTurnToolResult(turnId: string): void {
+    if (this.goalTurnToolResults?.turnId !== turnId) {
+      this.goalTurnToolResults = { turnId, count: 0 };
+    }
+    this.goalTurnToolResults.count += 1;
+  }
+
+  /**
+   * The evidence-bearing tool results `turnId` recorded, consuming them so a
+   * turn is counted once.
+   *
+   * `get_goal` and `update_goal` results are excluded: they are the Goal
+   * runtime talking to itself, and a turn that only reads its own state is
+   * exactly the idling this count exists to notice.
+   */
+  takeGoalTurnToolResults(turnId: string): number {
+    if (this.goalTurnToolResults?.turnId !== turnId) return 0;
+    const { count } = this.goalTurnToolResults;
+    this.goalTurnToolResults = undefined;
+    return count;
   }
 
   /**
@@ -2434,6 +2478,9 @@ export class ChatRecordingService {
         record.toolCallResult = recordingToolCallResult;
       }
 
+      if (options?.goalContext && options.provenance !== 'goal_runtime') {
+        this.accumulateGoalTurnToolResult(options.goalContext.turnId);
+      }
       this.appendRecord(record);
     } catch (error) {
       debugLogger.error('Error saving tool result:', error);
@@ -3049,6 +3096,17 @@ export class ChatRecordingService {
       ...this.createBaseRecord('system'),
       type: 'system',
       subtype: 'session_artifact_snapshot',
+      systemPayload: payload,
+    };
+    await this.appendRecordStrict(record, { updateActiveTail: false });
+  }
+  async recordSessionSourcesSnapshot(
+    payload: SessionSourcesSnapshot,
+  ): Promise<void> {
+    const record: ChatRecord = {
+      ...this.createBaseRecord('system'),
+      type: 'system',
+      subtype: 'session_sources_snapshot',
       systemPayload: payload,
     };
     await this.appendRecordStrict(record, { updateActiveTail: false });

@@ -1465,4 +1465,9 @@ export class ModelsConfig {
       providerProtocolConfig,
     );
   }
+
+  /** The raw providers config the registry was last built from. */
+  getModelProvidersConfig(): ModelProvidersConfig | undefined {
+    return this.modelRegistry.getModelProvidersConfig();
+  }
 }

@@ -163,6 +163,16 @@ R2.S1 已进入施工，其余两片仍是设计。R2.S1 拆为 R2.S1a 记录格
 
 最新空 store 基线已证明原 refresh 会写入，且普通基础 lock 与真实 lock.lock 不同；新只读 API 和 fixed 组仍待实现。详见执行引擎设计新增章节。本轮只核对源码与既有报告，未重跑历史产品测试；macOS 的已记录局部证据不能替代 Linux/Windows 验收。Windows 原生命令进程组路径目前明确 unsupported，有限范围默认必须限定已支持且已验收的平台/工具组合。
 
+**2026-09-11 上游对齐已完成（先对齐、后接线）**：分支落后 `origin/main` 470 个提交，R2.3 要动的四处 factory 与 read-path 都在上游改动最密的区域，因此先把 `origin/main`（`f649d65d1f`）合进分支再接线，而不是在旧基线上继续。共 64 个冲突文件；core 侧本轮之前已解，本轮结清 `bridge.ts`、`acpAgent.ts`、`Session.ts`、`run-qwen-serve.ts` 与四个测试文件。**方法**：最重的文件不逐个手工消解 conflict marker，而是取本分支版本后回放上游自己的补丁（`git apply --ignore-whitespace --reject`），用上游补丁本身当「必须存活的改动」清单——`Session.ts` 155 个 hunk 中 150 个自动落地，只剩 5 个手工；`bridge.ts` 178 中 153、`acpAgent.ts` 127 中 118 同理。
+
+**该方法暴露了一个必须记录的失效模式**：忽略空白的匹配会把 hunk 落到「能匹配但不对」的位置，且结果可能语法合法。实测抓到五处并全部修回——`conversationsRuntimeProvenance` 与 inbox 清理注册落进 `new QwenAgent(...)` 的实参表；`planExecutionMode` 的 `_meta` spread 落到两个方法之间；settled-turn 的 per-request pin 落到 rewind 的 `runExclusiveHistoryMutation` 尾部；`llm.test.tsx` 里上游测试与本分支参数化测试被焊成一体；`bridge.test.ts` 里 repo-specific `setSessionPrs` 种子落进了相邻的另一个测试。凡被焊坏的文件都从 HEAD 重新派生后重放，而不是在已损坏的结果上继续打补丁；四个此前手工解决的测试文件（`bridge.test.ts`、`tool-call-emitter.test.ts`、`environment.test.ts`、`llm.test.tsx`）也因此重做，其中三个原本带着不平衡的花括号，build 才是发现它们的第一道关。
+
+**两侧都改过同一处行为的地方逐项裁定**：ACP 自动记忆调度被上游抽成 `#recordPromptCompletionEffects`，本分支的 `extractionHistory` 快照因此改在该方法内提供；`stopChannel` 改走上游的 `terminateChannel`（拿到超时上界）但保留本分支把 teardown 失败升级成 `AcpChannelTeardownError` 并记入 `slot.teardownFailure` 的语义；上游的单通道 `liveChannelInfo()` 按本分支的 per-engine slot 拆成既有 `liveControlChannelInfo()` 与 `ci.slot.current`，强制租约认证改为要求**每个** slot 的 factory 都转发 child env（任一 slot 丢掉覆盖就等于放出未加租约的子进程）；runtime epoch 与 keep-alive 状态在 slot 世界里重新声明，`getWorkspaceRuntimeLifecycleSnapshot` 的 starting 探测读 `channelSlots`。上游的 `runWithPinnedRuntimeBaseDirForRequest` 改为经本分支 trust-aware 的 `loadScopedSettings` 解析，并把仍用 `this.settings` 钉运行时根的 list/delete/rename 三个 handler 一起转过来——那正是上游 #10095 修的 bug 类，本分支此前还留着。测试侧三处按合并后的实际行为改判：归档读取的断言从上游 `onIncompleteRead` 回调改为本分支的 `sourceReadComplete`；relaunch 的 childEnv 期望补上本分支恒发的 managed Tool Runtime 钉子（两个 marker 并存）；discovery 排空用例改断言「没有任何一次调用发布了工具集」，因为上游的 session-source 工具注册现在会无参刷新工具列表。
+
+**证据**：`npm install`（上游新增 `remend` 依赖）、仓库 `npm run build` 与 `npm run typecheck` 均 0 error，改动文件 prettier/eslint 干净；`bridge.test.ts` 932/932，`llm.test.tsx` + `acpAgent.test.ts` 843/843，`run-qwen-serve.test.ts` + `environment.test.ts` + `tool-call-emitter.test.ts` 545/545，core 的 `sessionService`/`session-transcript-reader`/`managed-session-log`/`envVarResolver` 427/427。上游把 envVarResolver 移入 core 时删掉了 CLI 侧套件，本分支「显式环境不回落 ambient」的用例已补进 core 套件（28/28）。
+
+**边界**：这一步只是对齐，**没有**新增任何 Managed 默认接线——`managedSessionLogEnabled` 仍默认关闭，四处普通 factory 仍未开启它，因此 daemon 默认路径依旧是 legacy，R1 在默认配置下仍等于 no-op。本方案中带行号的 read-path 断言必须在新基线上重新核对后才能引用（上游改动了 transcript index 与 turn navigation），未重核的行号不得作为验收证据。
+
 ## 后续阶段与完整完成条件
 
 R4 仅是兼容范围的有限默认，不结束总目标。R5 继续手动/自动定时、内部自动执行、媒体/产物、Skills/本地初始化、MCP/Hooks/Channels、后台 Shell/PTY/子任务/记忆、物理历史与全部客户端/平台组合。各项调用者、协议、状态转换和迁移/失败策略已经补齐；实施时落实相应 validator、适配与可执行验收计划，完成后更新总表状态和允许范围。

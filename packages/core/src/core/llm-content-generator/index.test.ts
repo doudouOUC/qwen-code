@@ -54,6 +54,7 @@ describe('createLlmContentGenerator', () => {
         }),
       }),
       expect.anything(),
+      expect.anything(),
     );
   });
 
@@ -87,6 +88,7 @@ describe('createLlmContentGenerator', () => {
           },
           httpOptions: expect.objectContaining({ baseUrl }),
         }),
+        expect.anything(),
         expect.anything(),
       );
     },
@@ -125,6 +127,7 @@ describe('createLlmContentGenerator', () => {
         }),
       }),
       config,
+      mockConfig,
     );
   });
 
@@ -146,6 +149,7 @@ describe('createLlmContentGenerator', () => {
         }),
       }),
       config,
+      mockConfig,
     );
     expect(vi.mocked(LlmContentGenerator).mock.calls[0]?.[0]).toEqual(
       expect.objectContaining({

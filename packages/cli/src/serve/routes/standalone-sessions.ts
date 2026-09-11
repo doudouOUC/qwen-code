@@ -6,6 +6,7 @@
 
 import {
   APPROVAL_MODES,
+  MAX_CRON_TASK_ROUTING_ID_LENGTH,
   SESSION_TRANSCRIPT_MAX_LIMIT,
   type ApprovalMode,
   type SessionArchiveState,
@@ -266,6 +267,16 @@ export function registerStandaloneSessionRoutes(
     }
   };
 
+  app.get('/standalone/session-options', (req, res) =>
+    handle('GET /standalone/session-options', req, res, async () => {
+      if (Object.keys(req.query).length > 0) {
+        sendInvalidRequest(res, 'The request query contains unknown fields.');
+        return;
+      }
+      res.status(200).json(await deps.service.getOptions());
+    }),
+  );
+
   app.post('/standalone/sessions', deps.mutate({ strict: true }), (req, res) =>
     handle('POST /standalone/sessions', req, res, async () => {
       const body = requireExactBody(req, res, [
@@ -282,11 +293,11 @@ export function registerStandaloneSessionRoutes(
         body['modelServiceId'] !== undefined &&
         (typeof body['modelServiceId'] !== 'string' ||
           body['modelServiceId'].length === 0 ||
-          body['modelServiceId'].length > 256)
+          body['modelServiceId'].length > MAX_CRON_TASK_ROUTING_ID_LENGTH)
       ) {
         sendInvalidRequest(
           res,
-          '`modelServiceId` must be a non-empty string of at most 256 characters.',
+          `\`modelServiceId\` must be a non-empty string of at most ${MAX_CRON_TASK_ROUTING_ID_LENGTH} characters.`,
         );
         return;
       }

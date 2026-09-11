@@ -82,6 +82,7 @@ export function createLlmContentGenerator(
       httpOptions: { headers, baseUrl },
     },
     config,
+    gcConfig,
   );
 
   return llmContentGenerator;

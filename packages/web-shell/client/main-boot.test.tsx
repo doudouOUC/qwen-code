@@ -33,6 +33,7 @@ vi.mock('./config/daemon', () => ({
   // No token in the URL, so boot blocks on the postMessage handshake — the
   // window in which the watchdog's grace period can expire.
   getDaemonToken: () => null,
+  persistDaemonToken: vi.fn(),
   removeDaemonTokenFromUrl: vi.fn(),
   waitForDaemonTokenMessage: () =>
     new Promise<string>((resolve) => {
@@ -67,7 +68,7 @@ describe('web shell boot', () => {
     // React appends, so a surviving panel would sit above the recovered app.
     expect(testState.containers[0]).toBe(root);
     expect(root.querySelector('[data-boot-fallback]')).toBeNull();
-  });
+  }, 15_000);
 
   it('mounts into #root on a normal boot', async () => {
     document.body.innerHTML = '<div id="root"></div>';

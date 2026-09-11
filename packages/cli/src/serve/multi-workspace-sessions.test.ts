@@ -18,6 +18,7 @@ import {
   readSessionPrs,
   resetDebugLoggingState,
   setDebugLogSession,
+  writeSessionPrs,
 } from '@qwen-code/qwen-code-core';
 import {
   InvalidRewindTargetError,
@@ -214,6 +215,7 @@ async function writeStoredSession(input: {
   parentSessionId?: string;
   sourceType?: string;
   sourceId?: string;
+  assistantText?: string;
 }): Promise<void> {
   const chatsDir = path.join(new Storage(input.cwd).getProjectDir(), 'chats');
   await fsp.mkdir(chatsDir, { recursive: true });
@@ -229,6 +231,17 @@ async function writeStoredSession(input: {
       cwd: input.cwd,
     },
   ];
+  if (input.assistantText !== undefined) {
+    records.push({
+      uuid: `${input.sessionId}-assistant-1`,
+      parentUuid: `${input.sessionId}-user-1`,
+      sessionId: input.sessionId,
+      timestamp: input.timestamp,
+      type: 'assistant',
+      message: { role: 'model', parts: [{ text: input.assistantText }] },
+      cwd: input.cwd,
+    });
+  }
   if (input.parentSessionId !== undefined) {
     records.push({
       uuid: `${input.sessionId}-parent-1`,
@@ -544,13 +557,14 @@ function makeBridge(
         limits: {
           maxSessions: 20,
           maxPendingPromptsPerSession: 5,
-          eventRingSize: 8000,
+          eventRingSize: 8_000,
           compactedReplayMaxBytes: 4 * 1024 * 1024,
           maxJournalEvents: 10_000,
           maxJournalBytes: 8 * 1024 * 1024,
           journalGrowth: null,
           channelIdleTimeoutMs: 0,
           sessionIdleTimeoutMs: 1_800_000,
+          sessionPromptSettledCloseGraceMs: 0,
         },
         sessionCount: live.size,
         pendingPermissionCount: 0,
@@ -817,6 +831,12 @@ function makeBridge(
         refreshed: params.syncOutputLanguage,
       };
     },
+    getSessionSources: vi.fn(async () => ({ revision: 0, sources: [] })),
+    upsertSessionSource: vi.fn(async () => ({
+      revision: 1,
+      change: 'created',
+    })),
+    removeSessionSource: vi.fn(async () => ({ revision: 1, removed: true })),
     async addSessionArtifact(
       sessionId: string,
       artifact: Parameters<AcpSessionBridge['addSessionArtifact']>[1],
@@ -1555,6 +1575,103 @@ describe('multi-workspace session dispatch', () => {
     expect(primaryBridge.rewindCalls).toEqual([]);
     expect(secondaryBridge.rewindCalls).toHaveLength(3);
   });
+
+  const sourceAuth = (test: request.Test) =>
+    test.set('Host', host()).set('Authorization', TEST_AUTHORIZATION);
+
+  it('session sources use the trusted secondary owner for all metadata operations', async () => {
+    const { app, primaryBridge, secondaryBridge } = makeHarness({
+      token: TEST_TOKEN,
+    });
+    const sessionId = '22222222-2222-4222-a222-222222222222';
+    const input = {
+      title: 'Secondary source',
+      locator: { type: 'url', url: 'https://example.com/' },
+    };
+    const listed = await sourceAuth(
+      request(app).get(`/session/${sessionId}/sources`),
+    );
+    const added = await sourceAuth(
+      request(app).post(`/session/${sessionId}/sources`),
+    )
+      .set('X-Qwen-Client-Id', 'client-secondary')
+      .send(input);
+    const removed = await sourceAuth(
+      request(app).delete(`/session/${sessionId}/sources/source-1`),
+    ).set('X-Qwen-Client-Id', 'client-secondary');
+    expect([listed.status, added.status, removed.status]).toEqual([
+      200, 200, 200,
+    ]);
+    expect(secondaryBridge.getSessionSources).toHaveBeenCalledWith(
+      sessionId,
+      undefined,
+    );
+    expect(secondaryBridge.upsertSessionSource).toHaveBeenCalledWith(
+      sessionId,
+      input,
+      { clientId: 'client-secondary' },
+    );
+    expect(secondaryBridge.removeSessionSource).toHaveBeenCalledWith(
+      sessionId,
+      'source-1',
+      { clientId: 'client-secondary' },
+    );
+    expect(primaryBridge.getSessionSources).not.toHaveBeenCalled();
+    expect(primaryBridge.upsertSessionSource).not.toHaveBeenCalled();
+    expect(primaryBridge.removeSessionSource).not.toHaveBeenCalled();
+  });
+
+  it.each(['unknown', 'untrusted', 'ambiguous', 'replacing'] as const)(
+    'session sources fail closed for %s owners without primary fallback',
+    async (state) => {
+      const sessionId =
+        state === 'unknown'
+          ? 'missing'
+          : '22222222-2222-4222-a222-222222222222';
+      const harness = makeHarness({
+        token: TEST_TOKEN,
+        secondaryTrusted: state !== 'untrusted',
+        ...(state === 'ambiguous'
+          ? { primarySummaries: [makeSummary(sessionId, PRIMARY_CWD)] }
+          : {}),
+      });
+      if (state === 'replacing') {
+        harness.registry.beginReplacement(
+          harness.registry.getEntryByWorkspaceId('secondary-id')!,
+          'policy-2',
+        );
+      }
+      const responses = [
+        await sourceAuth(
+          request(harness.app).get(`/session/${sessionId}/sources`),
+        ),
+        await sourceAuth(
+          request(harness.app).post(`/session/${sessionId}/sources`),
+        )
+          .set('X-Qwen-Client-Id', 'client-secondary')
+          .send({}),
+        await sourceAuth(
+          request(harness.app).delete(`/session/${sessionId}/sources/source-1`),
+        ).set('X-Qwen-Client-Id', 'client-secondary'),
+      ];
+      const status = {
+        unknown: 404,
+        untrusted: 403,
+        ambiguous: 500,
+        replacing: 404,
+      }[state];
+      expect(responses.map((response) => response.status)).toEqual([
+        status,
+        status,
+        status,
+      ]);
+      for (const bridge of [harness.primaryBridge, harness.secondaryBridge]) {
+        expect(bridge.getSessionSources).not.toHaveBeenCalled();
+        expect(bridge.upsertSessionSource).not.toHaveBeenCalled();
+        expect(bridge.removeSessionSource).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it('fails closed for unknown, untrusted, and ambiguous rewind owners', async () => {
     const unknown = makeHarness();
@@ -3155,6 +3272,26 @@ describe('multi-workspace session dispatch', () => {
     expect(primaryBridge.setApprovalModeCalls).toEqual([]);
   });
 
+  it('routes DAC planning controls to the live-session owner without a primary fallback', async () => {
+    const { app, primaryBridge, secondaryBridge } = makeHarness();
+    const res = await request(app)
+      .post('/session/22222222-2222-4222-a222-222222222222/approval-mode')
+      .set('Host', host())
+      .set('X-Qwen-Client-Id', 'secondary-client')
+      .send({ mode: 'auto-edit', planMode: true });
+
+    expect(res.status).toBe(200);
+    expect(secondaryBridge.setApprovalModeCalls).toEqual([
+      expect.objectContaining({
+        sessionId: '22222222-2222-4222-a222-222222222222',
+        mode: 'auto-edit',
+        opts: { persist: false, planMode: true },
+        context: { clientId: 'secondary-client' },
+      }),
+    ]);
+    expect(primaryBridge.setApprovalModeCalls).toEqual([]);
+  });
+
   it('still rejects model/approval-mode mutations on an untrusted non-primary session', async () => {
     // Opening these routes to non-primary owners must not bypass the trust
     // gate: an untrusted workspace runtime is refused before the bridge runs.
@@ -3961,6 +4098,258 @@ describe('multi-workspace session dispatch', () => {
     expect(group.body.code).toBe('invalid_session_group_filter');
   });
 
+  it('searches non-primary workspace session content and returns snippets', async () => {
+    await withRuntimeDir(async () => {
+      const contentHitId = '550e8400-e29b-41d4-a716-446655440111';
+      const promptHitId = '550e8400-e29b-41d4-a716-446655440112';
+      const missId = '550e8400-e29b-41d4-a716-446655440113';
+      await writeStoredSession({
+        sessionId: contentHitId,
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:00:00.000Z',
+        prompt: 'generic title-like prompt',
+        assistantText: 'The qdrant indexing pipeline batches upserts.',
+        mtime: new Date('2026-07-08T00:04:00.000Z'),
+      });
+      await writeStoredSession({
+        sessionId: promptHitId,
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:01:00.000Z',
+        prompt: 'how does qdrant handle sharding?',
+        mtime: new Date('2026-07-08T00:05:00.000Z'),
+      });
+      await writeStoredSession({
+        sessionId: missId,
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:02:00.000Z',
+        prompt: 'unrelated topic',
+        mtime: new Date('2026-07-08T00:06:00.000Z'),
+      });
+      const { app } = makeHarness();
+
+      const res = await request(app)
+        .get('/workspace/secondary-id/sessions/search?q=qdrant')
+        .set('Host', host());
+
+      expect(res.status).toBe(200);
+      expect(res.body.results).toHaveLength(2);
+      // Most recently modified first.
+      expect(
+        res.body.results.map(
+          (result: { session: { sessionId: string } }) =>
+            result.session.sessionId,
+        ),
+      ).toEqual([promptHitId, contentHitId]);
+      expect(res.body.results[0].snippet).toContain('qdrant');
+      expect(res.body.results[1].snippet).toContain('qdrant');
+      expect(res.body.results[1].session).toEqual(
+        expect.objectContaining({
+          workspaceCwd: SECONDARY_CWD,
+          displayName: 'generic title-like prompt',
+        }),
+      );
+    });
+  });
+
+  it('validates the workspace session search query parameters', async () => {
+    const { app } = makeHarness();
+
+    const missing = await request(app)
+      .get('/workspace/secondary-id/sessions/search')
+      .set('Host', host());
+    expect(missing.status).toBe(400);
+    expect(missing.body.code).toBe('invalid_search_query');
+
+    const empty = await request(app)
+      .get('/workspace/secondary-id/sessions/search?q=%20%20')
+      .set('Host', host());
+    expect(empty.status).toBe(400);
+    expect(empty.body.code).toBe('invalid_search_query');
+
+    const tooLong = await request(app)
+      .get(`/workspace/secondary-id/sessions/search?q=${'a'.repeat(201)}`)
+      .set('Host', host());
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body.code).toBe('invalid_search_query');
+
+    for (const raw of ['0', '51', 'abc']) {
+      const invalid = await request(app)
+        .get(
+          `/workspace/secondary-id/sessions/search?q=qdrant&maxResults=${raw}`,
+        )
+        .set('Host', host());
+      expect(invalid.status).toBe(400);
+      expect(invalid.body.code).toBe('invalid_search_max_results');
+    }
+  });
+
+  it('honors maxResults for workspace session content search', async () => {
+    await withRuntimeDir(async () => {
+      for (const [index, sessionId] of [
+        '550e8400-e29b-41d4-a716-446655440121',
+        '550e8400-e29b-41d4-a716-446655440122',
+      ].entries()) {
+        await writeStoredSession({
+          sessionId,
+          cwd: SECONDARY_CWD,
+          timestamp: '2026-07-08T00:00:00.000Z',
+          prompt: `qdrant prompt ${index}`,
+          mtime: new Date(`2026-07-08T00:0${index}:00.000Z`),
+        });
+      }
+      const { app } = makeHarness();
+
+      const res = await request(app)
+        .get('/workspace/secondary-id/sessions/search?q=qdrant&maxResults=1')
+        .set('Host', host());
+
+      expect(res.status).toBe(200);
+      expect(res.body.results).toHaveLength(1);
+    });
+  });
+
+  it('searches session content via the plural workspace route spelling', async () => {
+    await withRuntimeDir(async () => {
+      const hitId = '550e8400-e29b-41d4-a716-446655440131';
+      await writeStoredSession({
+        sessionId: hitId,
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:00:00.000Z',
+        prompt: 'qdrant plural spelling hit',
+        mtime: new Date('2026-07-08T00:00:00.000Z'),
+      });
+      const { app } = makeHarness();
+
+      const res = await request(app)
+        .get('/workspaces/secondary-id/sessions/search?q=qdrant')
+        .set('Host', host());
+
+      expect(res.status).toBe(200);
+      expect(res.body.results).toHaveLength(1);
+      expect(res.body.results[0].session.sessionId).toBe(hitId);
+      expect(res.body.results[0].snippet).toContain('qdrant');
+    });
+  });
+
+  it('returns organization state and PR sidecar badges on search hits', async () => {
+    await withRuntimeDir(async () => {
+      const hitId = '550e8400-e29b-41d4-a716-446655440132';
+      await writeStoredSession({
+        sessionId: hitId,
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:00:00.000Z',
+        prompt: 'qdrant pinned sidecar hit',
+        mtime: new Date('2026-07-08T00:00:00.000Z'),
+      });
+      await createSessionOrganizationService(
+        SECONDARY_CWD,
+      ).updateSessionOrganization(hitId, { isPinned: true });
+      const sidecarPath = new SessionService(
+        SECONDARY_CWD,
+      ).getPrSessionPathForArchiveState(hitId, 'active');
+      await writeSessionPrs(sidecarPath, [
+        {
+          number: 9517,
+          url: 'https://github.com/o/r/pull/9517',
+          createdAt: '2026-07-08T00:00:00.000Z',
+        },
+      ]);
+      const { app } = makeHarness();
+
+      const res = await request(app)
+        .get('/workspace/secondary-id/sessions/search?q=qdrant')
+        .set('Host', host());
+
+      expect(res.status).toBe(200);
+      expect(res.body.results).toHaveLength(1);
+      expect(res.body.results[0].session.isPinned).toBe(true);
+      expect(res.body.results[0].session.prs).toEqual([
+        { number: 9517, url: 'https://github.com/o/r/pull/9517' },
+      ]);
+    });
+  });
+
+  it('caps the search query after trimming, like the matcher', async () => {
+    await withRuntimeDir(async () => {
+      const hitId = '550e8400-e29b-41d4-a716-446655440133';
+      await writeStoredSession({
+        sessionId: hitId,
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:00:00.000Z',
+        prompt: 'a'.repeat(195),
+        mtime: new Date('2026-07-08T00:00:00.000Z'),
+      });
+      const { app } = makeHarness();
+
+      // 195 meaningful chars + 6 spaces of padding: raw 201 (over the raw
+      // cap) but trimmed 195 — the scan trims too, so this must match.
+      const res = await request(app)
+        .get(
+          `/workspace/secondary-id/sessions/search?q=${'a'.repeat(195)}%20%20%20%20%20%20`,
+        )
+        .set('Host', host());
+
+      expect(res.status).toBe(200);
+      expect(res.body.results).toHaveLength(1);
+    });
+  });
+
+  it('cancels the session content scan when the HTTP client disconnects', async () => {
+    await withRuntimeDir(async () => {
+      await writeStoredSession({
+        sessionId: '550e8400-e29b-41d4-a716-446655440134',
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:00:00.000Z',
+        prompt: 'qdrant disconnect target',
+        mtime: new Date('2026-07-08T00:00:00.000Z'),
+      });
+      let markScanStarted: (() => void) | undefined;
+      const scanStarted = new Promise<void>((resolve) => {
+        markScanStarted = resolve;
+      });
+      let markScanAborted: (() => void) | undefined;
+      const scanAborted = new Promise<void>((resolve) => {
+        markScanAborted = resolve;
+      });
+      let capturedSignal: AbortSignal | undefined;
+      const spy = vi
+        .spyOn(SessionService.prototype, 'searchSessionContent')
+        .mockImplementation(async (_query, options) => {
+          capturedSignal = options?.signal;
+          markScanStarted?.();
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener(
+              'abort',
+              () => {
+                markScanAborted?.();
+                resolve();
+              },
+              { once: true },
+            );
+          });
+          return [];
+        });
+      try {
+        const { app } = makeHarness();
+        const pending = request(app)
+          .get('/workspace/secondary-id/sessions/search?q=qdrant')
+          .set('Host', host());
+        const response = pending.then(
+          () => undefined,
+          () => undefined,
+        );
+
+        await scanStarted;
+        pending.abort();
+        await Promise.all([response, scanAborted]);
+
+        expect(capturedSignal?.aborted).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   it('lists archived non-primary workspace sessions for trusted workspaces', async () => {
     await withRuntimeDir(async () => {
       const archivedId = '550e8400-e29b-41d4-a716-446655440130';
@@ -4214,6 +4603,7 @@ describe('multi-workspace session dispatch', () => {
       for (const route of [
         `/workspace/${encodeURIComponent(selector)}/sessions`,
         `/workspace/${encodeURIComponent(selector)}/session-groups`,
+        `/workspace/${encodeURIComponent(selector)}/sessions/search?q=x`,
       ]) {
         const unknown = await request(app).get(route).set('Host', host());
         expect(unknown.status).toBe(400);
@@ -4226,6 +4616,7 @@ describe('multi-workspace session dispatch', () => {
       for (const route of [
         `/workspaces/${encodeURIComponent(selector)}/sessions`,
         `/workspaces/${encodeURIComponent(selector)}/session-groups`,
+        `/workspaces/${encodeURIComponent(selector)}/sessions/search?q=x`,
       ]) {
         const unknown = await request(app).get(route).set('Host', host());
         expect(unknown.status).toBe(400);
@@ -4582,6 +4973,68 @@ describe('multi-workspace session dispatch', () => {
       expect(response.body.pageBytes).toBeGreaterThan(
         response.body.maxBytes as number,
       );
+      expect(secondaryBridge.spawnCalls).toEqual([]);
+      expect(secondaryBridge.restoreCalls).toEqual([]);
+    });
+  });
+
+  it('serves workspace-qualified turn index and anchored transcript without starting the bridge', async () => {
+    await withRuntimeDir(async () => {
+      const sessionId = '550e8400-e29b-41d4-a716-446655440282';
+      await writeStoredSession({
+        sessionId,
+        cwd: SECONDARY_CWD,
+        timestamp: '2026-07-08T00:00:00.000Z',
+        prompt: 'secondary navigation prompt',
+        mtime: new Date('2026-07-08T00:00:00.000Z'),
+      });
+      const { app, primaryBridge, secondaryBridge } = makeHarness({
+        secondaryTrusted: false,
+      });
+
+      const index = await request(app)
+        .get(`/workspaces/secondary-id/session/${sessionId}/turn-index`)
+        .set('Host', host())
+        .expect(200);
+      expect(index.body).toMatchObject({
+        totalTurns: 1,
+        start: 0,
+        turns: [
+          {
+            ordinal: 0,
+            kind: 'prompt',
+            label: 'secondary navigation prompt',
+          },
+        ],
+      });
+
+      const turnId = index.body.turns[0].turnId as string;
+      const snapshot = index.body.snapshot as string;
+      const outOfRange = await request(app)
+        .get(
+          `/workspaces/secondary-id/session/${sessionId}/turn-index?snapshot=${encodeURIComponent(snapshot)}&start=2`,
+        )
+        .set('Host', host());
+      expect(outOfRange.status).toBe(400);
+      expect(outOfRange.body.code).toBe('invalid_transcript_cursor');
+      const anchored = await request(app)
+        .get(
+          `/workspaces/secondary-id/session/${sessionId}/transcript?atRecordId=${encodeURIComponent(turnId)}&snapshot=${encodeURIComponent(snapshot)}`,
+        )
+        .set('Host', host())
+        .expect(200);
+      expect(anchored.body.targetRecordId).toBe(turnId);
+      expect(anchored.body.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            data: expect.objectContaining({
+              sessionUpdate: 'user_message_chunk',
+            }),
+          }),
+        ]),
+      );
+      expect(primaryBridge.spawnCalls).toEqual([]);
+      expect(primaryBridge.restoreCalls).toEqual([]);
       expect(secondaryBridge.spawnCalls).toEqual([]);
       expect(secondaryBridge.restoreCalls).toEqual([]);
     });

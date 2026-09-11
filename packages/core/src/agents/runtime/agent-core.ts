@@ -44,6 +44,7 @@ import {
   type ToolCallRequestInfo,
 } from '../../core/turn.js';
 import { LoopDetectionService } from '../../services/loopDetectionService.js';
+import type { LoopType } from '../../telemetry/types.js';
 import {
   CoreToolScheduler,
   type ToolCall,
@@ -220,9 +221,10 @@ export const EXCLUDED_TOOLS_FOR_SUBAGENTS: ReadonlySet<string> = new Set([
   // never enter or exit the user's worktree state independently.
   ToolNames.ENTER_WORKTREE,
   ToolNames.EXIT_WORKTREE,
-  // V1 session artifacts are owned by the parent daemon session.
+  // V1 session artifacts and sources are owned by the parent daemon session.
   ToolNames.ARTIFACT,
   ToolNames.RECORD_ARTIFACT,
+  ToolNames.RECORD_SOURCE,
   // FIX-8 (SEC-I1): WORKFLOW is excluded to prevent unbounded recursive
   // fan-out: a subagent spawned by Workflow that calls Workflow would create
   // O(k^n) subagents.
@@ -282,6 +284,7 @@ const EXCLUDED_TOOLS_FOR_TEAMMATES: ReadonlySet<string> = new Set([
   // Worktree management belongs to the parent session.
   ToolNames.ENTER_WORKTREE,
   ToolNames.EXIT_WORKTREE,
+  ToolNames.RECORD_SOURCE,
   // Same recursion guard as EXCLUDED_TOOLS_FOR_SUBAGENTS: the teammate
   // identity propagates through AsyncLocalStorage into anything it
   // spawns, so prepareTools() would keep choosing THIS exclusion set
@@ -317,6 +320,12 @@ export interface ReasoningLoopResult {
   terminateMode: AgentTerminateMode | null;
   /** Number of model round-trips completed. */
   turnsUsed: number;
+  /**
+   * Which loop detector fired, when terminateMode is LOOP_DETECTED (issue
+   * #9450 — attribution for stops that all render as one generic message
+   * otherwise). null otherwise.
+   */
+  loopType?: LoopType | null;
 }
 
 /**
@@ -382,6 +391,37 @@ export interface ExecutionStats {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
+}
+
+export function renderSubagentSystemPrompt(
+  promptConfig: PromptConfig,
+  context: ContextState,
+  runtimeContext: Config,
+  interactive?: boolean,
+): string {
+  if (!promptConfig.systemPrompt) {
+    return '';
+  }
+
+  let finalPrompt = templateString(promptConfig.systemPrompt, context);
+
+  // Only add non-interactive instructions when NOT in interactive mode
+  if (!interactive) {
+    finalPrompt += `
+
+Important Rules:
+ - You operate in non-interactive mode: do not ask the user questions; proceed with available context.
+ - Use tools only when necessary to obtain facts or make changes.
+ - When the task is complete, return the final result as a normal model response (not a tool call) and stop.`;
+  }
+
+  // Context files (QWEN.md + output-language.md) keep the subagent aligned
+  // with project conventions; the volatile auto-memory section stays last.
+  return assembleSystemPrompt({
+    base: finalPrompt,
+    contextFiles: runtimeContext.getUserMemory(),
+    autoMemory: runtimeContext.getAutoMemoryPrompt(),
+  });
 }
 
 /**
@@ -993,6 +1033,13 @@ export class AgentCore {
         } as AgentRoundEvent);
 
         const functionCalls: FunctionCall[] = [];
+        // callIds already streamed to the loop guard this attempt. Mirrors
+        // dedupeToolCallsById (which collapses execution to one call per
+        // id): a provider can emit the same call id twice in one response,
+        // and counting both emissions would leave the request counters one
+        // ahead of the executed result evidence (one recordToolResult per
+        // executed call), fail-safe-halting a productive stateful poller.
+        const loopGuardStreamedCallIds = new Set<string>();
         let roundText = '';
         let roundThoughtText = '';
         let lastUsage: GenerateContentResponseUsageMetadata | undefined =
@@ -1030,6 +1077,7 @@ export class AgentCore {
               stickyMaxOutputTokens = streamEvent.maxOutputTokensEscalated;
             }
             functionCalls.length = 0;
+            loopGuardStreamedCallIds.clear();
             roundText = '';
             roundThoughtText = '';
             lastUsage = undefined;
@@ -1111,6 +1159,17 @@ export class AgentCore {
 
             for (const fc of chunkFunctionCalls) {
               const toolName = String(fc.name);
+              // Provider-duplicate emissions of an already-streamed call id
+              // execute once (dedupeToolCallsById collapses them), so feed
+              // the loop guard once — request counts and result evidence
+              // must stay the same population. Id-less calls are never
+              // deduped, mirroring dedupeToolCallsById.
+              if (fc.id) {
+                if (loopGuardStreamedCallIds.has(fc.id)) {
+                  continue;
+                }
+                loopGuardStreamedCallIds.add(fc.id);
+              }
               if (
                 checkSubagentLoop({
                   type: LlmEventType.ToolCallRequest,
@@ -1198,6 +1257,24 @@ export class AgentCore {
           );
           if (toolCallResult.repeatedDuplicateProviderToolCall) {
             terminateMode = AgentTerminateMode.LOOP_DETECTED;
+            break;
+          }
+          // Result-aware loop guards (issue #9450): stateful reads like
+          // task_list may legitimately repeat with identical arguments while
+          // the shared task board changes, so the detector must see each
+          // executed result before the next round re-emits the call.
+          for (const toolResult of toolCallResult.results) {
+            if (
+              loopDetector.recordToolResult(
+                { name: toolResult.toolName, args: toolResult.args },
+                toolResult.responseParts,
+              )
+            ) {
+              terminateMode = AgentTerminateMode.LOOP_DETECTED;
+              break;
+            }
+          }
+          if (terminateMode === AgentTerminateMode.LOOP_DETECTED) {
             break;
           }
           currentMessages = toolCallResult.messages;
@@ -1317,6 +1394,9 @@ export class AgentCore {
       text: finalText,
       terminateMode,
       turnsUsed: turnCounter,
+      ...(terminateMode === AgentTerminateMode.LOOP_DETECTED
+        ? { loopType: loopDetector.getLastLoopType() }
+        : {}),
     };
   }
 
@@ -1625,6 +1705,14 @@ export class AgentCore {
   ): Promise<{
     messages: Content[];
     repeatedDuplicateProviderToolCall: boolean;
+    /** Executed calls with their model-visible results, in call order.
+     * Consumed by the loop detector for result-aware stateful-read guards
+     * (issue #9450). */
+    results: Array<{
+      toolName: string;
+      args: Record<string, unknown>;
+      responseParts: Part[];
+    }>;
   }> {
     const responseByCallId = new Map<
       string,
@@ -1678,6 +1766,7 @@ export class AgentCore {
       return {
         messages: [{ role: 'user', parts: [] }],
         repeatedDuplicateProviderToolCall: true,
+        results: [],
       };
     }
 
@@ -2267,9 +2356,31 @@ export class AgentCore {
       timestamp: Date.now(),
     });
 
+    // Pair each executed call with its model-visible (finalized) result so
+    // the reasoning loop can feed the loop detector's result-aware guards.
+    const finalizedByCallId = new Map(
+      finalizedResponses.map((response) => [response.callId, response]),
+    );
+    const results: Array<{
+      toolName: string;
+      args: Record<string, unknown>;
+      responseParts: Part[];
+    }> = [];
+    for (const fc of uniqueFunctionCalls) {
+      const callId = callIdByFunctionCall.get(fc) ?? fc.id ?? '';
+      const finalized = finalizedByCallId.get(callId);
+      if (!finalized) continue;
+      results.push({
+        toolName: String(fc.name ?? ''),
+        args: (fc.args ?? {}) as Record<string, unknown>,
+        responseParts: finalized.responseParts,
+      });
+    }
+
     return {
       messages: [{ role: 'user', parts: toolResponseParts }],
       repeatedDuplicateProviderToolCall: false,
+      results,
     };
   }
 
@@ -2545,29 +2656,12 @@ export class AgentCore {
     context: ContextState,
     options?: CreateChatOptions,
   ): string {
-    if (!this.promptConfig.systemPrompt) {
-      return '';
-    }
-
-    let finalPrompt = templateString(this.promptConfig.systemPrompt, context);
-
-    // Only add non-interactive instructions when NOT in interactive mode
-    if (!options?.interactive) {
-      finalPrompt += `
-
-Important Rules:
- - You operate in non-interactive mode: do not ask the user questions; proceed with available context.
- - Use tools only when necessary to obtain facts or make changes.
- - When the task is complete, return the final result as a normal model response (not a tool call) and stop.`;
-    }
-
-    // Context files (QWEN.md + output-language.md) keep the subagent aligned
-    // with project conventions; the volatile auto-memory section stays last.
-    return assembleSystemPrompt({
-      base: finalPrompt,
-      contextFiles: this.runtimeContext.getUserMemory(),
-      autoMemory: this.runtimeContext.getAutoMemoryPrompt(),
-    });
+    return renderSubagentSystemPrompt(
+      this.promptConfig,
+      context,
+      this.runtimeContext,
+      options?.interactive,
+    );
   }
 
   /**

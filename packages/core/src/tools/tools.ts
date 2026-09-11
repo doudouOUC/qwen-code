@@ -87,6 +87,13 @@ export interface ToolInvocation<
   requiresUserInteraction?(): boolean;
 
   /**
+   * Whether a host-level allow decision may be confirmed without forwarding
+   * an interaction payload. Tools that collect data through their approval
+   * surface should return false so the host-provided payload is preserved.
+   */
+  canAutoApproveOnAllow?(): boolean;
+
+  /**
    * Constructs the confirmation dialog details for this invocation.
    * Only called when the final permission decision is `'ask'` and the user
    * needs to be prompted interactively.
@@ -137,6 +144,10 @@ export abstract class BaseToolInvocation<
 
   requiresUserInteraction(): boolean {
     return false;
+  }
+
+  canAutoApproveOnAllow(): boolean {
+    return true;
   }
 
   /**
@@ -665,10 +676,13 @@ export interface AgentResultDisplay {
   taskDescription: string;
   taskPrompt: string;
   executionMode?: 'foreground' | 'background';
+  /** Whether the registered subagent session is available for inspection. */
+  subagentSessionReady?: boolean;
   status: 'running' | 'completed' | 'failed' | 'cancelled' | 'background';
   terminateReason?: string;
   result?: string;
   executionSummary?: AgentStatsSummary;
+  skills?: string[];
   /** Real-time output-token count during execution, accumulated across subagent rounds. */
   tokenCount?: number;
 
@@ -807,8 +821,15 @@ export function isTerminalImageDisplay(
   );
 }
 
+export interface AskUserQuestionResultDisplay {
+  type: 'ask_user_question_answers';
+  text: string;
+  answers: Array<{ question: string; answer: string }>;
+}
+
 export type ToolResultDisplay =
   | string
+  | AskUserQuestionResultDisplay
   | FileDiff
   | TodoResultDisplay
   | PlanResultDisplay
@@ -843,6 +864,13 @@ export interface TaskListResultDisplay {
 export interface FileDiff {
   fileDiff: string;
   fileName: string;
+  /**
+   * Full (project-relative or absolute) path to the edited file, as passed
+   * to the tool. UI consumers must prefer this over `fileName` when
+   * resolving a clickable/openable location — `fileName` is a basename and
+   * cannot be used to locate files outside the workspace root.
+   */
+  filePath?: string;
   originalContent: string | null;
   newContent: string;
   diffStat?: DiffStat;
@@ -963,6 +991,8 @@ export interface ToolEditConfirmationDetails {
 }
 
 export interface ToolConfirmationPayload {
+  /** Execution permission displayed when approving a DAC plan. */
+  expectedPlanExecutionMode?: string;
   // used to override `modifiedProposedContent` for modifiable tools in the
   // inline modify flow
   newContent?: string;
@@ -1042,7 +1072,13 @@ export interface ToolInfoConfirmationDetails {
 }
 
 export interface AutoModeFallbackConfirmation {
-  reason: 'classifier_unavailable';
+  reason:
+    | 'classifier_blocked_retry'
+    | 'classifier_unavailable'
+    | 'consecutive_block'
+    | 'consecutive_unavailable'
+    | 'total_denial'
+    | 'external_write';
   message: string;
 }
 

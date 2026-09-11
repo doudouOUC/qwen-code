@@ -62,9 +62,11 @@ export const ToolNames = {
   WORKFLOW: 'workflow',
   ARTIFACT: 'artifact',
   RECORD_ARTIFACT: 'record_artifact',
+  RECORD_SOURCE: 'record_source',
   REPORT_FINDINGS: 'report_findings',
   GET_GOAL: 'get_goal',
   UPDATE_GOAL: 'update_goal',
+  PROPOSE_GOAL: 'propose_goal',
   DISPLAY_IMAGE: 'display_image',
 } as const;
 
@@ -118,9 +120,11 @@ export const ToolDisplayNames = {
   WORKFLOW: 'Workflow',
   ARTIFACT: 'Artifact',
   RECORD_ARTIFACT: 'RecordArtifact',
+  RECORD_SOURCE: 'RecordSource',
   REPORT_FINDINGS: 'ReportFindings',
   GET_GOAL: 'Goal',
   UPDATE_GOAL: 'UpdateGoal',
+  PROPOSE_GOAL: 'ProposeGoal',
   DISPLAY_IMAGE: 'DisplayImage',
 } as const;
 

@@ -8,7 +8,7 @@ import type { ManagedChildExecutionScope } from '../tools/managed-tool-session.j
 import type { AgentHeadless } from './runtime/agent-headless.js';
 
 export function bindManagedChildExecution(
-  agent: AgentHeadless,
+  agent: Pick<AgentHeadless, 'execute'>,
   scope: ManagedChildExecutionScope,
 ): void {
   if (!scope.signal) return;
