@@ -822,6 +822,7 @@ export function isSinglePathSegment(value: string): boolean {
 
 const MANAGED_HEADER_MARKER = '"subtype":"managed_session_header_v1"';
 const MANAGED_METADATA_MARKER = '"domain":"session_metadata"';
+const MANAGED_SOURCE_MARKER = '"domain":"session_source"';
 
 function lastLineContaining(text: string, marker: string): string | undefined {
   const lines = text.split('\n');
@@ -885,6 +886,83 @@ export function readManagedSessionTitleInfoSync(
   runtimeBaseDir: string,
   scratchBuffer?: Buffer,
 ): { title?: string; source?: 'auto' | 'manual' } | undefined {
+  const found = readManagedDomainBodySync(
+    filePath,
+    runtimeBaseDir,
+    MANAGED_METADATA_MARKER,
+    scratchBuffer,
+  );
+  if (found === undefined) return undefined;
+  const body = found.body as
+    | { title?: unknown; titleSource?: unknown }
+    | undefined;
+  if (typeof body?.title !== 'string' || body.title.length === 0) return {};
+  const source =
+    body.titleSource === 'auto' || body.titleSource === 'manual'
+      ? body.titleSource
+      : undefined;
+  return { title: body.title, source };
+}
+
+/**
+ * The source a Managed session was created from, read the same way as its
+ * title: the record lives in a committed `session_source` domain body, so the
+ * legacy scan for a `session_source` line finds nothing.
+ *
+ * Returns `undefined` when the transcript is not Managed, so the caller falls
+ * back to the legacy reader, and `{}` for a Managed session with no source.
+ */
+export function readManagedSessionSourceSync(
+  filePath: string,
+  runtimeBaseDir: string,
+  scratchBuffer?: Buffer,
+): { sourceType?: string; sourceId?: string } | undefined {
+  const found = readManagedDomainBodySync(
+    filePath,
+    runtimeBaseDir,
+    MANAGED_SOURCE_MARKER,
+    scratchBuffer,
+  );
+  if (found === undefined) return undefined;
+  const payload = (
+    found.body as
+      | {
+          record?: {
+            systemPayload?: { sourceType?: unknown; sourceId?: unknown };
+          };
+        }
+      | undefined
+  )?.record?.systemPayload;
+  if (
+    typeof payload?.sourceType !== 'string' ||
+    payload.sourceType.length === 0
+  )
+    return {};
+  return {
+    sourceType: payload.sourceType,
+    ...(typeof payload.sourceId === 'string'
+      ? { sourceId: payload.sourceId }
+      : {}),
+  };
+}
+
+/**
+ * Locates the newest committed record for a domain marker and reads its body.
+ *
+ * `undefined` means the transcript carries no Managed header, which is how the
+ * callers tell "not Managed, use the legacy reader" apart from "Managed with
+ * nothing to report" (`{}`). Display stays tolerant: an unreadable body is the
+ * latter rather than a throw into the session list.
+ *
+ * Like the legacy readers this only scans the tail and head windows, so a
+ * record buried in the middle of a very long log is not found.
+ */
+function readManagedDomainBodySync(
+  filePath: string,
+  runtimeBaseDir: string,
+  marker: string,
+  scratchBuffer?: Buffer,
+): { body?: unknown } | undefined {
   let fd: number | undefined;
   try {
     const fileSize = fs.statSync(filePath).size;
@@ -916,12 +994,9 @@ export function readManagedSessionTitleInfoSync(
     const tailOffset = fileSize - tailLength;
     if (tailOffset > 0) {
       const tailBytes = fs.readSync(fd, buffer, 0, tailLength, tailOffset);
-      line = lastLineContaining(
-        buffer.toString('utf-8', 0, tailBytes),
-        MANAGED_METADATA_MARKER,
-      );
+      line = lastLineContaining(buffer.toString('utf-8', 0, tailBytes), marker);
     }
-    line ??= lastLineContaining(headText, MANAGED_METADATA_MARKER);
+    line ??= lastLineContaining(headText, marker);
     if (line === undefined) return {};
 
     const record = JSON.parse(line) as {
@@ -939,18 +1014,14 @@ export function readManagedSessionTitleInfoSync(
     ) {
       return {};
     }
-    const body = JSON.parse(
-      fs.readFileSync(
-        path.join(resourceRoot, ref.kind, ref.resourceId),
-        'utf-8',
-      ),
-    ) as { title?: unknown; titleSource?: unknown };
-    if (typeof body.title !== 'string' || body.title.length === 0) return {};
-    const source =
-      body.titleSource === 'auto' || body.titleSource === 'manual'
-        ? body.titleSource
-        : undefined;
-    return { title: body.title, source };
+    return {
+      body: JSON.parse(
+        fs.readFileSync(
+          path.join(resourceRoot, ref.kind, ref.resourceId),
+          'utf-8',
+        ),
+      ) as unknown,
+    };
   } catch {
     return {};
   } finally {

@@ -51,6 +51,7 @@ import {
   localManagedSessionKey,
   managedSessionResourceRoot,
   readLastMatchingLineFieldSync,
+  readManagedSessionSourceSync,
   readManagedSessionTitleInfoSync,
   readSessionTitleInfoFromFileSync,
   type MatchingRecordFieldReader,
@@ -2109,11 +2110,19 @@ export class SessionService {
     if (metadata.sourceType !== undefined) return metadata;
 
     const tailSource = this.readSessionSourceFromTail(filePath, tailBuffer);
-    if (tailSource.sourceType === undefined) return metadata;
-    return {
-      ...metadata,
-      ...tailSource,
-    };
+    if (tailSource.sourceType !== undefined) {
+      return { ...metadata, ...tailSource };
+    }
+    /* Only sessions without a legacy source pay for the Managed probe: a
+       Managed transcript keeps its source in a committed domain body, so
+       neither scan above can find a record for it. */
+    const managedSource = readManagedSessionSourceSync(
+      filePath,
+      this.storage.getRuntimeBaseDir(),
+      tailBuffer,
+    );
+    if (managedSource?.sourceType === undefined) return metadata;
+    return { ...metadata, ...managedSource };
   }
 
   private readSessionSourceFromTail(

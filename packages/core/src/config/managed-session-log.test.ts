@@ -570,6 +570,14 @@ describe('managed session log activation', () => {
         sourceType: 'standalone',
         sourceId: 'task-42',
       });
+
+      // The listing reads physical records and then the transcript tail, so
+      // without a Managed probe a Managed session would be listed with no
+      // creator attribution at all.
+      const listed = await fixture.config.getSessionService().listSessions();
+      const item = listed.items.find((entry) => entry.sessionId === sessionId);
+      expect(item?.sourceType).toBe('standalone');
+      expect(item?.sourceId).toBe('task-42');
     });
   });
 
