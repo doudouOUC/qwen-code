@@ -3418,6 +3418,7 @@ export class SessionTranscriptReader {
     const apiHistory = new SessionApiHistoryAccumulator();
     const resumeTokenCounts = new ResumeTokenCountsAccumulator();
     const turnState = new SessionTurnStateAccumulator(sessionId);
+    const fileHistory = new SessionFileHistoryAccumulator();
     const uiTelemetryEvents: UiEvent[] = [];
     const goalRecords: GoalRecoveryRecord[] = [];
     let attributionSnapshot: AttributionSnapshot | undefined;
@@ -3429,6 +3430,11 @@ export class SessionTranscriptReader {
       // compaction snapshot, and resets its history when it sees one, so
       // filtering by type here would rebuild history from before a compaction.
       apiHistory.add(record);
+      // Also every record, for the same reason in reverse: the file history
+      // accumulator ignores anything that is not a snapshot batch and bounds
+      // what it retains, so it folds the batches exactly as it does on a
+      // legacy transcript.
+      fileHistory.add(record);
       if (isResumeTokenCountsCandidate(record)) lastTokenCountsRecord = record;
       if (isGoalRecoveryCandidate(record)) {
         const normalized = normalizeGoalRecoveryRecord(record);
@@ -3469,6 +3475,7 @@ export class SessionTranscriptReader {
       goalRecovery,
     );
     const restoredTokenCounts = resumeTokenCounts.finish();
+    const restoredFileHistory = fileHistory.finish();
     const runtime: SessionRuntimeResumeState = {
       apiHistory: apiHistory.finish(),
       ...(restoredTokenCounts
@@ -3498,6 +3505,9 @@ export class SessionTranscriptReader {
         ? { goalRecoverySourceUuid: goalRecovery.sourceUuid }
         : {}),
       ...(goalCheckpointWindow ? { goalCheckpointWindow } : {}),
+      ...(restoredFileHistory
+        ? { fileHistorySnapshots: restoredFileHistory }
+        : {}),
       initialTurn: turnStateValue.initialTurn,
       backgroundNotificationTaskIds:
         turnStateValue.backgroundNotificationTaskIds,

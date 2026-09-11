@@ -411,6 +411,58 @@ describe('managed session log activation', () => {
     });
   });
 
+  it('carries the file history a managed session recorded', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      await recorder.recordFileHistorySnapshotBatchStrict([
+        {
+          promptId: 'prompt-1',
+          trackedFileBackups: {},
+          timestamp: new Date('2026-09-11T00:00:00.000Z'),
+        },
+      ]);
+      await recorder.recordFileHistorySnapshotBatchStrict([
+        {
+          promptId: 'prompt-2',
+          trackedFileBackups: {},
+          timestamp: new Date('2026-09-11T00:00:01.000Z'),
+        },
+      ]);
+      await fixture.config.closeSessionWriter();
+
+      // Each batch is its own committed fact, so both prompts survive a cold
+      // reopen; one folded latest-wins body would have dropped the first.
+      const projection = await fixture.config
+        .getSessionService()
+        .readRestoreProjection(sessionId, { replay: { kind: 'none' } });
+      expect(
+        projection?.runtime.fileHistorySnapshots?.map(
+          (snapshot) => snapshot.promptId,
+        ),
+      ).toEqual(['prompt-1', 'prompt-2']);
+
+      // They live in the authoritative log, not as a legacy record beside it.
+      const records = await transcriptRecords(fixture.transcriptPath);
+      expect(
+        records.filter(
+          (record) => record['subtype'] === 'file_history_snapshot',
+        ),
+      ).toEqual([]);
+      const committedDomains = records
+        .filter((record) => record['subtype'] === MANAGED_SESSION_EVENT_SUBTYPE)
+        .map((record) => record['managedSession'] as Record<string, unknown>)
+        .filter((event) => event['kind'] === 'domain.committed')
+        .map(
+          (event) =>
+            (event['payload'] as { domain?: unknown } | undefined)?.domain,
+        );
+      expect(
+        committedDomains.filter((domain) => domain === 'file_history'),
+      ).toHaveLength(2);
+    });
+  });
+
   it('navigates the turns of a managed session', async () => {
     await withWorkspace(async (activate) => {
       const fixture = await activate({ managedSessionLog: true });

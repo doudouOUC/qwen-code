@@ -347,9 +347,12 @@ describe('managed session per-kind rules', () => {
     ).toThrow(/recordRef.kind must be managed-session_metadata/);
   });
 
-  it('registers exactly the thirty v1 domains without duplicates', () => {
-    expect(MANAGED_SESSION_DOMAINS).toHaveLength(30);
-    expect(new Set(MANAGED_SESSION_DOMAINS).size).toBe(30);
+  it('registers a closed v1 domain index without duplicates', () => {
+    expect(MANAGED_SESSION_DOMAINS).toHaveLength(31);
+    expect(new Set(MANAGED_SESSION_DOMAINS).size).toBe(31);
+    // Added explicitly rather than folded into one of the history domains:
+    // file backups are their own fact with their own producer and consumer.
+    expect(MANAGED_SESSION_DOMAINS).toContain('file_history');
   });
 
   it('validates the lifecycle target state', () => {

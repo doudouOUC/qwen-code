@@ -84,6 +84,12 @@ export const MANAGED_SESSION_DOMAINS = [
   'team_plan',
   'session_message',
   'session_metadata',
+  // New to the v1 index. None of the history domains above describes the
+  // per-prompt file backups a session takes, and the rule for adding a name is
+  // an explicit schema, producer and consumer: the recorder's sink commits it,
+  // the message projection restores the original record, and the existing file
+  // history accumulator folds those records into the session's snapshots.
+  'file_history',
 ] as const;
 
 export type ManagedSessionDomain = (typeof MANAGED_SESSION_DOMAINS)[number];
@@ -94,7 +100,7 @@ export type ManagedSessionDomain = (typeof MANAGED_SESSION_DOMAINS)[number];
  * implemented or admitted, so submission is gated separately.
  */
 export const MANAGED_SESSION_ENABLED_DOMAINS: readonly ManagedSessionDomain[] =
-  ['goal_state', 'session_metadata'];
+  ['goal_state', 'session_metadata', 'file_history'];
 
 export function assertManagedSessionDomainEnabled(
   domain: ManagedSessionDomain,

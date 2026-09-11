@@ -173,7 +173,9 @@ describe('managed session record sink', () => {
 
   it('refuses shapes that have their own home and are not mapped yet', async () => {
     const harness = await createHarness();
-    const unmapped = ['file_history_snapshot'] as const;
+    // A rewind belongs to the history_rewind domain and a session source to
+    // the session sources domain; neither is routed yet, so both are refused.
+    const unmapped = ['rewind', 'session_source'] as const;
     for (const subtype of unmapped) {
       expect(harness.sink.canCarry(record({ type: 'system', subtype }))).toBe(
         false,

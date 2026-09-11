@@ -176,10 +176,11 @@ export async function readManagedSessionRecords(options: {
 /**
  * Where a whole reader-facing record lives, for the channels that carry one.
  *
- * Only the goal domain stores records; every other domain body has its own
- * shape and is not something a reader replays. A domain body is the authority's
- * envelope wrapping the content, so the record sits under its own key there,
- * unlike the event channels whose body is the record itself.
+ * The goal and file history domains are the two that store records; every other
+ * domain body has its own shape and is not something a reader replays. A domain
+ * body is the authority's envelope wrapping the content, so the record sits
+ * under its own key there, unlike the event channels whose body is the record
+ * itself.
  */
 function readerFacingBody(event: ManagedSessionEvent):
   | {
@@ -195,7 +196,8 @@ function readerFacingBody(event: ManagedSessionEvent):
     case 'context.compacted':
       return { ref: event.payload['summaryRef'], inDomainEnvelope: false };
     case 'domain.committed':
-      return event.payload['domain'] === 'goal_state'
+      return event.payload['domain'] === 'goal_state' ||
+        event.payload['domain'] === 'file_history'
         ? { ref: event.payload['recordRef'], inDomainEnvelope: true }
         : undefined;
     default:

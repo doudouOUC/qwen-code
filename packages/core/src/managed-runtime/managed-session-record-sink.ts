@@ -18,8 +18,8 @@ import type { LocalManagedSessionResourceStore } from './managed-session-resourc
  * A Managed log keeps domain content once and projects reader-facing records
  * back out of it, so a record may only be routed here if the projection can
  * reproduce it. Shapes with their own home in the event union or the domain
- * registry are routed there instead; what remains unmapped -- file history --
- * is refused until it has one.
+ * registry are routed there instead; anything still unmapped is refused rather
+ * than falling back to a direct append.
  */
 const CARRIED_SYSTEM_SUBTYPES = new Set([
   'slash_command',
@@ -74,6 +74,7 @@ export class ManagedSessionRecordSink {
       if (record.subtype === 'turn_result') return true;
       if (record.subtype === 'chat_compression') return true;
       if (record.subtype === 'goal_state') return true;
+      if (record.subtype === 'file_history_snapshot') return true;
       return (
         record.subtype !== undefined &&
         CARRIED_SYSTEM_SUBTYPES.has(record.subtype)
@@ -107,6 +108,10 @@ export class ManagedSessionRecordSink {
     }
     if (record.subtype === 'goal_state') {
       await this.commitGoalState(record);
+      return;
+    }
+    if (record.subtype === 'file_history_snapshot') {
+      await this.commitFileHistory(record);
       return;
     }
     if (record.subtype === 'turn_result') {
@@ -190,6 +195,36 @@ export class ManagedSessionRecordSink {
       // A domain record admits only a trusted entry: the update reaches the log
       // through the authorised entry, and the activation is an eligibility
       // condition rather than the author.
+      { class: 'trusted_entry' },
+    );
+  }
+
+  /**
+   * A file history batch records which backups a prompt took, so it is
+   * committed to the file history domain rather than projected as a message.
+   *
+   * Each batch is its own record instead of one folded latest-wins state: a
+   * folded body would force this writer to re-read the accumulated snapshots
+   * after every cold reopen, and a body written from partial knowledge would
+   * silently drop earlier prompts' backups. The reader folds the records with
+   * the same bounded accumulator it uses on a legacy transcript, so the
+   * restored snapshot set is identical.
+   */
+  private async commitFileHistory(record: ChatRecord): Promise<void> {
+    if (record.systemPayload === undefined) {
+      throw new ManagedSessionUnmappedRecordError(record);
+    }
+    await this.authority.commitDomainRecord(
+      {
+        operation: 'commitFileHistory',
+        commandId: `recorder:${record.uuid}`,
+        sessionKey: this.authority.sessionHeader.sessionKey,
+        contentDigest: this.authority.sessionHeader.definitionRef.digest,
+      },
+      {
+        domain: 'file_history',
+        content: { record: record as unknown as Record<string, unknown> },
+      },
       { class: 'trusted_entry' },
     );
   }
