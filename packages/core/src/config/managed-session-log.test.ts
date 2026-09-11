@@ -184,6 +184,67 @@ describe('managed session log activation', () => {
     });
   });
 
+  it('restores a managed session from its projected records', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      const recorder = fixture.config.getChatRecordingService()!;
+      recorder.recordUserMessage('first turn');
+      recorder.recordUserMessage('second turn');
+      await fixture.config.closeSessionWriter();
+
+      const service = fixture.config.getSessionService();
+      const projection = await service.readRestoreProjection(sessionId, {
+        replay: { kind: 'all', hideInheritedHistory: false },
+      });
+
+      // The replay page is the conversation, not the wrapper records.
+      expect(projection?.replay?.records.map((entry) => entry.type)).toEqual([
+        'user',
+        'user',
+      ]);
+      expect(projection?.replay?.hasMore).toBe(false);
+      expect(projection?.runtime.apiHistory.length).toBeGreaterThan(0);
+      expect(projection?.runtime.recording.executionEngine).toBe('managed');
+
+      // A record written next chains from the last thing a reader saw.
+      const records = projection!.replay!.records;
+      expect(projection?.runtime.recording.lastCompletedUuid).toBe(
+        records[records.length - 1].uuid,
+      );
+
+      const recent = await service.readRestoreProjection(sessionId, {
+        replay: { kind: 'recent', limit: 1, hideInheritedHistory: false },
+      });
+      expect(recent?.replay?.records).toHaveLength(1);
+      expect(recent?.replay?.hasMore).toBe(true);
+      expect(recent?.replay?.anchorRecordId).toBe(
+        recent?.replay?.records[0].uuid,
+      );
+    });
+  });
+
+  it('refuses to restore a managed session from another project', async () => {
+    await withWorkspace(async (activate) => {
+      const fixture = await activate({ managedSessionLog: true });
+      fixture.config.getChatRecordingService()!.recordUserMessage('first turn');
+      await fixture.config.closeSessionWriter();
+
+      const service = fixture.config.getSessionService();
+      vi.spyOn(
+        service as unknown as {
+          sessionBelongsToCurrentProject(): Promise<boolean>;
+        },
+        'sessionBelongsToCurrentProject',
+      ).mockResolvedValue(false);
+
+      await expect(
+        service.readRestoreProjection(sessionId, {
+          replay: { kind: 'all', hideInheritedHistory: false },
+        }),
+      ).rejects.toThrow();
+    });
+  });
+
   it('loads a managed session that nothing has been said in yet', async () => {
     await withWorkspace(async (activate) => {
       const first = await activate({ managedSessionLog: true });

@@ -14,7 +14,13 @@ import { Storage } from '../config/storage.js';
 import * as jsonl from '../utils/jsonl-utils.js';
 import { createDebugLogger } from '../utils/debugLogger.js';
 import { addDaemonRequestAttribute } from '../telemetry/daemon-tracing.js';
-import { readSessionTitleInfoFromFileSync } from '../utils/sessionStorageUtils.js';
+import {
+  localManagedSessionKey,
+  readManagedSessionTitleInfoSync,
+  readSessionTitleInfoFromFileSync,
+} from '../utils/sessionStorageUtils.js';
+import { readManagedSessionRecords } from '../managed-runtime/managed-session-message-projection.js';
+import { MANAGED_SESSION_HEADER_SUBTYPE } from '../managed-runtime/managed-session-records.js';
 import type { HistoryGap } from '../utils/conversation-chain.js';
 import { parseGoalStateRecordPayloadV2 } from '../goals/goal-reducer.js';
 import type { GoalStateRecordPayloadV2 } from '../goals/goal-protocol.js';
@@ -2094,6 +2100,36 @@ function selectArtifactUuids(index: TranscriptIndex): string[] {
   );
 }
 
+function indexHasManagedHeader(index: TranscriptIndex): boolean {
+  return index.physicalRecords.some(
+    (record) => record.subtype === MANAGED_SESSION_HEADER_SUBTYPE,
+  );
+}
+
+/**
+ * Builds a replay page over projected records.
+ *
+ * There is nothing to select by uuid here: the projection is already the
+ * committed history in order, so the selection is a suffix of it. Inherited
+ * history has nothing to hide either -- forking a Managed session is refused, so
+ * no record in the log belongs to another session.
+ */
+function managedReplayPage(
+  records: ChatRecord[],
+  selection: SessionRestoreReplaySelection,
+): SessionRestoreReplayPage | undefined {
+  if (selection.kind === 'none') return undefined;
+  const selected =
+    selection.kind === 'recent' ? records.slice(-selection.limit) : records;
+  const hasMore = selected.length < records.length;
+  return {
+    records: selected,
+    gaps: [],
+    hasMore,
+    ...(hasMore && selected[0] ? { anchorRecordId: selected[0].uuid } : {}),
+  };
+}
+
 export class SessionTranscriptReader {
   private readonly storage: Storage;
 
@@ -2170,6 +2206,14 @@ export class SessionTranscriptReader {
       recordRestoreStage('transcript_index', indexStartedAt);
     }
     recordRestoreIndexAttributes(index);
+    if (indexHasManagedHeader(index)) {
+      return this.readManagedRestoreProjection(
+        sessionId,
+        index,
+        options,
+        readOptions,
+      );
+    }
     const selectionStartedAt = performance.now();
     let replaySelection: ReturnType<typeof selectRestoreReplayUuids>;
     try {
@@ -2630,6 +2674,179 @@ export class SessionTranscriptReader {
     };
   }
 
+  /**
+   * Restores a Managed session from its committed events.
+   *
+   * The index locates physical records by byte offset, but a Managed log keeps
+   * the conversation in resource bodies the index cannot see, so selecting uuids
+   * from it would restore the wrapper records. The projected records are the
+   * whole history, so the accumulators run over them directly.
+   *
+   * Record shapes the sink does not yet admit -- goals, artifacts, file history,
+   * session source and session model -- cannot appear in a Managed log at all,
+   * so they are absent here by construction.
+   */
+  private async readManagedRestoreProjection(
+    sessionId: string,
+    index: TranscriptIndex,
+    options: SelectiveSessionRestoreOptions,
+    readOptions: RestoreProjectionReadOptions,
+  ): Promise<SessionRestoreProjection> {
+    const records = await this.readManagedRecords(
+      sessionId,
+      index,
+      readOptions,
+    );
+    const apiHistory = new SessionApiHistoryAccumulator();
+    const resumeTokenCounts = new ResumeTokenCountsAccumulator();
+    const turnState = new SessionTurnStateAccumulator(sessionId);
+    const uiTelemetryEvents: UiEvent[] = [];
+    let attributionSnapshot: AttributionSnapshot | undefined;
+    let lastAssistantModel: string | undefined;
+    let lastTokenCountsRecord: ChatRecord | undefined;
+    for (const record of records) {
+      turnState.addHint(getSessionTurnRecordHint(record, sessionId));
+      if (record.type !== 'system') apiHistory.add(record);
+      if (isResumeTokenCountsCandidate(record)) lastTokenCountsRecord = record;
+      if (record.subtype === 'ui_telemetry') {
+        const uiEvent = (
+          record.systemPayload as UiTelemetryRecordPayload | undefined
+        )?.uiEvent;
+        if (uiEvent) uiTelemetryEvents.push(uiEvent);
+      }
+      if (record.subtype === 'attribution_snapshot') {
+        const snapshot = (
+          record.systemPayload as AttributionSnapshotPayload | undefined
+        )?.snapshot;
+        if (snapshot && typeof snapshot === 'object') {
+          attributionSnapshot = snapshot;
+        }
+      }
+      if (
+        record.type === 'assistant' &&
+        typeof record.model === 'string' &&
+        record.model.trim()
+      ) {
+        lastAssistantModel = record.model;
+      }
+    }
+    if (lastTokenCountsRecord) resumeTokenCounts.add(lastTokenCountsRecord);
+    const persistedTitle =
+      readManagedSessionTitleInfoSync(
+        index.filePath,
+        this.storage.getRuntimeBaseDir(),
+      ) ?? {};
+    const turnStateValue = turnState.finish();
+    const restoredTokenCounts = resumeTokenCounts.finish();
+    const runtime: SessionRuntimeResumeState = {
+      apiHistory: apiHistory.finish(),
+      ...(restoredTokenCounts
+        ? { resumeTokenCounts: restoredTokenCounts }
+        : {}),
+      uiTelemetryEvents,
+      ...(attributionSnapshot ? { attributionSnapshot } : {}),
+      recording: {
+        // The projected tail, not the physical one: a new record chains from
+        // the last thing a reader saw, and the wrappers are not that.
+        lastCompletedUuid: records[records.length - 1]?.uuid ?? index.leafUuid,
+        turnParentUuids: turnStateValue.turnParentUuids,
+        ...(persistedTitle.title !== undefined
+          ? { customTitle: persistedTitle.title }
+          : {}),
+        ...(persistedTitle.source !== undefined
+          ? { titleSource: persistedTitle.source }
+          : {}),
+        ...(lastAssistantModel !== undefined ? { lastAssistantModel } : {}),
+        ...(index.executionEngine.status === 'verified' &&
+        index.executionEngine.recorded
+          ? { executionEngine: index.executionEngine.engine }
+          : {}),
+      },
+      goalRecords: [],
+      initialTurn: turnStateValue.initialTurn,
+      backgroundNotificationTaskIds:
+        turnStateValue.backgroundNotificationTaskIds,
+    };
+    const replay = managedReplayPage(records, options.replay);
+    await assertIndexSnapshotUnchanged(index, sessionId);
+    offerFreshIndexToCache(index);
+    return {
+      sessionId,
+      filePath: index.filePath,
+      startTime: index.restoreStartTime,
+      lastUpdated: index.lastUpdated,
+      runtime,
+      executionEngine: index.executionEngine,
+      ...(replay ? { replay } : {}),
+    };
+  }
+
+  /** The live counterpart, which carries the replay page only. */
+  private async readManagedLiveRestoreProjection(
+    sessionId: string,
+    index: TranscriptIndex,
+    options: SelectiveSessionRestoreOptions,
+    readOptions: RestoreProjectionReadOptions,
+  ): Promise<SessionLiveRestoreProjection> {
+    const records = await this.readManagedRecords(
+      sessionId,
+      index,
+      readOptions,
+    );
+    const replay = managedReplayPage(records, options.replay);
+    await assertIndexSnapshotUnchanged(index, sessionId);
+    offerFreshIndexToCache(index);
+    return {
+      sessionId,
+      startTime: index.restoreStartTime,
+      lastUpdated: index.lastUpdated,
+      ...(replay ? { replay } : {}),
+    };
+  }
+
+  private async readManagedRecords(
+    sessionId: string,
+    index: TranscriptIndex,
+    readOptions: RestoreProjectionReadOptions,
+  ): Promise<ChatRecord[]> {
+    // Timed as the same stage the index-based path uses for its record reads:
+    // for a Managed log the projection is that read, and leaving it untimed
+    // would blank out the daemon's restore timings for these sessions.
+    const startedAt = performance.now();
+    try {
+      // The first physical record proves which project the session belongs to.
+      // Projecting without that gate would restore another project's session.
+      let firstRecordSeen = false;
+      await forEachAggregatedRecord(
+        index,
+        [index.firstRecordUuid],
+        async (record) => {
+          if (record.uuid !== index.firstRecordUuid) return;
+          if (
+            readOptions.validateFirstRecord &&
+            !(await readOptions.validateFirstRecord(record))
+          ) {
+            throw new SessionTranscriptSnapshotUnavailableError(sessionId);
+          }
+          firstRecordSeen = true;
+        },
+      );
+      if (!firstRecordSeen) {
+        throw new SessionTranscriptSnapshotUnavailableError(sessionId);
+      }
+      return await readManagedSessionRecords({
+        transcriptPath: index.filePath,
+        runtimeBaseDir: this.storage.getRuntimeBaseDir(),
+        sessionKey: localManagedSessionKey(
+          this.storage.getProjectRoot(),
+          sessionId,
+        ),
+      });
+    } finally {
+      recordRestoreStage('selected_record_read', startedAt);
+    }
+  }
+
   async readLiveRestoreProjection(
     sessionId: string,
     options: SelectiveSessionRestoreOptions,
@@ -2682,6 +2899,14 @@ export class SessionTranscriptReader {
       recordRestoreStage('transcript_index', indexStartedAt);
     }
     recordRestoreIndexAttributes(index);
+    if (indexHasManagedHeader(index)) {
+      return this.readManagedLiveRestoreProjection(
+        sessionId,
+        index,
+        options,
+        readOptions,
+      );
+    }
     const selectionStartedAt = performance.now();
     const replaySelection = selectRestoreReplayUuids(
       index,

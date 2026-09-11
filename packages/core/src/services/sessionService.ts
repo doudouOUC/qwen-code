@@ -47,7 +47,7 @@ import {
   readManagedSessionTitleInfoSync,
   readSessionTitleInfoFromFileSync,
 } from '../utils/sessionStorageUtils.js';
-import { readManagedSessionMessages } from '../managed-runtime/managed-session-message-projection.js';
+import { readManagedSessionRecords } from '../managed-runtime/managed-session-message-projection.js';
 import { MANAGED_SESSION_HEADER_SUBTYPE } from '../managed-runtime/managed-session-records.js';
 import {
   isSessionArtifactRecord,
@@ -2663,7 +2663,7 @@ export class SessionService {
     );
     const { messages, gaps } = managed
       ? {
-          messages: await readManagedSessionMessages({
+          messages: await readManagedSessionRecords({
             transcriptPath: filePath,
             runtimeBaseDir: this.storage.getRuntimeBaseDir(),
             sessionKey: localManagedSessionKey(

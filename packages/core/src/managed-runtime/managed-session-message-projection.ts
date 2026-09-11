@@ -109,35 +109,39 @@ export class ManagedSessionMessageProjection {
       for (const event of page) {
         after = event.sequence;
         if (event.kind !== 'message.committed') continue;
-        records.push(await readMessageBody(this.resources, event.payload));
+        records.push(
+          await readRecordBody(this.resources, event.payload['contentRef']),
+        );
       }
     }
     return records;
   }
 }
 
-async function readMessageBody(
+async function readRecordBody(
   resources: LocalManagedSessionResourceStore,
-  payload: ManagedSessionEvent['payload'],
+  ref: ManagedSessionEvent['payload'][string],
 ): Promise<ChatRecord> {
   const body = await resources.read(
-    payload['contentRef'] as unknown as Parameters<
-      LocalManagedSessionResourceStore['read']
-    >[0],
+    ref as unknown as Parameters<LocalManagedSessionResourceStore['read']>[0],
   );
   return JSON.parse(body.toString('utf8')) as ChatRecord;
 }
 
 /**
- * Projects a Managed session's message history without taking the writer.
+ * Projects a Managed session's reader-facing records without taking the writer.
  *
  * Session loading runs on paths that never write, so it cannot go through the
  * authority: acquiring a lease there would fight the live writer and fail for a
  * session that is merely being read. The committed prefix is the whole history,
  * so a torn or uncommitted tail left by a crashed writer is simply not part of
  * what a reader sees.
+ *
+ * Both channels that carry a whole original record are projected, in commit
+ * order: the conversation itself, and the turn terminal states a legacy
+ * transcript would have written as `turn_result` records.
  */
-export async function readManagedSessionMessages(options: {
+export async function readManagedSessionRecords(options: {
   readonly transcriptPath: string;
   readonly runtimeBaseDir: string;
   readonly sessionKey: ManagedSessionKey;
@@ -157,8 +161,14 @@ export async function readManagedSessionMessages(options: {
   });
   const records: ChatRecord[] = [];
   for (const event of scan.events) {
-    if (event.kind !== 'message.committed') continue;
-    records.push(await readMessageBody(resources, event.payload));
+    const ref =
+      event.kind === 'message.committed'
+        ? event.payload['contentRef']
+        : event.kind === 'turn.settled'
+          ? event.payload['resultRef']
+          : undefined;
+    if (ref === undefined) continue;
+    records.push(await readRecordBody(resources, ref));
   }
   return records;
 }
