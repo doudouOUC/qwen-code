@@ -76,7 +76,6 @@ import type { FileHistorySnapshot } from './fileHistoryService.js';
 import { SessionFileHistoryAccumulator } from './session-file-history-state.js';
 import {
   SessionExecutionEngineAccumulator,
-  SessionExecutionEngineError,
   type SessionExecutionEngine,
   type SessionExecutionEngineState,
 } from './session-execution-engine.js';
@@ -408,6 +407,8 @@ interface TranscriptIndex {
   lastUpdated: string;
   byUuid: Map<string, UuidIndexEntry>;
   branchPointsByAssistantUuid: ReadonlyMap<string, string>;
+  /** Present when the index was projected rather than scanned from the file. */
+  projectedRecords?: ReadonlyMap<string, ChatRecord>;
 }
 
 interface CacheEntry {
@@ -1919,6 +1920,9 @@ async function withAggregatedRecordReadContext<T>(
     handle,
     scheduler: new CooperativeReadScheduler(),
     lineCache: {},
+    ...(index.projectedRecords
+      ? { preloadedRecords: new Map(index.projectedRecords) }
+      : {}),
   };
   try {
     return await callback(context);
@@ -1957,6 +1961,51 @@ async function readGoalStatePayloadBeforePosition(
   const uuid = index.replayUuids[goalStatePosition]!;
   const [record] = await readAggregatedRecords(index, [uuid]);
   return parseGoalStateRecordPayloadV2(record?.systemPayload);
+}
+
+/**
+ * The index entry for one record's first fragment.
+ *
+ * Shared so a projection-backed index answers navigation, goal and turn
+ * questions exactly the way the physical scanner does; two copies of this field
+ * list would drift and give a Managed session a different history than a legacy
+ * one.
+ */
+function newIndexEntry(
+  record: ChatRecord,
+  sessionId: string,
+  segments: RecordSegment[],
+  goalEvidenceAccumulator: GoalEvidenceRecordIndexAccumulator,
+): UuidIndexEntry {
+  const navigationKind = navigationKindForRecord(record);
+  return {
+    parentUuid: record.parentUuid,
+    sessionIdMatchesFile: record.sessionId === sessionId,
+    type: record.type,
+    ...(record.subtype !== undefined ? { subtype: record.subtype } : {}),
+    inherited: record.forkedFrom !== undefined,
+    sideTaskSource:
+      record.type === 'system' &&
+      record.subtype === 'session_source' &&
+      isObjectRecord(record.systemPayload) &&
+      record.systemPayload['sourceType'] === 'side_task',
+    apiHistoryCompressionCandidate: isApiHistoryCompressionCandidate(record),
+    resumeTokenCountsCandidate: isResumeTokenCountsCandidate(record),
+    attributionSnapshotCandidate: isAttributionSnapshotCandidate(record),
+    goalRecoveryCandidate: isGoalRecoveryCandidate(record),
+    goalEvidenceHint: goalEvidenceAccumulator.finish(),
+    turnHint: getSessionTurnRecordHint(record, sessionId),
+    ...(navigationKind ? { navigationKind } : {}),
+    navigationTextSuppressed:
+      record.subtype === 'cron' ||
+      projectUserTranscriptForDisplay(record).displayText !== undefined,
+    assistantPreviewCandidate: isAssistantPreviewCandidate(record),
+    ...(record.subtype === 'turn_result' &&
+    isTurnResultRecordPayload(record.systemPayload)
+      ? { turnResultPromptId: record.systemPayload.promptId }
+      : {}),
+    segments,
+  };
 }
 
 async function buildIndex(params: {
@@ -2016,11 +2065,6 @@ async function buildIndex(params: {
             firstRecordUuid = record.uuid;
             firstRecordTimestamp = record.timestamp;
           }
-          const sideTaskSource =
-            record.type === 'system' &&
-            record.subtype === 'session_source' &&
-            isObjectRecord(record.systemPayload) &&
-            record.systemPayload['sourceType'] === 'side_task';
           if (isTranscriptConversationRecord(record)) {
             appendBranchPointRecord(
               branchPointRecords,
@@ -2076,48 +2120,21 @@ async function buildIndex(params: {
               ?.addFragment(record as unknown as ChatRecord);
           } else {
             const chatRecord = record as unknown as ChatRecord;
-            const navigationKind = navigationKindForRecord(chatRecord);
-            const navigationTextSuppressed =
-              chatRecord.subtype === 'cron' ||
-              projectUserTranscriptForDisplay(chatRecord).displayText !==
-                undefined;
             const goalEvidenceAccumulator =
               new GoalEvidenceRecordIndexAccumulator(chatRecord);
-            const goalEvidenceHint = goalEvidenceAccumulator.finish();
-            if (goalEvidenceHint.provenance) {
+            const entry = newIndexEntry(
+              chatRecord,
+              sessionId,
+              [segment],
+              goalEvidenceAccumulator,
+            );
+            if (entry.goalEvidenceHint.provenance) {
               goalEvidenceAccumulators.set(
                 record.uuid,
                 goalEvidenceAccumulator,
               );
             }
-            byUuid.set(record.uuid, {
-              parentUuid: record.parentUuid,
-              sessionIdMatchesFile: record.sessionId === sessionId,
-              type: record.type,
-              ...(record.subtype !== undefined
-                ? { subtype: record.subtype }
-                : {}),
-              inherited: record.forkedFrom !== undefined,
-              sideTaskSource,
-              apiHistoryCompressionCandidate:
-                isApiHistoryCompressionCandidate(chatRecord),
-              resumeTokenCountsCandidate:
-                isResumeTokenCountsCandidate(chatRecord),
-              attributionSnapshotCandidate:
-                isAttributionSnapshotCandidate(chatRecord),
-              goalRecoveryCandidate: isGoalRecoveryCandidate(chatRecord),
-              goalEvidenceHint,
-              turnHint: getSessionTurnRecordHint(chatRecord, sessionId),
-              ...(navigationKind ? { navigationKind } : {}),
-              navigationTextSuppressed,
-              assistantPreviewCandidate:
-                isAssistantPreviewCandidate(chatRecord),
-              ...(record.subtype === 'turn_result' &&
-              isTurnResultRecordPayload(record.systemPayload)
-                ? { turnResultPromptId: record.systemPayload.promptId }
-                : {}),
-              segments: [segment],
-            });
+            byUuid.set(record.uuid, entry);
           }
         }
       },
@@ -2669,6 +2686,82 @@ function managedNavigationTurns(
     }
   }
   return turns;
+}
+
+/**
+ * An index over projected records, shaped like the physical one.
+ *
+ * Selection, navigation anchors, goal positions and branch points all read the
+ * index rather than the file, so giving the projection the same shape is what
+ * lets paging work on a Managed log without a second copy of those rules. The
+ * snapshot identity stays the physical one: the turn reader issues snapshots
+ * from it, and a client anchors a page with them.
+ */
+function managedPageIndex(
+  index: TranscriptIndex,
+  records: ChatRecord[],
+): TranscriptIndex {
+  const sessionId = path.basename(index.filePath, '.jsonl');
+  const byUuid = new Map<string, UuidIndexEntry>();
+  const branchPointRecords = new Map<string, BranchPointRecord>();
+  const goalStatePositions: number[] = [];
+  const projectedRecords = new Map<string, ChatRecord>();
+  for (const [position, record] of records.entries()) {
+    if (record.sessionId !== sessionId) {
+      debugLogger.warn(
+        `transcript session mismatch session=${sessionId} uuid=${record.uuid}`,
+      );
+      throw new SessionTranscriptSnapshotUnavailableError(sessionId);
+    }
+    // The projection is already the whole record, so the segment carries no
+    // offset to read from; its length is what the page byte budget measures.
+    const entry = newIndexEntry(
+      record,
+      sessionId,
+      [
+        {
+          offset: 0,
+          length: Buffer.byteLength(JSON.stringify(record), 'utf8'),
+          sequence: position,
+          fragmentIndex: 0,
+        },
+      ],
+      new GoalEvidenceRecordIndexAccumulator(record),
+    );
+    byUuid.set(record.uuid, entry);
+    projectedRecords.set(record.uuid, record);
+    appendBranchPointRecord(branchPointRecords, record);
+    if (entry.type === 'system' && entry.subtype === 'goal_state') {
+      goalStatePositions.push(position);
+    }
+  }
+  const navigationTurns = managedNavigationTurns(records);
+  for (const [ordinal, turn] of navigationTurns.entries()) {
+    byUuid.get(turn.turnId)!.navigationOrdinal = ordinal;
+  }
+  const replayUuids = records.map((record) => record.uuid);
+  return {
+    ...index,
+    runtimeUuids: replayUuids,
+    replayUuids,
+    navigationTurns,
+    goalStatePositions,
+    // The committed prefix is contiguous by construction, so a projected page
+    // never reports a hole the way a broken physical chain does.
+    gaps: [],
+    byUuid,
+    branchPointsByAssistantUuid: new Map(
+      [
+        ...resolveBranchPoints(
+          replayUuids.flatMap((uuid) => {
+            const record = branchPointRecords.get(uuid);
+            return record ? [record] : [];
+          }),
+        ).values(),
+      ].map((point) => [point.assistantRecordUuid, point.checkpointUuid]),
+    ),
+    projectedRecords,
+  };
 }
 
 export class SessionTranscriptReader {
@@ -3854,7 +3947,7 @@ export class SessionTranscriptReader {
       throw new SessionTranscriptSnapshotUnavailableError(sessionId);
     }
 
-    const index = await getCachedIndex({
+    const physicalIndex = await getCachedIndex({
       filePath,
       fileIdentity,
       snapshotSize,
@@ -3863,16 +3956,16 @@ export class SessionTranscriptReader {
         snapshot?.lastUpdated ??
         new Date(stats.mtimeMs).toISOString(),
     });
-    // The index is built from the physical lines, which in a Managed log are
-    // the authority's wrapper records — paging it would hand a client those
-    // envelopes as if they were the conversation. Refuse until this reader can
-    // page the projection, the way the restore and turn readers already do.
-    if (indexHasManagedHeader(index)) {
-      throw new SessionExecutionEngineError(
-        sessionId,
-        'paged transcript reads are not implemented for the managed engine',
-      );
-    }
+    // The physical lines of a Managed log are the authority's wrapper records,
+    // so paging that index would hand a client those envelopes as if they were
+    // the conversation. Page the projection instead, the way the restore and
+    // turn readers already read it.
+    const index = indexHasManagedHeader(physicalIndex)
+      ? managedPageIndex(
+          physicalIndex,
+          await this.readManagedRecords(sessionId, physicalIndex, {}),
+        )
+      : physicalIndex;
     const frozenLeafUuid = cursor?.leafUuid ?? snapshot?.leafUuid;
     if (frozenLeafUuid !== undefined && frozenLeafUuid !== index.leafUuid) {
       debugLogger.warn(

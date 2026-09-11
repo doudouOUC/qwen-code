@@ -12,8 +12,12 @@ import { Config, type ConfigParameters } from './config.js';
 import { CompressionStatus } from '../core/turn.js';
 import { buildGoalEvidenceCheckpointWindow } from '../goals/goal-evidence.js';
 import { Storage } from './storage.js';
+import type { ChatRecord } from '../services/chatRecordingService.js';
 import { getSessionWriterLockPath } from '../services/session-writer-lease.js';
-import { SessionTranscriptReader } from '../services/session-transcript-reader.js';
+import {
+  encodeSessionTranscriptCursor,
+  SessionTranscriptReader,
+} from '../services/session-transcript-reader.js';
 import { readManagedSessionRecords } from '../managed-runtime/managed-session-message-projection.js';
 import {
   MANAGED_SESSION_COMMIT_SUBTYPE,
@@ -405,6 +409,13 @@ describe('managed session log activation', () => {
       expect(loaded?.conversation.messages).toEqual([]);
       expect(loaded?.lastCompletedUuid).toBeNull();
 
+      // A client opening the same session pages it before anything is said.
+      const page = await new SessionTranscriptReader(
+        first.config.getTargetDir(),
+      ).readPage(sessionId, { limit: 10 });
+      expect(page.records).toEqual([]);
+      expect(page.hasMore).toBe(false);
+
       const second = await activate({ managedSessionLog: true });
       second.config.getChatRecordingService()!.recordUserMessage('first turn');
       await second.config.closeSessionWriter();
@@ -623,22 +634,104 @@ describe('managed session log activation', () => {
     });
   });
 
-  it('refuses to page a managed session instead of serving its wrappers', async () => {
+  it('pages a managed session from its projection', async () => {
     await withWorkspace(async (activate) => {
       const fixture = await activate({ managedSessionLog: true });
       const recorder = fixture.config.getChatRecordingService()!;
+      const cursor = recorder.getBranchCheckpointCursor();
       recorder.recordUserMessage('first turn');
+      recorder.recordAssistantTurn({
+        model: 'qwen3-coder-plus',
+        message: [{ text: 'first reply' }],
+      });
+      const point = await recorder.recordBranchCheckpointTransaction({
+        cursor,
+        stopReason: 'end_turn',
+      });
       recorder.recordUserMessage('second turn');
       await fixture.config.closeSessionWriter();
 
-      // Without the guard this returned ten `system` records — the authority's
-      // wrappers — which a client would render as the conversation.
-      await expect(
-        new SessionTranscriptReader(fixture.config.getTargetDir()).readPage(
-          sessionId,
-          { limit: 10 },
+      // Without projection-backed paging this handed the client the authority's
+      // wrapper records as if they were the conversation.
+      const workspaceCwd = fixture.config.getTargetDir();
+      const reader = new SessionTranscriptReader(workspaceCwd);
+      const first = await reader.readPage(sessionId, { limit: 2 });
+      expect(first.records.map((item) => item.type)).toEqual([
+        'user',
+        'assistant',
+      ]);
+      expect(first.hasMore).toBe(true);
+      expect(first.branchPointsByAssistantUuid).toEqual({
+        [first.records[1].uuid]: point!.checkpointUuid,
+      });
+
+      const second = await reader.readPage(sessionId, {
+        cursor: encodeSessionTranscriptCursor(
+          first.nextCursorState!,
+          workspaceCwd,
         ),
-      ).rejects.toThrow(/managed engine/);
+        limit: 2,
+      });
+      expect(second.records.map((item) => [item.type, item.subtype])).toEqual([
+        ['system', 'branch_checkpoint'],
+        ['user', undefined],
+      ]);
+      expect(second.records[1].message?.parts?.[0]?.text).toBe('second turn');
+      expect(second.hasMore).toBe(false);
+
+      // The turn index issues the snapshot a client anchors with, so both
+      // readers have to accept the same identity.
+      const turns = await reader.readTurnIndexPage(sessionId);
+      const anchored = await reader.readPage(sessionId, {
+        snapshot: turns.snapshot,
+        atRecordId: turns.turns[1].turnId,
+        limit: 1,
+      });
+      expect(anchored.targetRecordId).toBe(turns.turns[1].turnId);
+      expect(
+        anchored.records.map((item) => item.message?.parts?.[0]?.text),
+      ).toEqual(['second turn']);
+      expect(anchored.hasOlder).toBe(true);
+
+      // The projected segment length is what the byte budget measures, so a
+      // tiny budget still has to return the one record a page cannot split.
+      const budgeted = await reader.readPage(sessionId, {
+        limit: 10,
+        maxBytes: 1,
+      });
+      expect(budgeted.records).toHaveLength(1);
+      expect(budgeted.hasMore).toBe(true);
+
+      // Turn status resolution pages backward and chains the cursor, so the
+      // chain has to cover the whole projection in order.
+      const backward: ChatRecord[][] = [];
+      let backwardCursor: string | undefined;
+      for (let request = 0; request < 10; request++) {
+        const page = await reader.readPage(sessionId, {
+          ...(backwardCursor === undefined
+            ? { direction: 'backward' as const }
+            : { cursor: backwardCursor }),
+          limit: 2,
+        });
+        backward.unshift(page.records);
+        if (!page.hasMore || page.nextCursorState === undefined) break;
+        backwardCursor = encodeSessionTranscriptCursor(
+          page.nextCursorState,
+          workspaceCwd,
+        );
+      }
+      const projected = await reader.readPage(sessionId, { limit: 10 });
+      expect(backward.flat().map((item) => item.uuid)).toEqual(
+        projected.records.map((item) => item.uuid),
+      );
+
+      const before = await reader.readPage(sessionId, {
+        beforeRecordId: projected.records[3].uuid,
+        limit: 10,
+      });
+      expect(before.records.map((item) => item.uuid)).toEqual(
+        projected.records.slice(0, 3).map((item) => item.uuid),
+      );
     });
   });
 
