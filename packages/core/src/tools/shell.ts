@@ -2970,6 +2970,18 @@ export class ShellToolInvocation extends BaseToolInvocation<
     let persistedOutputFiles: string[] | undefined;
     let outputBudgetApplied = false;
 
+    // The advisory and attribution warning are appended after the truncation
+    // below (deliberately outside the truncation envelope — see the append
+    // site), so their size comes out of the body budget here: the marker
+    // asserts the ASSEMBLED string fits the declared budget, and a body that
+    // fits whole must still fit once they land.
+    const longRunHint = shouldAppendLongRunHint
+      ? buildLongRunningForegroundHint(elapsedMs)
+      : null;
+    const appendedMetadataChars =
+      (longRunHint ? longRunHint.length + 2 : 0) +
+      (attributionWarning ? attributionWarning.length + 2 : 0);
+
     // Truncate large output and save full content to a temp file.
     if (typeof llmContent === 'string') {
       const originalLlmContent = llmContent;
@@ -2978,8 +2990,9 @@ export class ShellToolInvocation extends BaseToolInvocation<
         this.config,
         ShellTool.Name,
         llmContent,
-        // Per-tool char budget; mirrors ShellTool.maxOutputChars. keep='both'
-        // preserves the command's start AND its trailing exit/error summary
+        // Per-tool char budget: ShellTool.maxOutputChars minus the metadata
+        // reserved above. keep='both' preserves the command's start AND its
+        // trailing exit/error summary
         // (where shell failures report). Kept in-tool (not deferred to the
         // scheduler) so the long-run hint below is appended OUTSIDE the
         // truncation envelope; the scheduler's sentinel makes its later pass a
@@ -2987,8 +3000,8 @@ export class ShellToolInvocation extends BaseToolInvocation<
         // cap can't undercut the effective Shell char budget — many short lines
         // (e.g. `find /`, `ls -R`) would otherwise truncate while chars remain.
         {
-          threshold: outputThreshold,
-          previewChars: Math.min(4000, outputThreshold),
+          threshold: outputThreshold - appendedMetadataChars,
+          previewChars: Math.min(4000, outputThreshold - appendedMetadataChars),
           keep: 'both',
           lines: Number.POSITIVE_INFINITY,
         },
@@ -3016,9 +3029,6 @@ export class ShellToolInvocation extends BaseToolInvocation<
     // header (which the LLM might misread as part of the command's own
     // output). The hint is process metadata about the command, not
     // command output, so it belongs outside the truncation envelope.
-    const longRunHint = shouldAppendLongRunHint
-      ? buildLongRunningForegroundHint(elapsedMs)
-      : null;
     if (longRunHint) {
       if (typeof llmContent === 'string') {
         llmContent += `\n\n${longRunHint}`;

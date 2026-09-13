@@ -2866,13 +2866,14 @@ describe('CoreToolScheduler', () => {
 
   function outputOfFirstCall(
     onAllToolCallsComplete: ReturnType<typeof vi.fn>,
+    key: 'output' | 'error' = 'output',
   ): string {
     const completionCalls = onAllToolCallsComplete.mock
       .calls as unknown as Array<[ToolCall[]]>;
     const call = completionCalls[0]?.[0]?.[0];
     return call && 'response' in call
       ? ((call.response.responseParts[0]?.functionResponse?.response?.[
-          'output'
+          key
         ] as string) ?? '')
       : '';
   }
@@ -3737,19 +3738,6 @@ describe('CoreToolScheduler', () => {
     // bounded twice under two different policies.
     const BODY = 'a'.repeat(29_000);
 
-    function errorOfFirstCall(
-      onAllToolCallsComplete: ReturnType<typeof vi.fn>,
-    ): string {
-      const completionCalls = onAllToolCallsComplete.mock
-        .calls as unknown as Array<[ToolCall[]]>;
-      const call = completionCalls[0]?.[0]?.[0];
-      return call && 'response' in call
-        ? ((call.response.responseParts[0]?.functionResponse?.response?.[
-            'error'
-          ] as string) ?? '')
-        : '';
-    }
-
     async function runBudgetedTool(result: Partial<ToolResult>) {
       const execute = vi.fn().mockResolvedValue({
         returnDisplay: 'x',
@@ -3808,6 +3796,11 @@ describe('CoreToolScheduler', () => {
       const output = outputOfFirstCall(onAllToolCallsComplete);
       expect(output).not.toBe(BODY);
       expect(output.length).toBeLessThan(BODY.length);
+      // Positive anchor: a degenerate '' from a blinded reader must not
+      // satisfy this control.
+      expect(output).toContain(
+        'Tool output was too large and has been truncated',
+      );
     });
 
     it('skips the error gate while error.message is still the sized body', async () => {
@@ -3817,7 +3810,7 @@ describe('CoreToolScheduler', () => {
         outputBudgetApplied: true,
       });
 
-      expect(errorOfFirstCall(onAllToolCallsComplete)).toBe(BODY);
+      expect(outputOfFirstCall(onAllToolCallsComplete, 'error')).toBe(BODY);
     });
 
     // Spawn/setup failures build `error.message` separately, so the marker on
@@ -3830,9 +3823,117 @@ describe('CoreToolScheduler', () => {
         outputBudgetApplied: true,
       });
 
-      const error = errorOfFirstCall(onAllToolCallsComplete);
+      const error = outputOfFirstCall(onAllToolCallsComplete, 'error');
       expect(error).not.toBe(separateMessage);
       expect(error.length).toBeLessThan(separateMessage.length);
+      // Positive anchor: a degenerate '' from a blinded reader must not
+      // satisfy this control.
+      expect(error).toContain(
+        'Tool output was too large and has been truncated',
+      );
+    });
+
+    // The timeout branch stands the generic gate down for a marked body, so
+    // a marked detail that fits the producer's budget must arrive whole —
+    // this is the window the marker exists to keep open.
+    it('delivers a marked timeout detail whole', async () => {
+      const onAllToolCallsComplete = await runBudgetedTool({
+        llmContent: BODY,
+        outputBudgetApplied: true,
+        error: {
+          message: 'Command timed out before it could complete.',
+          type: ToolErrorType.EXECUTION_TIMEOUT,
+        },
+      });
+
+      // The timeout detail travels as the response's error field; the
+      // operational error.message stays the short summary by design.
+      expect(outputOfFirstCall(onAllToolCallsComplete, 'error')).toBe(BODY);
+    });
+
+    // Control for the case above: an unmarked timeout detail of the same size
+    // is still spilled by the generic gate.
+    it('spills an unmarked timeout detail', async () => {
+      const onAllToolCallsComplete = await runBudgetedTool({
+        llmContent: BODY,
+        error: {
+          message: 'Command timed out before it could complete.',
+          type: ToolErrorType.EXECUTION_TIMEOUT,
+        },
+      });
+
+      const error = outputOfFirstCall(onAllToolCallsComplete, 'error');
+      expect(error).not.toBe(BODY);
+      expect(error.length).toBeLessThan(BODY.length);
+      expect(error).toContain(
+        'Tool output was too large and has been truncated',
+      );
+    });
+
+    // The timeout branch has no combined pass behind it, so a marked detail
+    // that EXCEEDS the producer's declared budget is re-bounded at that
+    // budget — the marker is a sizing claim, not an unlimited exemption.
+    it('re-bounds a marked timeout detail at the producer budget', async () => {
+      const onAllToolCallsComplete = await runBudgetedTool({
+        llmContent: 'a'.repeat(200_000),
+        outputBudgetApplied: true,
+        error: {
+          message: 'Command timed out before it could complete.',
+          type: ToolErrorType.EXECUTION_TIMEOUT,
+        },
+      });
+
+      const error = outputOfFirstCall(onAllToolCallsComplete, 'error');
+      expect(error).toContain(
+        'Tool output was too large and has been truncated',
+      );
+      // The pass keeps head+tail inside the 30k producer budget; the envelope
+      // around the preview needs room, so pin an upper bound above 30k.
+      expect(error.length).toBeLessThanOrEqual(31_000);
+
+      // The spill file the bound produced must survive into the recorded
+      // call, not be dropped by the timeout branch's plumbing.
+      const completionCalls = onAllToolCallsComplete.mock
+        .calls as unknown as Array<[ToolCall[]]>;
+      const call = completionCalls[0]?.[0]?.[0];
+      expect(
+        call && 'response' in call
+          ? call.response.persistedOutputFiles
+          : undefined,
+      ).toHaveLength(1);
+    });
+
+    // The error gate stands down only while error.message IS the marked body.
+    // Without the marker the identity alone must not exempt it — producers
+    // like tool-registry build identical message/body pairs with no sizing.
+    it('keeps the error gate for an identical error.message without the marker', async () => {
+      const onAllToolCallsComplete = await runBudgetedTool({
+        llmContent: BODY,
+        error: { message: BODY },
+      });
+
+      const error = outputOfFirstCall(onAllToolCallsComplete, 'error');
+      expect(error).not.toBe(BODY);
+      expect(error.length).toBeLessThan(BODY.length);
+      expect(error).toContain(
+        'Tool output was too large and has been truncated',
+      );
+    });
+
+    // The per-tool pass is the single authority for a marked body on the
+    // success path: a marked body that exceeds the producer's declared budget
+    // is still bounded there, so the marker cannot skip both bounds.
+    it('re-bounds a marked success body at the producer budget', async () => {
+      const onAllToolCallsComplete = await runBudgetedTool({
+        llmContent: 'a'.repeat(200_000),
+        outputBudgetApplied: true,
+      });
+
+      const output = outputOfFirstCall(onAllToolCallsComplete);
+      expect(output).toContain(
+        'Tool output was too large and has been truncated',
+      );
+      expect(output.length).toBeLessThanOrEqual(31_000);
     });
   });
 

@@ -6102,12 +6102,61 @@ export class CoreToolScheduler {
         }
 
         if (isTimeout) {
-          const timeoutContent = await this.maybePersistLargeToolResult(
-            callId,
-            toolName,
-            toolResult.llmContent,
-            toolResult.outputBudgetApplied === true,
-          );
+          // The generic gate stands down for a marked body; bound the timeout
+          // detail at the producer's own declared budget instead — char-only,
+          // mirroring the success path's per-tool pass. An honest producer is
+          // a no-op under its own budget; anything appended after the mark
+          // stays bounded. A marked producer with no declared budget keeps
+          // the stand-down (it claims the sizing decision for itself).
+          const markedProducerBudget =
+            toolResult.outputBudgetApplied === true
+              ? scheduledCall.tool.maxOutputChars
+              : undefined;
+          let timeoutContent: {
+            content: PartListUnion;
+            persistedOutputFiles?: string[];
+          };
+          if (markedProducerBudget !== undefined) {
+            try {
+              const truncated = await truncateLlmContent(
+                this.config,
+                toolName,
+                toolResult.llmContent,
+                {
+                  threshold: markedProducerBudget,
+                  lines: Number.POSITIVE_INFINITY,
+                  keep: scheduledCall.tool.truncateKeep,
+                },
+                scheduledCall.request.prompt_id,
+              );
+              timeoutContent = {
+                content: truncated.content,
+                persistedOutputFiles: truncated.outputFile
+                  ? [truncated.outputFile]
+                  : truncated.content !== toolResult.llmContent
+                    ? []
+                    : undefined,
+              };
+            } catch (truncErr) {
+              // A truncation/IO failure must never demote the result — keep
+              // the detail and warn, same as the success-path pass.
+              debugLogger.warn(
+                `TRUNCATION (timeout detail) failed for ${toolName}: ${
+                  truncErr instanceof Error
+                    ? truncErr.message
+                    : String(truncErr)
+                }`,
+              );
+              timeoutContent = { content: toolResult.llmContent };
+            }
+          } else {
+            timeoutContent = await this.maybePersistLargeToolResult(
+              callId,
+              toolName,
+              toolResult.llmContent,
+              toolResult.outputBudgetApplied === true,
+            );
+          }
           let responseParts = convertToFunctionErrorResponse(
             toolName,
             callId,
