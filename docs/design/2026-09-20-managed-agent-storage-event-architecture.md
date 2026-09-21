@@ -4,6 +4,8 @@
 
 Status: proposed architecture, with P0, the SQL-backed P1 materialization slice, and the P2 SQL delivery-claim slice implemented on this branch. Date: 2026-09-21. This design uses the integration snapshot below; it does not claim production validation of the complete architecture.
 
+The [tool-result and durable-artifact design](managed-agent-tool-result-artifacts.md) specifies full-byte capture, private/model/public representations, receipt ACK, bounded reads, WebShell presentation, and reference-aware retention. Those capabilities remain proposed; the existing SQL batch journal stores public projections, not complete native tool results.
+
 ## 1. Decisions
 
 Keep the WebShell → Java control plane → Hosted Harness → Runtime Broker → Tool-only Runtime responsibilities. Harness runs the Qwen Agent loop; Java owns admission, state, event projection, and client APIs; Runtime owns tools and the workspace. Model inference and Runtime warmup remain concurrent, with a wait only when an actual tool call needs Runtime.

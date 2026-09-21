@@ -4,6 +4,8 @@
 
 状态：总体架构仍为提议；本分支已实现 P0、基于 SQL 的 P1 物化切片，以及 P2 SQL 投递认领切片。日期：2026-09-21。本文按下面的集成代码快照设计，不表示完整架构已经通过生产验收。
 
+[完整工具结果与持久产物专项](managed-agent-tool-result-artifacts.zh-CN.md)规定完整 bytes 捕获、私有/模型/公开表示、回执 ACK、有界读取、WebShell 展示和引用感知保留。这些能力仍为提案；现有 SQL 批次日志保存公开投影，不等于完整原生工具结果。
+
 ## 1. 决策
 
 保留 WebShell → Java 控制面 → Hosted Harness → Runtime Broker → Tool-only Runtime 的分工。Harness 运行 Qwen Agent 循环，Java 负责准入、状态、事件投影和客户端接口，Runtime 负责工具与工作区。模型推理与 Runtime 预热仍并行，实际调用工具时才等待 Runtime。
