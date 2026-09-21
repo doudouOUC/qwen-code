@@ -2,12 +2,12 @@ package com.alibaba.qwen.code.managedagent.store;
 
 import com.alibaba.qwen.code.managedagent.store.StoreModels.Admission;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.CommandRecord;
+import com.alibaba.qwen.code.managedagent.store.StoreModels.DeliveryClaim;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.DispatchTarget;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.EventPage;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.EventRecord;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.HarnessEvent;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.MaterializationResult;
-import com.alibaba.qwen.code.managedagent.store.StoreModels.MaterializationTarget;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.SessionPage;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.SessionRecord;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.SnapshotRecord;
@@ -18,6 +18,8 @@ import java.util.Map;
 import java.util.Optional;
 
 public interface AgentStateStore {
+    String MESSAGE_PROJECTION = "message_projection";
+
     Admission insertSessionCommand(String tenantId, String operation,
             String idempotencyKey, String requestDigest, String agentId,
             String title, List<Map<String, Object>> input,
@@ -61,10 +63,13 @@ public interface AgentStateStore {
     Optional<SnapshotRecord> findSnapshot(String tenantId,
             String sessionId);
 
-    List<MaterializationTarget> findMaterializationTargets(int limit);
+    List<DeliveryClaim> claimDeliveries(String consumerName, String owner,
+            Duration leaseDuration, int limit);
 
-    MaterializationResult materializeNextBatch(String tenantId,
-            String sessionId, int limit);
+    MaterializationResult materializeDelivery(DeliveryClaim claim);
+
+    boolean retryDelivery(DeliveryClaim claim, Duration delay,
+            String errorCode);
 
     List<DispatchTarget> findDispatchable(long now, int limit);
 

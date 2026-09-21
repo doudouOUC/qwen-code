@@ -2,7 +2,7 @@
 
 [English](2026-09-20-managed-agent-storage-event-architecture.md) | [简体中文](2026-09-20-managed-agent-storage-event-architecture.zh-CN.md)
 
-状态：总体架构仍为提议；本分支已实现 P0 和基于 SQL 的 P1 物化切片。日期：2026-09-20。本文按下面的集成代码快照设计，不表示完整架构已经通过生产验收。
+状态：总体架构仍为提议；本分支已实现 P0、基于 SQL 的 P1 物化切片，以及 P2 SQL 投递认领切片。日期：2026-09-21。本文按下面的集成代码快照设计，不表示完整架构已经通过生产验收。
 
 ## 1. 决策
 
@@ -16,25 +16,25 @@
 
 本文随下述首批表结构和 SDK 集成一同更新，但不承诺任意模型 token 位置恢复、工具恰好执行一次、数据库在线热切换或所有 MQ 功能完全等价。
 
-当前实现切片已经加入 `AgentStateStore`、有界 Harness 事件批处理、稳定 Item/Part 身份、游标/序号/终态单事务更新，以及提交后的本机 SSE 直推与持久化补发。Flyway V2 新增 Item、Item Part、Snapshot 和消费进度表；SQL 扫描器按连续事件前缀在同一事务中更新物化内容、Snapshot 与进度，WebShell 读取一致 Snapshot、控制事件和未物化尾部。为保持兼容，目前每个公开事件仍保留一条 SQL 记录。批次日志/Outbox、保留清理、外部 EventTransport、PostgreSQL 适配器、多实例唤醒和 Harness/Runtime 持久恢复仍是后续工作。
+当前实现已经加入 `AgentStateStore`、有界 Harness 事件批处理、稳定 Item/Part 身份、游标/序号/终态单事务更新，以及提交后的本机 SSE 直推与持久化补发。Flyway V2 新增 Item、Item Part、Snapshot 和消费进度表；Flyway V4 新增 SQL 批次日志和按消费者持久化的投递任务。SQL 物化器用带 fencing 的租约认领任务，应用一个精确连续批次，并把 Item/Snapshot/进度与投递完成放在同一事务提交。WebShell 读取一致 Snapshot、控制事件和未物化尾部。过渡期仍为每个公开事件保留一条 SQL 记录，同时保存批次正文。保留清理、外部 EventTransport、PostgreSQL 适配器、多实例唤醒和 Harness/Runtime 持久恢复仍是后续工作。
 
 ## 2. 核实的代码基线
 
-集成基线为分支 `feature/managed-agents-p0-p8`、提交 `fc32ab0c9502a0b44020ef1a66c88e9b3a2a1484`。上面说明的 P0/P1 切片已在该基线之后提交到同一分支。下列路径均指这一分支快照。
+集成基线为分支 `feature/managed-agents-p0-p8`、提交 `51cb9977f8b165b08e16757343017266fa95cac6`。P2 投递切片实现在该快照之上。下列路径均指这一分支快照。
 
 Java 服务源码根目录为 `packages/sdk-java/managed-agent-server/src/main/java/com/alibaba/qwen/code/managedagent/`。
 
-| 位置                                                                                               | 当前行为及设计影响                                                                                                 |
-| -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `store/ManagedAgentStore.java`                                                                     | 具体的 JDBC 类；事务同时维护命令幂等、Turn、源游标和公开事件，不能拆成互不相关的 CRUD 接口。                       |
-| `service/HarnessCoordinator.java`                                                                  | 消费 Harness SSE；按 `bootId:eventEpoch:eventId` 去重并提交有界源事件批次；还有 Java 产生的 Runtime 状态事件。     |
-| `service/HarnessEventProjector.java`                                                               | 文本与工具投影已有确定性的 Item/Part 身份，并继续使用明确的公开字段白名单。                                        |
-| `service/ManagedEventStreamService.java`                                                           | 实时路径使用提交后本机通知，缺口与重连通过周期 SQL 核对；浏览器不直接访问数据库。                                  |
-| `service/ManagedAgentService.java`                                                                 | Transcript 读取最新物化 Snapshot、保留的控制事件和 `coveredSequence` 后的尾部；Snapshot 尚未产生时兼容旧事件分页。 |
-| `harness/HarnessConnector.java`                                                                    | 已有连接器接口，可复用；当前包含提交、SSE、取消和启动代际信息。                                                    |
-| `src/main/resources/db/migration/V1__managed_agent_core.sql` 与 `V2__managed_agent_projection.sql` | V1 包含 Session、Turn、Command、Event；V2 增加 Item、Item Part、Snapshot 和投影进度，批次日志/Outbox 尚未实现。    |
-| `packages/sdk-java/runtime-broker/`                                                                | 已有三个 Repository 接口；Embedded Broker 默认构造仍使用内存实现。                                                 |
-| `packages/core/src/managed-runtime/managed-session-assembly.ts`                                    | 直接组装本地 Session authority、资源存储和写者租约，尚非可替换的远端持久化实现。                                   |
+| 位置                                                                                                                                       | 当前行为及设计影响                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `store/ManagedAgentStore.java`                                                                                                             | 具体的 JDBC 类；事务同时维护命令幂等、Turn、源游标和公开事件，不能拆成互不相关的 CRUD 接口。                       |
+| `service/HarnessCoordinator.java`                                                                                                          | 消费 Harness SSE；按 `bootId:eventEpoch:eventId` 去重并提交有界源事件批次；还有 Java 产生的 Runtime 状态事件。     |
+| `service/HarnessEventProjector.java`                                                                                                       | 文本与工具投影已有确定性的 Item/Part 身份，并继续使用明确的公开字段白名单。                                        |
+| `service/ManagedEventStreamService.java`                                                                                                   | 实时路径使用提交后本机通知，缺口与重连通过周期 SQL 核对；浏览器不直接访问数据库。                                  |
+| `service/ManagedAgentService.java`                                                                                                         | Transcript 读取最新物化 Snapshot、保留的控制事件和 `coveredSequence` 后的尾部；Snapshot 尚未产生时兼容旧事件分页。 |
+| `harness/HarnessConnector.java`                                                                                                            | 已有连接器接口，可复用；当前包含提交、SSE、取消和启动代际信息。                                                    |
+| `src/main/resources/db/migration/V1__managed_agent_core.sql`、`V2__managed_agent_projection.sql` 与 `V4__managed_agent_event_delivery.sql` | V1 包含 Session、Turn、Command、Event；V2 增加 Item、Item Part、Snapshot 和投影进度；V4 增加批次日志和投递认领表。 |
+| `packages/sdk-java/runtime-broker/`                                                                                                        | 已有三个 Repository 接口；Embedded Broker 默认构造仍使用内存实现。                                                 |
+| `packages/core/src/managed-runtime/managed-session-assembly.ts`                                                                            | 直接组装本地 Session authority、资源存储和写者租约，尚非可替换的远端持久化实现。                                   |
 
 最新代码已统一公开 Java Session、Harness、JSONL 与 Broker 使用的 Session UUID。`harnessSessionId` 仅为协议别名，不再设计第二套身份映射。租户隔离仍使用 `(tenantId, sessionId)`；`turnId` 与稳定的 `promptId` 各有用途。
 
@@ -174,17 +174,22 @@ RocketMQ 的组内顺序需要单生产者串行发送；跨生产者接管仍�
 
 消费者在一个数据库事务里更新 Item/Snapshot 和自己的连续进度，然后 ACK；重投不重复追加文本。缺口从短期日志补齐；日志也缺失时暂停该 Session 的物化并报警，不把后续内容当作连续状态。消费者不能仅因超过重试次数进入死信就推进业务水位。
 
+已经实现的纯 SQL 路径在每条 `managed_agent_event_batch` 同一事务创建一条 `managed_agent_batch_delivery` 任务。Worker 扫描符合条件的任务，不维护全局最大 `batch_offset`；更早的未完成批次只阻塞同一个 Session 和消费者。认领通过 CAS 更新并递增 `claim_generation`；物化按 Session、消费者进度、投递任务的顺序加锁，验证精确连续的序号区间，并把投影、Snapshot、进度和 `DONE` 同事务提交。已过期或被接管的 claim 既不能完成，也不能把任务改回 `PENDING`。`batch_offset` 只用于公平扫描排序，因此低 offset 事务晚提交后仍能被发现。
+
+这仍是兼容过渡：公开事件继续保存在 `managed_agent_event`，新接受的批次同时保存编码正文与 SHA-256 摘要。Java 控制事件目前每个事件形成一个批次；一次 Harness 接受事务可以包含多个投影事件。24 小时 `expires_at` 目前只是元数据，在清理门槛和范围读取保护完成前不会触发删除。本切片未启用 RocketMQ/Redis Relay 或清理任务。V4 有意排在另一项已暂存的 Runtime endpoint V3 迁移之后，集成时必须保持该顺序。
+
 浏览器续传使用 Session 的公开序号，不重置物化消费者组。RocketMQ 的消息位置由 topic/queue/offset 描述，消费者进度属于消费组，不是用户会话游标。[RocketMQ consumer progress](https://rocketmq.apache.org/docs/featureBehavior/09consumerprogress/)
 
 ## 8. 表结构、聚合与保留
 
-| 结构                                              | 作用与当前状态                                                                                                |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `managed_agent_event_batch`                       | 单行保存一个有界批次、序号区间和编码后的公开事件；兼作 Outbox 与续传日志，不再额外复制一张相同的 SQL Outbox。 |
-| `managed_agent_item` 与 `managed_agent_item_part` | V2 已实现稳定消息/工具状态与文本 Part。P1 当前按已接受 delta 更新累计正文，不可变长输出分段仍是后续工作。     |
-| `managed_agent_snapshot`                          | V2 已实现一致 Item 文档与 `coveredSequence`；更完整的终态/控制状态和固定历史分页版本仍是后续工作。            |
-| `managed_agent_consumer_progress`                 | SQL 消息投影进度已实现；发布进度仍是后续工作，不能用 Broker ACK 代替物化进度。                                |
-| Session/Turn 增量列                               | 租约 generation、日志最低/最高水位、存储版本、恢复状态和持久化资源引用。                                      |
+| 结构                                              | 作用与当前状态                                                                                                                                    |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `managed_agent_event_batch`                       | V4 已实现。每个接受批次单行保存序号区间、编码后的公开事件、摘要、生产者/源信息和过期元数据；兼作未来 Outbox 与续传日志。                          |
+| `managed_agent_batch_delivery`                    | V4 已实现持久化的 `PENDING`/`LEASED`/`DONE`/`BLOCKED` 消费任务、租约 owner、`claim_generation`、尝试次数和完成状态；当前只有 SQL 消息投影消费者。 |
+| `managed_agent_item` 与 `managed_agent_item_part` | V2 已实现稳定消息/工具状态与文本 Part。P1 当前按已接受 delta 更新累计正文，不可变长输出分段仍是后续工作。                                         |
+| `managed_agent_snapshot`                          | V2 已实现一致 Item 文档与 `coveredSequence`；更完整的终态/控制状态和固定历史分页版本仍是后续工作。                                                |
+| `managed_agent_consumer_progress`                 | SQL 消息投影进度已实现；发布进度仍是后续工作，不能用 Broker ACK 代替物化进度。                                                                    |
+| Session/Turn 增量列                               | 租约 generation、日志最低/最高水位、存储版本、恢复状态和持久化资源引用。                                                                          |
 
 批次按 `(tenantId, sessionId, firstSequence)` 定位，并支持查找覆盖请求起点的批次；分页在应用层展开事件。长期 Item 可以在内容块结束、终态或有上限的周期检查点更新；不要每个 delta 都重写累计增长的整段正文。长输出使用不可变分段及清单，避免累计写放大。
 
@@ -265,13 +270,14 @@ qwen:
 
 ## 12. 落地顺序与代码改造
 
-| 阶段                           | 工作与退出条件                                                                                                                                                                                                                             |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| P0：契约与基线                 | **基础已实现。** 已有 `AgentStateStore`、有界入口批处理、幂等准入和提交后 Hub 直推；H2 与真实 MySQL 集成测试覆盖当前契约。性能基线和 PostgreSQL 对等能力仍待完成。                                                                         |
-| P1：批次与直推                 | **基于 SQL 的切片已实现。** 已有稳定 Item/Part 身份、V2 投影表、连续进度/Snapshot 同事务物化、带 Snapshot 水位的公共 Item 列表，以及 WebShell 的 Snapshot 加尾部恢复。长输出写放大、Snapshot 分页保护和生产故障/性能证据仍待完成。         |
-| P2：传输与保留                 | 增加实际选中的 MQ 适配器、Outbox Relay、多实例通知及续传重置；物化核对通过后，才启用窗口清理。已有 RocketMQ 平台时在此接入。                                                                                                               |
-| P3：恢复持久化                 | 持久化 Broker 三个 Repository；补 Harness authority 和资源 manifest、Workspace 恢复与回收屏障。跨 JVM/Harness/Runtime 故障测试通过后，才开放自动接管能力。                                                                                 |
-| P4：按测量决定是否改变接受路径 | 若 SQL 接受吞吐或 SQL 故障隔离不达标，先让 Harness/入口具备独立持久化源日志、单写者 fencing、稳定事件身份与重放确认，再设计 MQ 接受后直推、SQL 异步物化。此时必须重定控制事件与文本的统一顺序及公开游标，不能只替换 `acceptBatch` 的实现。 |
+| 阶段                           | 工作与退出条件                                                                                                                                                                                                                                                                           |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P0：契约与基线                 | **基础已实现。** 已有 `AgentStateStore`、有界入口批处理、幂等准入和提交后 Hub 直推；H2 与真实 MySQL 集成测试覆盖当前契约。性能基线和 PostgreSQL 对等能力仍待完成。                                                                                                                       |
+| P1：批次与直推                 | **基于 SQL 的切片已实现。** 已有稳定 Item/Part 身份、V2 投影表、提交后本机 SSE、带 Snapshot 水位的公共 Item 列表，以及 WebShell 的 Snapshot 加尾部恢复。长输出写放大、Snapshot 分页保护和生产故障/性能证据仍待完成。                                                                     |
+| P2：持久 SQL 投递              | **第一切片已实现。** V4 批次/投递记录与接受事件同事务提交；Worker 用 generation fencing 认领按消费者划分的任务，并按 Session 精确连续序号范围事务化物化。H2 覆盖旧 claim 拒绝，真实 MySQL 覆盖旧 claim 和低 offset 晚提交。MQ Relay、清理、批次策略调优及生产负载/故障切换证据仍待完成。 |
+| P2 后续：传输与保留            | 增加实际选中的 MQ 适配器、Outbox Relay、多实例通知及续传重置；物化核对通过后，才启用窗口清理。已有 RocketMQ 平台时在此接入。                                                                                                                                                             |
+| P3：恢复持久化                 | 持久化 Broker 三个 Repository；补 Harness authority 和资源 manifest、Workspace 恢复与回收屏障。跨 JVM/Harness/Runtime 故障测试通过后，才开放自动接管能力。                                                                                                                               |
+| P4：按测量决定是否改变接受路径 | 若 SQL 接受吞吐或 SQL 故障隔离不达标，先让 Harness/入口具备独立持久化源日志、单写者 fencing、稳定事件身份与重放确认，再设计 MQ 接受后直推、SQL 异步物化。此时必须重定控制事件与文本的统一顺序及公开游标，不能只替换 `acceptBatch` 的实现。                                               |
 
 P4 是明确的后续设计门槛，不是当前接口已经实现的能力。当前不引入多套运行模式、通用查询 DSL、自动 MQ 热切换或新的 Java Agent 循环。
 

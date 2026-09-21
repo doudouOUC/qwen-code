@@ -460,21 +460,25 @@ class ManagedAgentServerIntegrationTest {
         assertThat(store.findEvents(tenant, session.sessionId(), before, 100))
                 .extracting(event -> event.sequence())
                 .containsExactly(before + 1, before + 2, before + 3);
-        store.materializeNextBatch(tenant, session.sessionId(), 200);
-        assertThat(store.findSnapshot(tenant, session.sessionId()))
-                .get().satisfies(snapshot -> {
-                    assertThat(snapshot.coveredSequence())
-                            .isEqualTo(before + 3);
-                    assertThat(snapshot.items()).filteredOn(item ->
-                            "assistant".equals(item.role()))
-                            .singleElement().satisfies(item ->
-                                    assertThat(item.content())
-                                            .singleElement()
-                                            .extracting(part -> part.text())
-                                            .isEqualTo("onetwo"));
-                });
-        assertThat(store.materializeNextBatch(tenant, session.sessionId(),
-                200).advanced()).isFalse();
+        assertThat(jdbc.queryForList("SELECT event_count FROM"
+                        + " managed_agent_event_batch WHERE tenant_id = ?"
+                        + " AND session_id = ? AND producer_kind = 'harness'"
+                        + " ORDER BY first_sequence", Integer.class, tenant,
+                session.sessionId())).containsExactly(2, 1);
+        await().atMost(Duration.ofSeconds(2)).untilAsserted(() ->
+                assertThat(store.findSnapshot(tenant, session.sessionId()))
+                        .get().satisfies(snapshot -> {
+                            assertThat(snapshot.coveredSequence())
+                                    .isEqualTo(before + 3);
+                            assertThat(snapshot.items()).filteredOn(item ->
+                                    "assistant".equals(item.role()))
+                                    .singleElement().satisfies(item ->
+                                            assertThat(item.content())
+                                                    .singleElement()
+                                                    .extracting(part ->
+                                                            part.text())
+                                                    .isEqualTo("onetwo"));
+                        }));
     }
 
     @Test
@@ -486,6 +490,10 @@ class ManagedAgentServerIntegrationTest {
                 List.of(), null);
         long before = store.requireSession(tenant, session.sessionId())
                 .lastSequence();
+        Integer batchesBefore = jdbc.queryForObject("SELECT COUNT(*) FROM"
+                        + " managed_agent_event_batch WHERE tenant_id = ?"
+                        + " AND session_id = ?", Integer.class, tenant,
+                session.sessionId());
 
         try (SessionEventHub.Subscription subscription = eventHub.subscribe(
                 tenant, session.sessionId())) {
@@ -504,6 +512,15 @@ class ManagedAgentServerIntegrationTest {
             assertThat(delivery.events()).isEmpty();
             assertThat(store.requireSession(tenant, session.sessionId())
                     .lastSequence()).isEqualTo(before);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM"
+                            + " managed_agent_event_batch WHERE tenant_id = ?"
+                            + " AND session_id = ?", Integer.class, tenant,
+                    session.sessionId())).isEqualTo(batchesBefore);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM"
+                            + " managed_agent_batch_delivery WHERE"
+                            + " tenant_id = ? AND session_id = ?",
+                    Integer.class, tenant, session.sessionId()))
+                    .isEqualTo(batchesBefore);
         }
     }
 

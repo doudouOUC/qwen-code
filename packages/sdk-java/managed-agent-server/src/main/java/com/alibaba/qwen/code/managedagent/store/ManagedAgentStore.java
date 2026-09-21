@@ -3,6 +3,7 @@ package com.alibaba.qwen.code.managedagent.store;
 import com.alibaba.qwen.code.managedagent.api.ApiException;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.Admission;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.CommandRecord;
+import com.alibaba.qwen.code.managedagent.store.StoreModels.DeliveryClaim;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.DispatchTarget;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.EventRecord;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.EventPage;
@@ -10,7 +11,6 @@ import com.alibaba.qwen.code.managedagent.store.StoreModels.HarnessEvent;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.ItemPartRecord;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.ItemRecord;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.MaterializationResult;
-import com.alibaba.qwen.code.managedagent.store.StoreModels.MaterializationTarget;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.ProjectedEvent;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.SessionPage;
 import com.alibaba.qwen.code.managedagent.store.StoreModels.SessionRecord;
@@ -20,11 +20,15 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -50,7 +54,7 @@ public class ManagedAgentStore implements AgentStateStore {
     private static final TypeReference<List<ItemRecord>> ITEMS_TYPE =
             new TypeReference<>() {
             };
-    private static final String MESSAGE_PROJECTION = "message_projection";
+    private static final Duration EVENT_RETENTION = Duration.ofHours(24);
     private static final List<String> ACTIVE_TURN_STATES = List.of(
             "ACCEPTED", "RUNNING", "CANCELLING");
     private final JdbcTemplate jdbc;
@@ -401,40 +405,105 @@ public class ManagedAgentStore implements AgentStateStore {
         return rows.stream().findFirst();
     }
 
-    public List<MaterializationTarget> findMaterializationTargets(int limit) {
-        return jdbc.query("SELECT s.tenant_id, s.session_id FROM"
-                        + " managed_agent_session s JOIN"
-                        + " managed_agent_consumer_progress p ON"
-                        + " p.tenant_id = s.tenant_id AND p.session_id ="
-                        + " s.session_id AND p.consumer_name = ? WHERE"
-                        + " s.last_sequence > p.covered_sequence ORDER BY"
-                        + " p.updated_at ASC LIMIT ?",
-                (result, row) -> new MaterializationTarget(
+    @Transactional
+    public List<DeliveryClaim> claimDeliveries(String consumerName,
+            String owner, Duration leaseDuration, int limit) {
+        long now = databaseNow();
+        long leaseUntil = now + leaseDuration.toMillis();
+        List<DeliveryCandidate> candidates = jdbc.query(
+                "SELECT d.tenant_id, d.session_id, d.batch_id,"
+                        + " d.consumer_name, d.claim_generation,"
+                        + " b.first_sequence, b.last_sequence FROM"
+                        + " managed_agent_batch_delivery d JOIN"
+                        + " managed_agent_event_batch b ON b.tenant_id ="
+                        + " d.tenant_id AND b.session_id = d.session_id AND"
+                        + " b.batch_id = d.batch_id WHERE d.consumer_name = ?"
+                        + " AND ((d.state = 'PENDING' AND d.available_at <= ?)"
+                        + " OR (d.state = 'LEASED' AND d.lease_until < ?))"
+                        + " AND NOT EXISTS (SELECT 1 FROM"
+                        + " managed_agent_batch_delivery prior JOIN"
+                        + " managed_agent_event_batch prior_batch ON"
+                        + " prior_batch.tenant_id = prior.tenant_id AND"
+                        + " prior_batch.session_id = prior.session_id AND"
+                        + " prior_batch.batch_id = prior.batch_id WHERE"
+                        + " prior.tenant_id = d.tenant_id AND"
+                        + " prior.session_id = d.session_id AND"
+                        + " prior.consumer_name = d.consumer_name AND"
+                        + " prior.state <> 'DONE' AND"
+                        + " prior_batch.first_sequence < b.first_sequence)"
+                        + " ORDER BY d.available_at, b.batch_offset LIMIT ?",
+                (result, row) -> new DeliveryCandidate(
                         result.getString("tenant_id"),
-                        result.getString("session_id")),
-                MESSAGE_PROJECTION, limit);
+                        result.getString("session_id"),
+                        result.getString("batch_id"),
+                        result.getString("consumer_name"),
+                        result.getLong("claim_generation"),
+                        result.getLong("first_sequence"),
+                        result.getLong("last_sequence")),
+                consumerName, now, now, limit);
+        List<DeliveryClaim> claims = new ArrayList<>();
+        for (DeliveryCandidate candidate : candidates) {
+            int updated = jdbc.update("UPDATE managed_agent_batch_delivery"
+                            + " SET state = 'LEASED', lease_owner = ?,"
+                            + " lease_until = ?, claim_generation ="
+                            + " claim_generation + 1, attempts = attempts + 1,"
+                            + " last_error_code = NULL WHERE tenant_id = ?"
+                            + " AND session_id = ? AND batch_id = ? AND"
+                            + " consumer_name = ? AND claim_generation = ?"
+                            + " AND ((state = 'PENDING' AND available_at <= ?)"
+                            + " OR (state = 'LEASED' AND lease_until < ?))",
+                    owner, leaseUntil, candidate.tenantId(),
+                    candidate.sessionId(), candidate.batchId(),
+                    candidate.consumerName(), candidate.claimGeneration(),
+                    now, now);
+            if (updated == 1) {
+                claims.add(candidate.claim(owner, leaseUntil));
+            }
+        }
+        return List.copyOf(claims);
     }
 
     @Transactional
-    public MaterializationResult materializeNextBatch(String tenantId,
-            String sessionId, int limit) {
-        requireSession(tenantId, sessionId);
+    public MaterializationResult materializeDelivery(DeliveryClaim claim) {
+        requireSessionForUpdate(claim.tenantId(), claim.sessionId());
         Long covered = jdbc.queryForObject("SELECT covered_sequence FROM"
                         + " managed_agent_consumer_progress WHERE tenant_id"
                         + " = ? AND session_id = ? AND consumer_name = ?"
                         + " FOR UPDATE",
-                Long.class, tenantId, sessionId, MESSAGE_PROJECTION);
+                Long.class, claim.tenantId(), claim.sessionId(),
+                claim.consumerName());
         if (covered == null) {
             throw new IllegalStateException(
                     "Message projection progress is unavailable");
         }
+        DeliveryState delivery = requireDeliveryForUpdate(claim);
+        long now = databaseNow();
+        if (!"LEASED".equals(delivery.state())
+                || !claim.leaseOwner().equals(delivery.leaseOwner())
+                || claim.claimGeneration() != delivery.claimGeneration()
+                || delivery.leaseUntil() == null
+                || delivery.leaseUntil() < now) {
+            throw new IllegalStateException("Delivery claim was lost");
+        }
+        if (delivery.lastSequence() <= covered) {
+            completeDelivery(claim, now);
+            return new MaterializationResult(false, covered);
+        }
+        if (delivery.firstSequence() != covered + 1) {
+            throw new IllegalStateException(
+                    "Message projection event sequence has a gap");
+        }
         List<EventRecord> events = jdbc.query("SELECT * FROM"
                         + " managed_agent_event WHERE tenant_id = ? AND"
-                        + " session_id = ? AND sequence_id > ? ORDER BY"
-                        + " sequence_id ASC LIMIT ?",
-                eventMapper, tenantId, sessionId, covered, limit);
-        if (events.isEmpty()) {
-            return new MaterializationResult(false, covered);
+                        + " session_id = ? AND sequence_id >= ? AND"
+                        + " sequence_id <= ? ORDER BY sequence_id ASC",
+                eventMapper, claim.tenantId(), claim.sessionId(),
+                delivery.firstSequence(), delivery.lastSequence());
+        long expectedCount = delivery.lastSequence()
+                - delivery.firstSequence() + 1;
+        if (events.size() != expectedCount) {
+            throw new IllegalStateException(
+                    "Message projection batch is incomplete");
         }
         long expected = covered + 1;
         for (EventRecord event : events) {
@@ -446,34 +515,51 @@ public class ManagedAgentStore implements AgentStateStore {
             expected++;
         }
         long nextCovered = events.get(events.size() - 1).sequence();
-        long now = clock.millis();
         jdbc.update("UPDATE managed_agent_consumer_progress SET"
                         + " covered_sequence = ?, updated_at = ? WHERE"
                         + " tenant_id = ? AND session_id = ? AND"
                         + " consumer_name = ?",
-                nextCovered, now, tenantId, sessionId, MESSAGE_PROJECTION);
-        List<ItemRecord> items = allItems(tenantId, sessionId);
+                nextCovered, now, claim.tenantId(), claim.sessionId(),
+                claim.consumerName());
+        List<ItemRecord> items = allItems(claim.tenantId(),
+                claim.sessionId());
         List<Long> versions = jdbc.query("SELECT snapshot_version FROM"
                         + " managed_agent_snapshot WHERE tenant_id = ? AND"
                         + " session_id = ? FOR UPDATE",
                 (result, row) -> result.getLong("snapshot_version"),
-                tenantId, sessionId);
+                claim.tenantId(), claim.sessionId());
         if (versions.isEmpty()) {
             jdbc.update("INSERT INTO managed_agent_snapshot (tenant_id,"
                             + " session_id, snapshot_version,"
                             + " covered_sequence, items_json, created_at,"
                             + " updated_at) VALUES (?, ?, 1, ?, ?, ?, ?)",
-                    tenantId, sessionId, nextCovered, writeJson(items), now,
-                    now);
+                    claim.tenantId(), claim.sessionId(), nextCovered,
+                    writeJson(items), now, now);
         } else {
             jdbc.update("UPDATE managed_agent_snapshot SET"
                             + " snapshot_version = ?, covered_sequence = ?,"
                             + " items_json = ?, updated_at = ? WHERE"
                             + " tenant_id = ? AND session_id = ?",
                     versions.get(0) + 1, nextCovered, writeJson(items), now,
-                    tenantId, sessionId);
+                    claim.tenantId(), claim.sessionId());
         }
+        completeDelivery(claim, databaseNow());
         return new MaterializationResult(true, nextCovered);
+    }
+
+    public boolean retryDelivery(DeliveryClaim claim, Duration delay,
+            String errorCode) {
+        long now = databaseNow();
+        return jdbc.update("UPDATE managed_agent_batch_delivery SET state ="
+                        + " 'PENDING', available_at = ?, lease_owner = NULL,"
+                        + " lease_until = NULL, last_error_code = ? WHERE"
+                        + " tenant_id = ? AND session_id = ? AND batch_id = ?"
+                        + " AND consumer_name = ? AND state = 'LEASED' AND"
+                        + " lease_owner = ? AND claim_generation = ? AND"
+                        + " lease_until >= ?",
+                now + delay.toMillis(), errorCode, claim.tenantId(),
+                claim.sessionId(), claim.batchId(), claim.consumerName(),
+                claim.leaseOwner(), claim.claimGeneration(), now) == 1;
     }
 
     public List<DispatchTarget> findDispatchable(long now, int limit) {
@@ -643,8 +729,8 @@ public class ManagedAgentStore implements AgentStateStore {
         List<HarnessEvent> projected = accepted.stream()
                 .filter(event -> event.projection() != null).toList();
         List<EventRecord> committed = appendEvents(tenantId, sessionId,
-                turnId, eventEpoch, lastSourceId, session.lastSequence(),
-                projected, now);
+                turnId, eventEpoch, accepted.get(0).sourceId(), lastSourceId,
+                session.lastSequence(), projected, now);
         publishAfterCommit(committed);
     }
 
@@ -683,8 +769,8 @@ public class ManagedAgentStore implements AgentStateStore {
 
     private List<EventRecord> appendEvents(String tenantId,
             String sessionId, String turnId, String eventEpoch,
-            long lastSourceId, long sequence, List<HarnessEvent> events,
-            long now) {
+            long firstSourceId, long lastSourceId, long sequence,
+            List<HarnessEvent> events, long now) {
         List<EventRecord> records = new ArrayList<>();
         long next = sequence;
         for (HarnessEvent event : events) {
@@ -717,6 +803,8 @@ public class ManagedAgentStore implements AgentStateStore {
                         statement.setString(9, event.sourceKey());
                         statement.setLong(10, event.createdAt());
                     });
+            appendEventBatch(records, "harness", eventEpoch, firstSourceId,
+                    lastSourceId, now);
         }
         return List.copyOf(records);
     }
@@ -1117,8 +1205,36 @@ public class ManagedAgentStore implements AgentStateStore {
                 event.eventId(), event.turnId(), event.type(),
                 writeJson(event.data()), event.terminal(), event.sourceKey(),
                 event.createdAt());
+        appendEventBatch(List.of(event), "java", null, null, null, now);
         publishAfterCommit(List.of(event));
         return event;
+    }
+
+    private void appendEventBatch(List<EventRecord> events,
+            String producerKind, String sourceEventEpoch,
+            Long sourceFirstEventId, Long sourceLastEventId, long now) {
+        EventRecord first = events.get(0);
+        EventRecord last = events.get(events.size() - 1);
+        String batchId = publicId("batch");
+        String payload = writeJson(events);
+        jdbc.update("INSERT INTO managed_agent_event_batch (tenant_id,"
+                        + " session_id, batch_id, turn_id, producer_kind,"
+                        + " source_event_epoch, source_first_event_id,"
+                        + " source_last_event_id, first_sequence,"
+                        + " last_sequence, event_count, payload_json,"
+                        + " payload_sha256, terminal, accepted_at, expires_at)"
+                        + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                        + " ?, ?, ?)",
+                first.tenantId(), first.sessionId(), batchId, first.turnId(),
+                producerKind, sourceEventEpoch, sourceFirstEventId,
+                sourceLastEventId, first.sequence(), last.sequence(),
+                events.size(), payload, sha256(payload), last.terminal(), now,
+                now + EVENT_RETENTION.toMillis());
+        jdbc.update("INSERT INTO managed_agent_batch_delivery (tenant_id,"
+                        + " session_id, batch_id, consumer_name, available_at)"
+                        + " VALUES (?, ?, ?, ?, ?)",
+                first.tenantId(), first.sessionId(), batchId,
+                MESSAGE_PROJECTION, 0L);
     }
 
     private void publishAfterCommit(List<EventRecord> events) {
@@ -1136,6 +1252,48 @@ public class ManagedAgentStore implements AgentStateStore {
                         eventPublisher.publish(events);
                     }
                 });
+    }
+
+    private DeliveryState requireDeliveryForUpdate(DeliveryClaim claim) {
+        List<DeliveryState> rows = jdbc.query(
+                "SELECT d.state, d.lease_owner, d.lease_until,"
+                        + " d.claim_generation, b.first_sequence,"
+                        + " b.last_sequence FROM"
+                        + " managed_agent_batch_delivery d JOIN"
+                        + " managed_agent_event_batch b ON b.tenant_id ="
+                        + " d.tenant_id AND b.session_id = d.session_id AND"
+                        + " b.batch_id = d.batch_id WHERE d.tenant_id = ?"
+                        + " AND d.session_id = ? AND d.batch_id = ? AND"
+                        + " d.consumer_name = ? FOR UPDATE",
+                (result, row) -> new DeliveryState(
+                        result.getString("state"),
+                        result.getString("lease_owner"),
+                        nullableLong(result, "lease_until"),
+                        result.getLong("claim_generation"),
+                        result.getLong("first_sequence"),
+                        result.getLong("last_sequence")),
+                claim.tenantId(), claim.sessionId(), claim.batchId(),
+                claim.consumerName());
+        if (rows.isEmpty()) {
+            throw new IllegalStateException("Delivery does not exist");
+        }
+        return rows.get(0);
+    }
+
+    private void completeDelivery(DeliveryClaim claim, long now) {
+        int updated = jdbc.update("UPDATE managed_agent_batch_delivery SET"
+                        + " state = 'DONE', completed_at = ?,"
+                        + " lease_owner = NULL, lease_until = NULL WHERE"
+                        + " tenant_id = ? AND session_id = ? AND batch_id = ?"
+                        + " AND consumer_name = ? AND state = 'LEASED' AND"
+                        + " lease_owner = ? AND claim_generation = ? AND"
+                        + " lease_until >= ?",
+                now, claim.tenantId(), claim.sessionId(), claim.batchId(),
+                claim.consumerName(), claim.leaseOwner(),
+                claim.claimGeneration(), now);
+        if (updated != 1) {
+            throw new IllegalStateException("Delivery claim was lost");
+        }
     }
 
     private boolean hasActiveTurn(String tenantId, String sessionId) {
@@ -1172,6 +1330,25 @@ public class ManagedAgentStore implements AgentStateStore {
         } catch (JsonProcessingException error) {
             throw new IllegalArgumentException("Value is not valid JSON",
                     error);
+        }
+    }
+
+    private long databaseNow() {
+        Timestamp now = jdbc.queryForObject("SELECT CURRENT_TIMESTAMP(3)",
+                Timestamp.class);
+        if (now == null) {
+            throw new IllegalStateException("Database time is unavailable");
+        }
+        return now.getTime();
+    }
+
+    private static String sha256(String value) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(
+                    value.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException error) {
+            throw new IllegalStateException("SHA-256 is unavailable", error);
         }
     }
 
@@ -1224,5 +1401,20 @@ public class ManagedAgentStore implements AgentStateStore {
     }
 
     private record ItemPartRow(String itemId, ItemPartRecord part) {
+    }
+
+    private record DeliveryCandidate(String tenantId, String sessionId,
+            String batchId, String consumerName, long claimGeneration,
+            long firstSequence, long lastSequence) {
+        private DeliveryClaim claim(String owner, long leaseUntil) {
+            return new DeliveryClaim(tenantId, sessionId, batchId,
+                    consumerName, owner, claimGeneration + 1, leaseUntil,
+                    firstSequence, lastSequence);
+        }
+    }
+
+    private record DeliveryState(String state, String leaseOwner,
+            Long leaseUntil, long claimGeneration, long firstSequence,
+            long lastSequence) {
     }
 }

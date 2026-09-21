@@ -63,7 +63,10 @@ public final class StoreModels {
             long createdAt, long updatedAt) {
     }
 
-    public record MaterializationTarget(String tenantId, String sessionId) {
+    public record DeliveryClaim(String tenantId, String sessionId,
+            String batchId, String consumerName, String leaseOwner,
+            long claimGeneration, long leaseUntil, long firstSequence,
+            long lastSequence) {
     }
 
     public record MaterializationResult(boolean advanced,

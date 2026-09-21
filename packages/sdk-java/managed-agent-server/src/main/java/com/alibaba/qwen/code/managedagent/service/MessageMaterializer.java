@@ -1,7 +1,9 @@
 package com.alibaba.qwen.code.managedagent.service;
 
 import com.alibaba.qwen.code.managedagent.store.AgentStateStore;
-import com.alibaba.qwen.code.managedagent.store.StoreModels.MaterializationTarget;
+import com.alibaba.qwen.code.managedagent.store.StoreModels.DeliveryClaim;
+import java.time.Duration;
+import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -12,8 +14,10 @@ public class MessageMaterializer {
     private static final Logger LOG = LoggerFactory.getLogger(
             MessageMaterializer.class);
     private static final int TARGET_LIMIT = 32;
-    private static final int EVENT_LIMIT = 200;
+    private static final Duration CLAIM_LEASE = Duration.ofSeconds(30);
+    private static final Duration RETRY_DELAY = Duration.ofSeconds(1);
     private final AgentStateStore store;
+    private final String owner = "materializer-" + UUID.randomUUID();
 
     public MessageMaterializer(AgentStateStore store) {
         this.store = store;
@@ -22,14 +26,16 @@ public class MessageMaterializer {
     @Scheduled(fixedDelayString =
             "${qwen.managed-agent.events.materialize-interval:100ms}")
     public void materialize() {
-        for (MaterializationTarget target :
-                store.findMaterializationTargets(TARGET_LIMIT)) {
+        for (DeliveryClaim claim : store.claimDeliveries(
+                AgentStateStore.MESSAGE_PROJECTION, owner, CLAIM_LEASE,
+                TARGET_LIMIT)) {
             try {
-                store.materializeNextBatch(target.tenantId(),
-                        target.sessionId(), EVENT_LIMIT);
+                store.materializeDelivery(claim);
             } catch (RuntimeException error) {
                 LOG.warn("Failed to materialize Managed Agent session {}",
-                        target.sessionId(), error);
+                        claim.sessionId(), error);
+                store.retryDelivery(claim, RETRY_DELAY,
+                        error.getClass().getSimpleName());
             }
         }
     }
