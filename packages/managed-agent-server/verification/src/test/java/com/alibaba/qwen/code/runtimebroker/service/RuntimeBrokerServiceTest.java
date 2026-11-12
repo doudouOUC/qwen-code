@@ -138,8 +138,9 @@ class RuntimeBrokerServiceTest {
             execution = com.alibaba.qwen.code.runtimebroker.persistence.RuntimeBrokerTestAccess.authorizeDispatch(fixture.dataSource, execution, "owner", execution.getDispatchGeneration(), binding.getVersion());
             assertEquals("csi_execution_cancel_unavailable", failure(fixture.service.cancelExecution(
                     PROVIDER_SESSION, PROVIDER_SESSION, "execution")).getCode());
-            assertUnchanged(execution, fixture.executionRepository.findByExecutionCallId("execution"));
-            assertFalse(execution.isCancelRequested());
+            ToolExecutionRecord reread = fixture.executionRepository.findByExecutionCallId("execution");
+            assertUnchanged(execution, reread);
+            assertFalse(reread.isCancelRequested());
             assertEquals(0, fixture.transport.cancelCalls.get());
             var completed = com.alibaba.qwen.code.runtimebroker.persistence.RuntimeBrokerTestAccess.compareAndSet(fixture.dataSource, execution,
                     execution.withResult(Map.of("executionStatus", "success", "responseParts", List.of(Map.of("text", "complete"))),
@@ -5133,7 +5134,8 @@ class RuntimeBrokerServiceTest {
     @Test
     void lapsedInvocationThatCompletesUnderClockSkewIsFencedAsUnknown() {
         MutableClock serviceClock = new MutableClock(START);
-        var source = newDataSource("lapsed-invocation-skew");
+        MutableClock repositoryClock = new MutableClock(START);
+        var source = fakeClockDataSource(newDataSource("lapsed-invocation-skew"), repositoryClock);
         var executions = new JdbcToolExecutionRepository(source);
         FakeTransport transport = new FakeTransport();
         CompletableFuture<Map<String, Object>> result =
@@ -5146,9 +5148,9 @@ class RuntimeBrokerServiceTest {
                     "harness", "runtime", "idempotency",
                     reference("runtime", "digest")));
 
-            // Only the repository sees the lease lapse.
-            expire(source, "ma_tool_execution", "dispatch_lease_until",
-                    "execution_call_id", created.getExecutionCallId());
+            // Only the repository sees the lease lapse; this broker's clock
+            // still holds the claim live.
+            repositoryClock.advance(Duration.ofHours(2));
             result.complete(Map.of("executionStatus", "success"));
 
             assertEquals(ToolExecutionRecord.State.UNKNOWN,
@@ -7368,6 +7370,9 @@ class RuntimeBrokerServiceTest {
         assertTrue(expected.sameIdentity(actual));
         assertEquals(expected.getVersion(), actual.getVersion());
         assertEquals(expected.getState(), actual.getState());
+        assertEquals(expected.isCancelRequested(), actual.isCancelRequested());
+        assertEquals(expected.getExecutionStatus(), actual.getExecutionStatus());
+        assertEquals(expected.getResult(), actual.getResult());
     }
 
     /** JDBC deserializes a fresh lease, so lease equality is field equality. */

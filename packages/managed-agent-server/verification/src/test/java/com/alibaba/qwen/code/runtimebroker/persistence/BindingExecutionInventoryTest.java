@@ -137,10 +137,24 @@ class BindingExecutionInventoryTest {
         var repository = new JdbcToolExecutionRepository(source);
         repository.findOrCreate(prepared("?", BINDING, GENERATION, "session"));
         assertEquals(JdbcRepositorySupport.valueKey("?"), JdbcRepositorySupport.valueKey("\ud800"));
-        // The unique hash constraint refuses the aliasing insert; the ledger
-        // keeps exactly the original row.
-        assertThrows(IllegalStateException.class,
+        // The idempotency guard refuses the aliasing key before any insert.
+        IllegalStateException idempotency = assertThrows(IllegalStateException.class,
                 () -> repository.findOrCreate(prepared("\ud800", BINDING, GENERATION, "session")));
+        assertEquals("Tool idempotency hash collision", idempotency.getMessage());
+        // A distinct idempotency key reaches the insert, where identity
+        // validation refuses the unpaired surrogate ahead of the unique hash
+        // constraint; the read-side identity check refuses the alias directly.
+        ToolExecutionRecord aliasing = ToolExecutionRecord.prepared("\ud800", "alias-distinct-key",
+                BINDING, GENERATION, "session-harness", "session", "turn", "\ud800", "digest",
+                Map.of("sessionId", "session", "promptId", "turn", "callId", "\ud800",
+                        "argsDigest", "digest", "runtimeProtocol", 3));
+        IllegalArgumentException identity = assertThrows(IllegalArgumentException.class,
+                () -> repository.findOrCreate(aliasing));
+        assertEquals("Identity is not valid Unicode", identity.getMessage());
+        IllegalStateException readCollision = assertThrows(IllegalStateException.class,
+                () -> repository.findByExecutionCallId("\ud800"));
+        assertEquals("Tool execution-call hash collision", readCollision.getMessage());
+        // The ledger keeps exactly the original row.
         assertEquals(List.of("?"), executionIds(repository.findByBinding(BINDING, GENERATION, null, 100)));
     }
 

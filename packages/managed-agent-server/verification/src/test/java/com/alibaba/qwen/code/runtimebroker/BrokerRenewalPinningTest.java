@@ -92,7 +92,7 @@ class BrokerRenewalPinningTest {
                         service.warm(harnessId).toCompletableFuture()
                                 .get(60, TimeUnit.SECONDS);
                     } catch (Exception failure) {
-                        // Only the guard's carrier behaviour is asserted.
+                        // Recorded here, asserted after the join below.
                         firstFailure.compareAndSet(null, failure);
                     }
                 }));
@@ -117,10 +117,10 @@ class BrokerRenewalPinningTest {
         } finally {
             bindings.open();
             // The latch is carrier-sized, so it opens without the last two
-            // callers; a caller wedged before the guarded call fails no other
-            // assertion. One shared budget keeps the method inside @Timeout,
-            // and a pending failure keeps its own message: the wedged callers
-            // ride along as a suppressed error instead of replacing it.
+            // callers. One shared budget keeps the method inside @Timeout,
+            // and a pending failure keeps its own message: wedged callers and
+            // recorded caller failures ride along as suppressed errors
+            // instead of replacing it.
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
             int unsettled = 0;
             for (Thread caller : callers) {
@@ -137,6 +137,15 @@ class BrokerRenewalPinningTest {
                     throw wedged;
                 }
                 primary.addSuppressed(wedged);
+            }
+            Throwable callerFailure = firstFailure.get();
+            if (callerFailure != null) {
+                AssertionError failed = new AssertionError(
+                        "caller failed after the latch opened: " + callerFailure);
+                if (primary == null) {
+                    throw failed;
+                }
+                primary.addSuppressed(failed);
             }
         }
     }
@@ -233,6 +242,15 @@ class BrokerRenewalPinningTest {
         public CompletionStage<Object> control(RuntimeLease lease,
                 RuntimeSession session, Map<String, Object> operation) {
             return CompletableFuture.completedFuture("ok");
+        }
+
+        @Override
+        public CompletionStage<RuntimeAttestation> attest(RuntimeLease lease,
+                RuntimeProvisionRequest request, RuntimeProvisionSeed seed) {
+            return CompletableFuture.completedFuture(new RuntimeAttestation(
+                    lease.getRuntimeInstanceId(), seed.getGatewayIncarnation(),
+                    lease.getLeaseId(), lease.getEpoch(), request.getScope(),
+                    seed.getProvisionRequestId(), request.getStorageId()));
         }
 
         @Override
